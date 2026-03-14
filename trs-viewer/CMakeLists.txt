@@ -52,6 +52,9 @@ set(SOURCES
     src/ttest.cpp
     src/xcorr.cpp
     src/heatmap_widget.cpp
+    inc/mainwindow.h
+    inc/plot_widget.h
+    inc/heatmap_widget.h
 )
 
 add_executable(trs-viewer ${SOURCES})
@@ -61,7 +64,7 @@ target_link_libraries(trs-viewer PRIVATE
     OpenMP::OpenMP_CXX
     Eigen3::Eigen
 )
-target_include_directories(trs-viewer PRIVATE src)
+target_include_directories(trs-viewer PRIVATE src inc)
 
 target_compile_options(trs-viewer PRIVATE
     -O2
