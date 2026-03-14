@@ -1,4 +1,4 @@
-#pragma once
+     #pragma once
 
 #include "trs_file.h"
 #include "processing.h"
@@ -44,6 +44,9 @@ private slots:
     void onRunXCorr();
     void onLoadNpyTTest();
     void onLoadNpyHeatmap();
+    void onOpenNpyTraces();
+    void onExportNpy();
+    void onExportNpz();
 
 private:
     void setupMenuBar();
@@ -52,7 +55,7 @@ private:
     std::shared_ptr<ITransform> createTransform(int combo_index);
 
     // Data
-    std::unique_ptr<TrsFile>                 trs_file_;
+    std::unique_ptr<TrsFile> trs_file_;
     std::vector<std::shared_ptr<ITransform>> pipeline_;
 
     // Widgets

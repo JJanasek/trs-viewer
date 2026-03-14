@@ -40,6 +40,30 @@ void TrsFile::close() {
     header_              = TrsHeader{};
     trace_block_offset_  = 0;
     bytes_per_trace_     = 0;
+    mem_samples_.clear();
+    mem_data_.clear();
+}
+
+bool TrsFile::openFromArray(const float* samples, int32_t n_traces, int32_t n_samples,
+                             const std::string& display_name,
+                             const uint8_t* data_bytes, int16_t data_length)
+{
+    close();
+    path_                  = display_name;
+    header_.num_traces     = n_traces;
+    header_.num_samples    = n_samples;
+    header_.sample_type    = SampleType::FLOAT32;
+    header_.sample_size    = 4;
+    header_.data_length    = data_length;
+
+    const size_t ns = static_cast<size_t>(n_traces) * static_cast<size_t>(n_samples);
+    mem_samples_.assign(samples, samples + ns);
+
+    if (data_bytes && data_length > 0) {
+        const size_t nd = static_cast<size_t>(n_traces) * static_cast<size_t>(data_length);
+        mem_data_.assign(data_bytes, data_bytes + nd);
+    }
+    return true;
 }
 
 bool TrsFile::open(const std::string& path, std::string& error) {
@@ -239,6 +263,19 @@ int64_t TrsFile::traceByteOffset(int32_t trace_idx) const {
 
 int64_t TrsFile::readSamples(int32_t trace_idx, int64_t sample_offset,
                               int64_t count, float* buf) const {
+    // In-memory mode (from openFromArray)
+    if (!mem_samples_.empty()) {
+        if (trace_idx < 0 || trace_idx >= header_.num_traces) return 0;
+        int64_t avail = header_.num_samples - sample_offset;
+        if (avail <= 0) return 0;
+        count = std::min(count, avail);
+        const float* src = mem_samples_.data()
+                         + static_cast<size_t>(trace_idx) * static_cast<size_t>(header_.num_samples)
+                         + static_cast<size_t>(sample_offset);
+        std::memcpy(buf, src, static_cast<size_t>(count) * sizeof(float));
+        return count;
+    }
+
     if (!mmap_ptr_ || trace_idx < 0 || trace_idx >= header_.num_traces)
         return 0;
 
@@ -287,6 +324,16 @@ float TrsFile::readSample(int32_t trace_idx, int64_t sample_idx) const {
 }
 
 std::vector<uint8_t> TrsFile::readData(int32_t trace_idx) const {
+    // In-memory mode
+    if (!mem_samples_.empty()) {
+        if (trace_idx < 0 || trace_idx >= header_.num_traces
+                || header_.data_length <= 0 || mem_data_.empty())
+            return {};
+        const uint8_t* src = mem_data_.data()
+                           + static_cast<size_t>(trace_idx) * static_cast<size_t>(header_.data_length);
+        return {src, src + header_.data_length};
+    }
+
     if (!mmap_ptr_ || trace_idx < 0 || trace_idx >= header_.num_traces
         || header_.data_length <= 0)
         return {};

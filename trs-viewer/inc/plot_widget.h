@@ -102,6 +102,14 @@ public:
     void resetYZoom();
     float yScale() const { return y_scale_; }
     void setThresholds(bool show, double pos = 4.5, double neg = -4.5);
+    // When one_sided=true only the positive threshold line is drawn (use after abs() preprocessing).
+    void setThresholdOneSided(bool one_sided);
+    // Optional title rendered above the plot area (empty = no title, no extra margin).
+    void setTitle(const QString& title);
+    // Trace line width in pixels (default 1.5).
+    void setTraceWidth(float w);
+    // Change the color of an already-added trace by index.
+    void setTraceColor(int idx, const QColor& c);
 
     // View accessors
     int64_t viewStart()     const { return view_start_; }
@@ -193,13 +201,19 @@ private:
     // Ctrl+scroll adjusts this; resetView() restores it to 1.0.
     float y_scale_ = 1.0f;
 
-    bool   show_thresholds_ = false;
-    double threshold_pos_   =  4.5;
-    double threshold_neg_   = -4.5;
+    bool   show_thresholds_      = false;
+    bool   threshold_one_sided_  = false;
+    double threshold_pos_        =  4.5;
+    double threshold_neg_        = -4.5;
+
+    // Visual style
+    QString plot_title_;
+    float   trace_width_ = 1.5f;
 
     // Plot area margins (pixels)
-    static constexpr int ML = 65;
-    static constexpr int MR = 12;
-    static constexpr int MT = 12;
-    static constexpr int MB = 36;
+    static constexpr int ML      = 65;
+    static constexpr int MR      = 12;
+    static constexpr int MT      = 12;
+    static constexpr int MB      = 36;
+    static constexpr int MT_TITLE = 30;  // top margin when title is set
 };

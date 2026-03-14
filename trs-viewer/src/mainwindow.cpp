@@ -7,6 +7,7 @@
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
+#include <QColorDialog>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDoubleSpinBox>
@@ -17,6 +18,7 @@
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QInputDialog>
+#include <QLineEdit>
 #include <QLabel>
 #include <QMenuBar>
 #include <QMessageBox>
@@ -315,6 +317,10 @@ void MainWindow::setupMenuBar() {
     connect(act_open, &QAction::triggered, this, &MainWindow::onOpenFile);
     file_menu->addAction(act_open);
 
+    auto* act_open_npy = new QAction("Open NPY/NPZ as &traces…", this);
+    connect(act_open_npy, &QAction::triggered, this, &MainWindow::onOpenNpyTraces);
+    file_menu->addAction(act_open_npy);
+
     file_menu->addSeparator();
 
     auto* act_quit = new QAction("&Quit", this);
@@ -327,6 +333,14 @@ void MainWindow::setupMenuBar() {
     auto* act_exp_trs = new QAction("Export &TRS (processed traces)…", this);
     connect(act_exp_trs, &QAction::triggered, this, &MainWindow::onExportTrs);
     export_menu->addAction(act_exp_trs);
+
+    auto* act_exp_npy_traces = new QAction("Export traces as &NPY (2-D matrix)…", this);
+    connect(act_exp_npy_traces, &QAction::triggered, this, &MainWindow::onExportNpy);
+    export_menu->addAction(act_exp_npy_traces);
+
+    auto* act_exp_npz = new QAction("Export traces as NP&Z (traces + data)…", this);
+    connect(act_exp_npz, &QAction::triggered, this, &MainWindow::onExportNpz);
+    export_menu->addAction(act_exp_npz);
 
     export_menu->addSeparator();
 
@@ -848,6 +862,308 @@ static bool saveNpy(const QString& path, const float* data, int64_t n, QString& 
 }
 
 // ---------------------------------------------------------------------------
+// 2-D NPY helpers (n_rows × n_cols float32 or uint8, C-order / row-major)
+// ---------------------------------------------------------------------------
+
+static std::vector<uint8_t> buildNpyBytes(const std::string& dtype,
+                                           int64_t n_rows, int64_t n_cols,
+                                           const void* data, size_t data_bytes)
+{
+    std::string dict = "{'descr': '" + dtype + "', 'fortran_order': False, 'shape': ("
+                     + std::to_string(n_rows) + ", " + std::to_string(n_cols) + "), }";
+    size_t content_len = dict.size() + 1;
+    size_t header_len  = ((content_len + 10 + 63) / 64) * 64 - 10;
+    dict.resize(header_len - 1, ' ');
+    dict += '\n';
+
+    uint16_t hl = static_cast<uint16_t>(header_len);
+    std::vector<uint8_t> out;
+    out.reserve(10 + header_len + data_bytes);
+    const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 0x01, 0x00,
+                              uint8_t(hl & 0xFF), uint8_t(hl >> 8)};
+    out.insert(out.end(), magic, magic + 10);
+    out.insert(out.end(), dict.begin(), dict.end());
+    const auto* d = reinterpret_cast<const uint8_t*>(data);
+    out.insert(out.end(), d, d + data_bytes);
+    return out;
+}
+
+static bool saveNpy2D(const QString& path, const float* data,
+                       int64_t n_rows, int64_t n_cols, QString& err)
+{
+    auto bytes = buildNpyBytes("<f4", n_rows, n_cols, data,
+                                static_cast<size_t>(n_rows * n_cols) * sizeof(float));
+    FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
+    if (!fp) { err = "Cannot create: " + path; return false; }
+    std::fwrite(bytes.data(), 1, bytes.size(), fp);
+    std::fclose(fp);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal uncompressed NPZ writer (ZIP STORE method, no compression).
+// Entries is a list of (filename, raw_bytes) pairs.
+// ---------------------------------------------------------------------------
+
+static uint32_t zip_crc32(const uint8_t* data, size_t len)
+{
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++)
+            crc = (crc >> 1) ^ (0xEDB88320u & ~((crc & 1u) - 1u));
+    }
+    return ~crc;
+}
+
+static void zip_write_u16(std::vector<uint8_t>& v, uint16_t x) {
+    v.push_back(uint8_t(x));      v.push_back(uint8_t(x >> 8));
+}
+static void zip_write_u32(std::vector<uint8_t>& v, uint32_t x) {
+    v.push_back(uint8_t(x));      v.push_back(uint8_t(x >> 8));
+    v.push_back(uint8_t(x >> 16)); v.push_back(uint8_t(x >> 24));
+}
+
+static bool saveNpz(const QString& path,
+                     const std::vector<std::pair<std::string, std::vector<uint8_t>>>& entries,
+                     QString& err)
+{
+    std::vector<uint8_t> buf;
+    buf.reserve(1 << 20);
+
+    struct CDEntry {
+        std::string name;
+        uint32_t crc, size, offset;
+    };
+    std::vector<CDEntry> cd;
+
+    for (const auto& [name, data] : entries) {
+        uint32_t crc  = zip_crc32(data.data(), data.size());
+        uint32_t sz   = static_cast<uint32_t>(data.size());
+        uint32_t off  = static_cast<uint32_t>(buf.size());
+        cd.push_back({name, crc, sz, off});
+
+        // Local file header
+        zip_write_u32(buf, 0x04034b50u); // signature
+        zip_write_u16(buf, 20);          // version needed: 2.0
+        zip_write_u16(buf, 0);           // flags
+        zip_write_u16(buf, 0);           // compression: store
+        zip_write_u16(buf, 0);           // mod time
+        zip_write_u16(buf, 0);           // mod date
+        zip_write_u32(buf, crc);
+        zip_write_u32(buf, sz);          // compressed size
+        zip_write_u32(buf, sz);          // uncompressed size
+        zip_write_u16(buf, static_cast<uint16_t>(name.size()));
+        zip_write_u16(buf, 0);           // extra field length
+        buf.insert(buf.end(), name.begin(), name.end());
+        buf.insert(buf.end(), data.begin(), data.end());
+    }
+
+    uint32_t cd_offset = static_cast<uint32_t>(buf.size());
+
+    for (const auto& e : cd) {
+        zip_write_u32(buf, 0x02014b50u); // central dir signature
+        zip_write_u16(buf, 20);          // version made by
+        zip_write_u16(buf, 20);          // version needed
+        zip_write_u16(buf, 0);           // flags
+        zip_write_u16(buf, 0);           // compression: store
+        zip_write_u16(buf, 0);           // mod time
+        zip_write_u16(buf, 0);           // mod date
+        zip_write_u32(buf, e.crc);
+        zip_write_u32(buf, e.size);
+        zip_write_u32(buf, e.size);
+        zip_write_u16(buf, static_cast<uint16_t>(e.name.size()));
+        zip_write_u16(buf, 0);  zip_write_u16(buf, 0);
+        zip_write_u16(buf, 0);  zip_write_u16(buf, 0);
+        zip_write_u32(buf, 0);  zip_write_u32(buf, e.offset);
+        buf.insert(buf.end(), e.name.begin(), e.name.end());
+    }
+
+    uint32_t cd_size = static_cast<uint32_t>(buf.size()) - cd_offset;
+    uint16_t n_entries = static_cast<uint16_t>(cd.size());
+
+    // End of central directory
+    zip_write_u32(buf, 0x06054b50u);
+    zip_write_u16(buf, 0);  zip_write_u16(buf, 0);
+    zip_write_u16(buf, n_entries); zip_write_u16(buf, n_entries);
+    zip_write_u32(buf, cd_size);
+    zip_write_u32(buf, cd_offset);
+    zip_write_u16(buf, 0);  // comment length
+
+    FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
+    if (!fp) { err = "Cannot create: " + path; return false; }
+    std::fwrite(buf.data(), 1, buf.size(), fp);
+    std::fclose(fp);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Minimal NPZ reader: returns named entries as raw byte vectors.
+// Only STORE (method 0) compression is supported.
+// ---------------------------------------------------------------------------
+
+static bool loadNpz(const QString& path,
+                     std::map<std::string, std::vector<uint8_t>>& entries,
+                     QString& err)
+{
+    FILE* fp = std::fopen(path.toLocal8Bit().constData(), "rb");
+    if (!fp) { err = "Cannot open: " + path; return false; }
+
+    // Find end-of-central-directory by scanning backwards
+    std::fseek(fp, 0, SEEK_END);
+    long file_size = std::ftell(fp);
+    if (file_size < 22) { std::fclose(fp); err = "File too small to be NPZ."; return false; }
+
+    const int max_search = std::min((long)65558, file_size);
+    std::vector<uint8_t> tail(static_cast<size_t>(max_search));
+    std::fseek(fp, file_size - max_search, SEEK_SET);
+    std::fread(tail.data(), 1, tail.size(), fp);
+
+    int eocd_off = -1;
+    for (int i = static_cast<int>(tail.size()) - 22; i >= 0; i--) {
+        if (tail[i] == 0x50 && tail[i+1] == 0x4B && tail[i+2] == 0x05 && tail[i+3] == 0x06) {
+            eocd_off = i;
+            break;
+        }
+    }
+    if (eocd_off < 0) { std::fclose(fp); err = "No EOCD found; not a valid ZIP/NPZ."; return false; }
+
+    const uint8_t* eocd = tail.data() + eocd_off;
+    uint16_t n_entries  = static_cast<uint16_t>(eocd[8])  | (static_cast<uint16_t>(eocd[9])  << 8);
+    uint32_t cd_size    = static_cast<uint32_t>(eocd[12]) | (static_cast<uint32_t>(eocd[13]) << 8)
+                        | (static_cast<uint32_t>(eocd[14]) << 16) | (static_cast<uint32_t>(eocd[15]) << 24);
+    uint32_t cd_offset  = static_cast<uint32_t>(eocd[16]) | (static_cast<uint32_t>(eocd[17]) << 8)
+                        | (static_cast<uint32_t>(eocd[18]) << 16) | (static_cast<uint32_t>(eocd[19]) << 24);
+
+    std::vector<uint8_t> cd(cd_size);
+    std::fseek(fp, static_cast<long>(cd_offset), SEEK_SET);
+    if (std::fread(cd.data(), 1, cd_size, fp) != cd_size) {
+        std::fclose(fp); err = "Cannot read central directory."; return false;
+    }
+
+    size_t pos = 0;
+    for (uint16_t ei = 0; ei < n_entries; ei++) {
+        if (pos + 46 > cd.size()) break;
+        if (cd[pos] != 0x50 || cd[pos+1] != 0x4B || cd[pos+2] != 0x01 || cd[pos+3] != 0x02) break;
+        uint16_t method   = static_cast<uint16_t>(cd[pos+10]) | (static_cast<uint16_t>(cd[pos+11]) << 8);
+        uint32_t comp_sz  = static_cast<uint32_t>(cd[pos+20]) | (static_cast<uint32_t>(cd[pos+21]) << 8)
+                          | (static_cast<uint32_t>(cd[pos+22]) << 16) | (static_cast<uint32_t>(cd[pos+23]) << 24);
+        uint32_t uncomp_sz= static_cast<uint32_t>(cd[pos+24]) | (static_cast<uint32_t>(cd[pos+25]) << 8)
+                          | (static_cast<uint32_t>(cd[pos+26]) << 16) | (static_cast<uint32_t>(cd[pos+27]) << 24);
+        uint16_t fname_len= static_cast<uint16_t>(cd[pos+28]) | (static_cast<uint16_t>(cd[pos+29]) << 8);
+        uint16_t extra_len= static_cast<uint16_t>(cd[pos+30]) | (static_cast<uint16_t>(cd[pos+31]) << 8);
+        uint16_t comm_len = static_cast<uint16_t>(cd[pos+32]) | (static_cast<uint16_t>(cd[pos+33]) << 8);
+        uint32_t lh_offset= static_cast<uint32_t>(cd[pos+42]) | (static_cast<uint32_t>(cd[pos+43]) << 8)
+                          | (static_cast<uint32_t>(cd[pos+44]) << 16) | (static_cast<uint32_t>(cd[pos+45]) << 24);
+        std::string fname(reinterpret_cast<const char*>(cd.data() + pos + 46), fname_len);
+        pos += 46 + fname_len + extra_len + comm_len;
+
+        if (method != 0) {
+            err = QString("Entry '%1' uses compression method %2; only STORE (0) is supported.")
+                      .arg(QString::fromStdString(fname)).arg(method);
+            std::fclose(fp); return false;
+        }
+
+        // Read local file header to find data offset
+        std::fseek(fp, static_cast<long>(lh_offset) + 26, SEEK_SET);
+        uint8_t lh_extra[4] = {};
+        std::fread(lh_extra, 1, 4, fp);
+        uint16_t lh_fname_len = static_cast<uint16_t>(lh_extra[0]) | (static_cast<uint16_t>(lh_extra[1]) << 8);
+        uint16_t lh_extra_len = static_cast<uint16_t>(lh_extra[2]) | (static_cast<uint16_t>(lh_extra[3]) << 8);
+        long data_off = static_cast<long>(lh_offset) + 30 + lh_fname_len + lh_extra_len;
+        std::fseek(fp, data_off, SEEK_SET);
+
+        std::vector<uint8_t> data(uncomp_sz);
+        if (std::fread(data.data(), 1, uncomp_sz, fp) != uncomp_sz) {
+            err = QString("Truncated data for entry '%1'.").arg(QString::fromStdString(fname));
+            std::fclose(fp); return false;
+        }
+        (void)comp_sz;
+        entries[fname] = std::move(data);
+    }
+
+    std::fclose(fp);
+    return true;
+}
+
+// Parse a NPY array from an in-memory byte buffer into a flat float32 vector + shape.
+static bool parseNpyBytes(const std::vector<uint8_t>& buf,
+                           std::vector<float>& data,
+                           std::vector<int64_t>& shape,
+                           QString& err)
+{
+    if (buf.size() < 10) { err = "NPY entry too small."; return false; }
+    if (buf[0] != 0x93 || buf[1] != 'N' || buf[2] != 'U' ||
+        buf[3] != 'M'  || buf[4] != 'P' || buf[5] != 'Y') {
+        err = "Entry does not have NPY magic."; return false;
+    }
+    uint8_t ver = buf[6];
+    uint32_t header_len = 0;
+    size_t hdr_start;
+    if (ver == 1) {
+        header_len = static_cast<uint32_t>(buf[8]) | (static_cast<uint32_t>(buf[9]) << 8);
+        hdr_start = 10;
+    } else {
+        if (buf.size() < 12) { err = "NPY v2+ header too short."; return false; }
+        header_len = static_cast<uint32_t>(buf[8])  | (static_cast<uint32_t>(buf[9])  << 8)
+                   | (static_cast<uint32_t>(buf[10]) << 16) | (static_cast<uint32_t>(buf[11]) << 24);
+        hdr_start = 12;
+    }
+    if (hdr_start + header_len > buf.size()) { err = "NPY header truncated."; return false; }
+    std::string hdr(reinterpret_cast<const char*>(buf.data() + hdr_start), header_len);
+
+    // dtype must be float32 or uint8
+    bool is_f32 = (hdr.find("'<f4'") != std::string::npos || hdr.find("\"<f4\"") != std::string::npos);
+    bool is_u8  = (hdr.find("'|u1'") != std::string::npos || hdr.find("\"u1\""  ) != std::string::npos ||
+                   hdr.find("'uint8'") != std::string::npos);
+    if (!is_f32 && !is_u8) {
+        err = "Only float32 ('<f4') and uint8 ('|u1') dtypes are supported."; return false;
+    }
+
+    auto sp = hdr.find("'shape'");
+    if (sp == std::string::npos) sp = hdr.find("\"shape\"");
+    if (sp == std::string::npos) { err = "Cannot find shape in NPY header."; return false; }
+    auto lp = hdr.find('(', sp);
+    auto rp = hdr.find(')', lp != std::string::npos ? lp : 0);
+    if (lp == std::string::npos || rp == std::string::npos) { err = "Cannot parse shape."; return false; }
+    std::string shape_str = hdr.substr(lp + 1, rp - lp - 1);
+    shape.clear();
+    size_t pos = 0;
+    while (pos < shape_str.size()) {
+        while (pos < shape_str.size() &&
+               (shape_str[pos] == ' ' || shape_str[pos] == ',')) pos++;
+        if (pos >= shape_str.size() || !std::isdigit(static_cast<unsigned char>(shape_str[pos]))) break;
+        size_t end = pos;
+        while (end < shape_str.size() && std::isdigit(static_cast<unsigned char>(shape_str[end]))) end++;
+        shape.push_back(std::stoll(shape_str.substr(pos, end - pos)));
+        pos = end;
+    }
+    if (shape.empty()) { err = "Empty shape."; return false; }
+
+    int64_t n_elements = 1;
+    for (int64_t d : shape) n_elements *= d;
+
+    size_t data_offset = hdr_start + header_len;
+    if (is_f32) {
+        if (data_offset + static_cast<size_t>(n_elements) * 4 > buf.size()) {
+            err = "NPY data truncated."; return false;
+        }
+        data.resize(static_cast<size_t>(n_elements));
+        std::memcpy(data.data(), buf.data() + data_offset,
+                    static_cast<size_t>(n_elements) * sizeof(float));
+    } else {
+        // uint8 → cast to float
+        if (data_offset + static_cast<size_t>(n_elements) > buf.size()) {
+            err = "NPY data truncated."; return false;
+        }
+        data.resize(static_cast<size_t>(n_elements));
+        for (int64_t i = 0; i < n_elements; i++)
+            data[static_cast<size_t>(i)] = static_cast<float>(buf[data_offset + static_cast<size_t>(i)]);
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Load NPY helpers
 // ---------------------------------------------------------------------------
 
@@ -887,6 +1203,13 @@ void MainWindow::onLoadNpyTTest() {
     spin_thr->setDecimals(2); spin_thr->setSingleStep(0.5);
     connect(spin_thr, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             [pw](double v) { pw->setThresholds(true, v, -v); });
+
+    auto* chk_onesided_npy = new QCheckBox("One-sided (+)");
+    chk_onesided_npy->setToolTip("Show only positive threshold (use after abs() preprocessing)");
+    connect(chk_onesided_npy, &QCheckBox::toggled, dlg, [pw, lbl_thr](bool on) {
+        pw->setThresholdOneSided(on);
+        lbl_thr->setText(on ? "Threshold +:" : "Threshold ±:");
+    });
 
     auto* btn_exp_npy = new QPushButton("Export .npy…");
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, tstat_ptr]() {
@@ -967,6 +1290,68 @@ void MainWindow::onLoadNpyTTest() {
         cd->show();
     });
 
+    // Style dialog for NPY dialog
+    auto* btn_style_npy = new QPushButton("Style…");
+    connect(btn_style_npy, &QPushButton::clicked, dlg, [=]() {
+        auto* sd = new QDialog(dlg);
+        sd->setWindowTitle("Plot Style");
+        sd->setWindowModality(Qt::NonModal);
+        auto* fl2 = new QFormLayout(sd);
+
+        auto* le_title = new QLineEdit;
+        le_title->setPlaceholderText("e.g. Welch t-test — AES-128 key byte 0");
+        connect(le_title, &QLineEdit::textChanged, sd, [pw](const QString& t) { pw->setTitle(t); });
+
+        auto* sp_width = new QDoubleSpinBox;
+        sp_width->setRange(0.5, 6.0); sp_width->setValue(1.5); sp_width->setSingleStep(0.5);
+        connect(sp_width, QOverload<double>::of(&QDoubleSpinBox::valueChanged), sd,
+                [pw](double v) { pw->setTraceWidth(static_cast<float>(v)); });
+
+        auto* btn_color = new QPushButton("Pick color…");
+        btn_color->setStyleSheet(QString("background:%1").arg(QColor("#4fc3f7").name()));
+        connect(btn_color, &QPushButton::clicked, sd, [=]() {
+            QColor c = QColorDialog::getColor(QColor("#4fc3f7"), sd);
+            if (!c.isValid()) return;
+            pw->setTraceColor(0, c);
+            btn_color->setStyleSheet(QString("background:%1").arg(c.name()));
+        });
+
+        auto* btn_dark  = new QPushButton("Dark theme");
+        auto* btn_light = new QPushButton("Light theme");
+        connect(btn_dark,  &QPushButton::clicked, sd, [pw]() { pw->setTheme(PlotTheme::dark()); });
+        connect(btn_light, &QPushButton::clicked, sd, [pw]() { pw->setTheme(PlotTheme::light()); });
+
+        auto* bb2 = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(bb2, &QDialogButtonBox::rejected, sd, &QDialog::close);
+
+        fl2->addRow("Title:",       le_title);
+        fl2->addRow("Line width:",  sp_width);
+        fl2->addRow("Trace color:", btn_color);
+        auto* theme_row = new QWidget; auto* trl = new QHBoxLayout(theme_row);
+        trl->setContentsMargins(0,0,0,0); trl->addWidget(btn_dark); trl->addWidget(btn_light);
+        fl2->addRow("Theme:", theme_row);
+        fl2->addRow(bb2);
+        sd->show();
+    });
+
+    auto* btn_exp_pdf_npy = new QPushButton("Export PDF…");
+    connect(btn_exp_pdf_npy, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PDF", {}, "PDF files (*.pdf)");
+        if (path.isEmpty()) return;
+        QPdfWriter writer(path);
+        writer.setPageSize(QPageSize(QPageSize::A4));
+        writer.setPageOrientation(QPageLayout::Landscape);
+        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
+        QPainter painter(&writer);
+        double sx = static_cast<double>(writer.width())  / pw->width();
+        double sy = static_cast<double>(writer.height()) / pw->height();
+        double sc = std::min(sx, sy);
+        painter.scale(sc, sc);
+        pw->render(&painter);
+        painter.end();
+        QMessageBox::information(dlg, "Exported", "Saved: " + path);
+    });
+
     auto* ctrl   = new QWidget(dlg);
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
@@ -984,12 +1369,16 @@ void MainWindow::onLoadNpyTTest() {
 
     ctrl_l->addWidget(lbl_thr);
     ctrl_l->addWidget(spin_thr);
+    ctrl_l->addWidget(chk_onesided_npy);
     ctrl_l->addWidget(btn_calc_th_npy);
     ctrl_l->addSpacing(8);
     ctrl_l->addWidget(btn_yzi_npy);
     ctrl_l->addWidget(btn_yzo_npy);
+    ctrl_l->addSpacing(8);
+    ctrl_l->addWidget(btn_style_npy);
     ctrl_l->addStretch();
     ctrl_l->addWidget(btn_exp_npy);
+    ctrl_l->addWidget(btn_exp_pdf_npy);
 
     auto* vl = new QVBoxLayout(dlg);
     vl->setContentsMargins(4, 4, 4, 4); vl->setSpacing(4);
@@ -1199,6 +1588,286 @@ void MainWindow::onLoadNpyHeatmap() {
     dlg->show();
 }
 
+// ---------------------------------------------------------------------------
+// Open NPY / NPZ file as a trace set (loads into the main viewer)
+// ---------------------------------------------------------------------------
+void MainWindow::onOpenNpyTraces() {
+    QString path = QFileDialog::getOpenFileName(
+        this, "Open NPY/NPZ as traces",
+        {}, "NumPy files (*.npy *.npz);;All files (*)");
+    if (path.isEmpty()) return;
+
+    std::vector<float> traces_flat;
+    std::vector<float> data_flat;
+    int64_t n_traces = 0, n_samples = 0;
+    int64_t data_cols = 0;
+    QString err;
+
+    if (path.endsWith(".npz", Qt::CaseInsensitive)) {
+        std::map<std::string, std::vector<uint8_t>> entries;
+        if (!loadNpz(path, entries, err)) {
+            QMessageBox::critical(this, "Load failed", err); return;
+        }
+        // Look for 'traces', 'traces.npy', or the first 2-D float32 entry
+        auto it = entries.find("traces.npy");
+        if (it == entries.end()) it = entries.find("traces");
+        if (it == entries.end()) {
+            // pick the first 2-D entry
+            for (auto& kv : entries) {
+                std::vector<int64_t> sh;
+                std::vector<float> tmp;
+                if (parseNpyBytes(kv.second, tmp, sh, err) && sh.size() == 2) {
+                    it = entries.find(kv.first); break;
+                }
+            }
+        }
+        if (it == entries.end()) {
+            QMessageBox::critical(this, "Load failed",
+                "No 2-D traces array found. Expected an entry named 'traces' or 'traces.npy'.");
+            return;
+        }
+        std::vector<int64_t> sh;
+        if (!parseNpyBytes(it->second, traces_flat, sh, err)) {
+            QMessageBox::critical(this, "Load failed", err); return;
+        }
+        if (sh.size() != 2) {
+            QMessageBox::critical(this, "Load failed",
+                QString("Traces entry is %1-D; expected 2-D (n_traces × n_samples).").arg(sh.size()));
+            return;
+        }
+        n_traces = sh[0]; n_samples = sh[1];
+
+        // Optional 'data' or 'data.npy' entry (n_traces × data_length)
+        for (const char* dname : {"data.npy", "data", "labels.npy", "labels"}) {
+            auto di = entries.find(dname);
+            if (di == entries.end()) continue;
+            std::vector<int64_t> dsh;
+            if (parseNpyBytes(di->second, data_flat, dsh, err) && dsh.size() == 2 && dsh[0] == n_traces) {
+                data_cols = dsh[1];
+                break;
+            }
+        }
+    } else {
+        // Plain .npy
+        std::vector<int64_t> shape;
+        if (!loadNpy(path, traces_flat, shape, err)) {
+            QMessageBox::critical(this, "Load failed", err); return;
+        }
+        if (shape.size() != 2) {
+            QMessageBox::critical(this, "Load failed",
+                QString("Expected a 2-D array (n_traces × n_samples), got %1-D.").arg(shape.size()));
+            return;
+        }
+        n_traces = shape[0]; n_samples = shape[1];
+    }
+
+    if (n_traces < 1 || n_samples < 1) {
+        QMessageBox::critical(this, "Load failed", "Empty array."); return;
+    }
+
+    // Build the in-memory TrsFile
+    auto f = std::make_unique<TrsFile>();
+    std::vector<uint8_t> data_bytes;
+    int16_t data_length = 0;
+    if (data_cols > 0) {
+        data_length = static_cast<int16_t>(std::min(data_cols, (int64_t)32767));
+        data_bytes.resize(static_cast<size_t>(n_traces) * static_cast<size_t>(data_length));
+        for (int64_t ti = 0; ti < n_traces; ti++) {
+            for (int16_t bi = 0; bi < data_length; bi++) {
+                float v = data_flat[static_cast<size_t>(ti) * static_cast<size_t>(data_cols)
+                                  + static_cast<size_t>(bi)];
+                data_bytes[static_cast<size_t>(ti) * static_cast<size_t>(data_length)
+                         + static_cast<size_t>(bi)] = static_cast<uint8_t>(
+                    static_cast<int>(v) & 0xFF);
+            }
+        }
+    }
+    f->openFromArray(traces_flat.data(),
+                     static_cast<int32_t>(n_traces),
+                     static_cast<int32_t>(n_samples),
+                     path.toStdString(),
+                     data_bytes.empty() ? nullptr : data_bytes.data(),
+                     data_length);
+
+    trs_file_ = std::move(f);
+    pipeline_.clear();
+    rebuildTransformList();
+    plot_widget_->setTransforms(pipeline_);
+
+    int n = trs_file_->header().num_traces;
+    spin_first_->setMaximum(std::max(0, n - 1));
+    spin_count_->setMaximum(n);
+    spin_count_->setValue(1);
+    setWindowTitle(QString("TRS Viewer — %1").arg(QFileInfo(path).fileName()));
+
+    updateFileInfo();
+    onApplyTraces();
+}
+
+// ---------------------------------------------------------------------------
+// Export traces → 2-D NPY (n_traces × n_samples, pipeline applied)
+// ---------------------------------------------------------------------------
+void MainWindow::onExportNpy() {
+    if (!trs_file_) {
+        QMessageBox::information(this, "Export NPY", "No file loaded."); return;
+    }
+    const TrsHeader& h = trs_file_->header();
+
+    // Config dialog: same range picker as TRS export
+    QDialog cfg(this);
+    cfg.setWindowTitle("Export as NPY — configuration");
+    auto* fl     = new QFormLayout(&cfg);
+    auto* sp_first = new QSpinBox; sp_first->setRange(0, std::max(0, h.num_traces-1)); sp_first->setValue(0);
+    auto* sp_count = new QSpinBox; sp_count->setRange(1, h.num_traces); sp_count->setValue(h.num_traces);
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow("First trace:", sp_first);
+    fl->addRow("Count:",       sp_count);
+    fl->addRow(bb);
+    connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    if (cfg.exec() != QDialog::Accepted) return;
+
+    int32_t first = static_cast<int32_t>(sp_first->value());
+    int32_t count = static_cast<int32_t>(sp_count->value());
+    count = std::min(count, h.num_traces - first);
+
+    int64_t out_samples = h.num_samples;
+    for (const auto& t : pipeline_) out_samples = t->transformedCount(out_samples);
+
+    QString path = QFileDialog::getSaveFileName(
+        this, "Export traces as NPY", {}, "NumPy files (*.npy)");
+    if (path.isEmpty()) return;
+
+    // Allocate full matrix (may be large)
+    const size_t total = static_cast<size_t>(count) * static_cast<size_t>(out_samples);
+    double mem_mb = total * sizeof(float) / (1024.0 * 1024.0);
+    if (mem_mb > 2048.0) {
+        if (QMessageBox::warning(this, "Memory warning",
+                QString("Output matrix will require ~%1 GB.\nContinue?").arg(mem_mb/1024.0, 0,'f',1),
+                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) return;
+    }
+
+    std::vector<float> matrix(total);
+    std::vector<float> buf(static_cast<size_t>(h.num_samples));
+
+    QProgressDialog prog("Exporting…", "Cancel", 0, count, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(400);
+
+    for (int32_t ti = 0; ti < count; ti++) {
+        if (prog.wasCanceled()) return;
+        prog.setValue(ti);
+        QApplication::processEvents();
+
+        int32_t src = first + ti;
+        int64_t got = trs_file_->readSamples(src, 0, h.num_samples, buf.data());
+        if (got < h.num_samples)
+            std::fill(buf.begin() + static_cast<size_t>(got), buf.end(), 0.0f);
+        for (const auto& t : pipeline_) t->reset();
+        int64_t n_out = got;
+        for (const auto& t : pipeline_) n_out = t->apply(buf.data(), n_out, 0);
+        std::copy(buf.begin(), buf.begin() + static_cast<size_t>(n_out),
+                  matrix.begin() + static_cast<ptrdiff_t>(ti) * static_cast<ptrdiff_t>(out_samples));
+    }
+    prog.setValue(count);
+
+    QString err;
+    if (!saveNpy2D(path, matrix.data(), count, out_samples, err))
+        QMessageBox::critical(this, "Export failed", err);
+    else
+        QMessageBox::information(this, "Exported",
+            QString("Saved %1 × %2 matrix to:\n%3").arg(count).arg(out_samples).arg(path));
+}
+
+// ---------------------------------------------------------------------------
+// Export traces → NPZ (traces.npy + data.npy if TRS has data bytes)
+// ---------------------------------------------------------------------------
+void MainWindow::onExportNpz() {
+    if (!trs_file_) {
+        QMessageBox::information(this, "Export NPZ", "No file loaded."); return;
+    }
+    const TrsHeader& h = trs_file_->header();
+
+    QDialog cfg(this);
+    cfg.setWindowTitle("Export as NPZ — configuration");
+    auto* fl       = new QFormLayout(&cfg);
+    auto* sp_first = new QSpinBox; sp_first->setRange(0, std::max(0, h.num_traces-1)); sp_first->setValue(0);
+    auto* sp_count = new QSpinBox; sp_count->setRange(1, h.num_traces); sp_count->setValue(h.num_traces);
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow("First trace:", sp_first);
+    fl->addRow("Count:",       sp_count);
+    if (h.data_length > 0)
+        fl->addRow(new QLabel(QString("<i>Will also export data.npy (%1 bytes/trace)</i>")
+                                  .arg(h.data_length)));
+    fl->addRow(bb);
+    connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    if (cfg.exec() != QDialog::Accepted) return;
+
+    int32_t first = static_cast<int32_t>(sp_first->value());
+    int32_t count = static_cast<int32_t>(sp_count->value());
+    count = std::min(count, h.num_traces - first);
+
+    int64_t out_samples = h.num_samples;
+    for (const auto& t : pipeline_) out_samples = t->transformedCount(out_samples);
+
+    QString path = QFileDialog::getSaveFileName(
+        this, "Export traces as NPZ", {}, "NumPy archives (*.npz)");
+    if (path.isEmpty()) return;
+
+    // Build trace matrix
+    std::vector<float> traces(static_cast<size_t>(count) * static_cast<size_t>(out_samples));
+    std::vector<float> buf(static_cast<size_t>(h.num_samples));
+
+    QProgressDialog prog("Exporting…", "Cancel", 0, count, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(400);
+
+    for (int32_t ti = 0; ti < count; ti++) {
+        if (prog.wasCanceled()) return;
+        prog.setValue(ti);
+        QApplication::processEvents();
+        int32_t src = first + ti;
+        int64_t got = trs_file_->readSamples(src, 0, h.num_samples, buf.data());
+        if (got < h.num_samples)
+            std::fill(buf.begin() + static_cast<size_t>(got), buf.end(), 0.0f);
+        for (const auto& t : pipeline_) t->reset();
+        int64_t n_out = got;
+        for (const auto& t : pipeline_) n_out = t->apply(buf.data(), n_out, 0);
+        std::copy(buf.begin(), buf.begin() + static_cast<size_t>(n_out),
+                  traces.begin() + static_cast<ptrdiff_t>(ti) * static_cast<ptrdiff_t>(out_samples));
+    }
+    prog.setValue(count);
+
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> entries;
+    entries.push_back({"traces.npy",
+        buildNpyBytes("<f4", count, out_samples, traces.data(),
+                      static_cast<size_t>(count) * static_cast<size_t>(out_samples) * sizeof(float))});
+
+    if (h.data_length > 0) {
+        // Build data matrix (n_traces × data_length, uint8)
+        std::vector<uint8_t> data_mat(static_cast<size_t>(count) * static_cast<size_t>(h.data_length));
+        for (int32_t ti = 0; ti < count; ti++) {
+            auto db = trs_file_->readData(first + ti);
+            size_t copy_n = std::min(static_cast<size_t>(h.data_length), db.size());
+            std::copy(db.begin(), db.begin() + static_cast<ptrdiff_t>(copy_n),
+                      data_mat.begin() + static_cast<ptrdiff_t>(ti) * h.data_length);
+        }
+        entries.push_back({"data.npy",
+            buildNpyBytes("|u1", count, h.data_length, data_mat.data(), data_mat.size())});
+    }
+
+    QString err;
+    if (!saveNpz(path, entries, err))
+        QMessageBox::critical(this, "Export failed", err);
+    else
+        QMessageBox::information(this, "Exported",
+            QString("Saved %1 × %2 traces%3 to:\n%4")
+                .arg(count).arg(out_samples)
+                .arg(h.data_length > 0 ? " + data" : "")
+                .arg(path));
+}
+
 void MainWindow::onRunTTest() {
     if (!trs_file_) {
         QMessageBox::information(this, "T-test", "No file loaded.");
@@ -1340,12 +2009,19 @@ void MainWindow::onRunTTest() {
             .arg(n0).arg(n1));
     lbl_groups->setTextFormat(Qt::RichText);
 
-    auto* lbl_thr = new QLabel("Threshold ±:");
+    auto* lbl_thr  = new QLabel("Threshold ±:");
     auto* spin_thr = new QDoubleSpinBox;
     spin_thr->setRange(0.1, 1000.0);
     spin_thr->setValue(4.5);
     spin_thr->setDecimals(2);
     spin_thr->setSingleStep(0.5);
+
+    auto* chk_onesided = new QCheckBox("One-sided (+)");
+    chk_onesided->setToolTip("Show only the positive threshold (use when signal is preprocessed with abs())");
+    connect(chk_onesided, &QCheckBox::toggled, dlg, [pw, lbl_thr](bool on) {
+        pw->setThresholdOneSided(on);
+        lbl_thr->setText(on ? "Threshold +:" : "Threshold ±:");
+    });
 
     auto* btn_exp_trs = new QPushButton("Export TRS…");
     auto* btn_exp_npy = new QPushButton("Export .npy…");
@@ -1449,6 +2125,69 @@ void MainWindow::onRunTTest() {
         cd->show();
     });
 
+    // Style dialog button
+    auto* btn_style = new QPushButton("Style…");
+    connect(btn_style, &QPushButton::clicked, dlg, [=]() {
+        auto* sd = new QDialog(dlg);
+        sd->setWindowTitle("Plot Style");
+        sd->setWindowModality(Qt::NonModal);
+        auto* fl2 = new QFormLayout(sd);
+
+        auto* le_title = new QLineEdit(pw->windowTitle());
+        le_title->setPlaceholderText("e.g. Welch t-test — AES-128 key byte 0");
+        connect(le_title, &QLineEdit::textChanged, sd, [pw](const QString& t) { pw->setTitle(t); });
+
+        auto* sp_width = new QDoubleSpinBox;
+        sp_width->setRange(0.5, 6.0); sp_width->setValue(1.5); sp_width->setSingleStep(0.5);
+        connect(sp_width, QOverload<double>::of(&QDoubleSpinBox::valueChanged), sd,
+                [pw](double v) { pw->setTraceWidth(static_cast<float>(v)); });
+
+        auto* btn_color = new QPushButton("Pick color…");
+        btn_color->setStyleSheet(QString("background:%1").arg(QColor("#4fc3f7").name()));
+        connect(btn_color, &QPushButton::clicked, sd, [=]() {
+            QColor c = QColorDialog::getColor(pw->palette().color(QPalette::Window), sd);
+            if (!c.isValid()) return;
+            pw->setTraceColor(0, c);
+            btn_color->setStyleSheet(QString("background:%1").arg(c.name()));
+        });
+
+        auto* btn_dark  = new QPushButton("Dark theme");
+        auto* btn_light = new QPushButton("Light theme");
+        connect(btn_dark,  &QPushButton::clicked, sd, [pw]() { pw->setTheme(PlotTheme::dark()); });
+        connect(btn_light, &QPushButton::clicked, sd, [pw]() { pw->setTheme(PlotTheme::light()); });
+
+        auto* bb2 = new QDialogButtonBox(QDialogButtonBox::Close);
+        connect(bb2, &QDialogButtonBox::rejected, sd, &QDialog::close);
+
+        fl2->addRow("Title:",      le_title);
+        fl2->addRow("Line width:", sp_width);
+        fl2->addRow("Trace color:", btn_color);
+        auto* theme_row = new QWidget; auto* trl = new QHBoxLayout(theme_row);
+        trl->setContentsMargins(0,0,0,0); trl->addWidget(btn_dark); trl->addWidget(btn_light);
+        fl2->addRow("Theme:", theme_row);
+        fl2->addRow(bb2);
+        sd->show();
+    });
+
+    // PDF export button
+    auto* btn_exp_pdf = new QPushButton("Export PDF…");
+    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PDF", {}, "PDF files (*.pdf)");
+        if (path.isEmpty()) return;
+        QPdfWriter writer(path);
+        writer.setPageSize(QPageSize(QPageSize::A4));
+        writer.setPageOrientation(QPageLayout::Landscape);
+        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
+        QPainter painter(&writer);
+        double sx = static_cast<double>(writer.width())  / pw->width();
+        double sy = static_cast<double>(writer.height()) / pw->height();
+        double sc = std::min(sx, sy);
+        painter.scale(sc, sc);
+        pw->render(&painter);
+        painter.end();
+        QMessageBox::information(dlg, "Exported", "Saved: " + path);
+    });
+
     auto* ctrl = new QWidget(dlg);
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
@@ -1463,13 +2202,17 @@ void MainWindow::onRunTTest() {
 
     ctrl_l->addWidget(lbl_thr);
     ctrl_l->addWidget(spin_thr);
+    ctrl_l->addWidget(chk_onesided);
     ctrl_l->addWidget(btn_calc_th);
     ctrl_l->addSpacing(8);
     ctrl_l->addWidget(btn_yzi);
     ctrl_l->addWidget(btn_yzo);
+    ctrl_l->addSpacing(8);
+    ctrl_l->addWidget(btn_style);
     ctrl_l->addStretch();
     ctrl_l->addWidget(btn_exp_trs);
     ctrl_l->addWidget(btn_exp_npy);
+    ctrl_l->addWidget(btn_exp_pdf);
 
     auto* vl = new QVBoxLayout(dlg);
     vl->setContentsMargins(4, 4, 4, 4);

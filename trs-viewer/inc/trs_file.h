@@ -47,9 +47,15 @@ public:
     TrsFile& operator=(const TrsFile&) = delete;
 
     bool open(const std::string& path, std::string& error);
+    // Load an in-memory float32 trace matrix (row-major: samples[ti*n_samples+si]).
+    // Optionally supply data_bytes[ti*data_length+bi] for per-trace auxiliary data.
+    // After this call all SCA / xcorr code works on the in-memory data transparently.
+    bool openFromArray(const float* samples, int32_t n_traces, int32_t n_samples,
+                       const std::string& display_name = "memory",
+                       const uint8_t* data_bytes = nullptr, int16_t data_length = 0);
     void close();
 
-    bool isOpen() const { return mmap_ptr_ != nullptr; }
+    bool isOpen() const { return mmap_ptr_ != nullptr || !mem_samples_.empty(); }
     const TrsHeader& header() const { return header_; }
     const std::string& path() const { return path_; }
 
@@ -73,7 +79,11 @@ private:
     size_t      mmap_size_          = 0;
     int         fd_                 = -1;
     TrsHeader   header_;
-    int64_t     trace_block_offset_ = 0;  // file byte offset of first trace
+    int64_t     trace_block_offset_ = 0;
     int64_t     bytes_per_trace_    = 0;
     std::string path_;
+
+    // In-memory mode (set by openFromArray)
+    std::vector<float>   mem_samples_;   // n_traces × n_samples, row-major
+    std::vector<uint8_t> mem_data_;      // n_traces × data_length, row-major
 };

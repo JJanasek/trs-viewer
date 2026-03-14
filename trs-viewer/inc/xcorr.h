@@ -46,6 +46,21 @@ bool computeXCorr(
     XCorrProgress  progress,
     std::string&   error);
 
+// Naive reference implementation: no Eigen, no BLAS, no Welford — purely scalar
+// double loops for debugging correlation regressions.  Same signature as computeXCorr
+// but without the method parameter (always produces an M×M matrix).
+bool computeXCorrNaive(
+    TrsFile*       file,
+    int32_t        first_trace,
+    int32_t        num_traces,
+    int64_t        first_sample,
+    int64_t        num_samples,
+    int32_t        stride,
+    const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    XCorrResult&   out,
+    XCorrProgress  progress,
+    std::string&   error);
+
 // Compute a rectangular (search × ref) normalised cross-correlation matrix.
 // ref window:    [ref_first_sample, ref_first_sample + ref_num_samples)
 // search window: [search_first_sample, search_first_sample + search_num_samples)

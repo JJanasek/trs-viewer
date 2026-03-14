@@ -105,6 +105,27 @@ void PlotWidget::setThresholds(bool show, double pos, double neg) {
     update();
 }
 
+void PlotWidget::setThresholdOneSided(bool one_sided) {
+    threshold_one_sided_ = one_sided;
+    update();
+}
+
+void PlotWidget::setTitle(const QString& title) {
+    plot_title_ = title;
+    update();
+}
+
+void PlotWidget::setTraceWidth(float w) {
+    trace_width_ = std::clamp(w, 0.5f, 8.0f);
+    update();
+}
+
+void PlotWidget::setTraceColor(int idx, const QColor& c) {
+    if (idx < 0 || idx >= static_cast<int>(traces_.size())) return;
+    traces_[static_cast<size_t>(idx)].color = c;
+    update();
+}
+
 void PlotWidget::addTrace(TrsFile* file, int32_t trace_idx,
                            QColor color, const QString& label)
 {
@@ -215,7 +236,8 @@ void PlotWidget::resetYZoom() {
 // ---------------------------------------------------------------------------
 
 QRect PlotWidget::plotRect() const {
-    return QRect(ML, MT, width() - ML - MR, height() - MT - MB);
+    int mt = plot_title_.isEmpty() ? MT : MT_TITLE;
+    return QRect(ML, mt, width() - ML - MR, height() - mt - MB);
 }
 
 int64_t PlotWidget::pixelToSample(int px, const QRect& pr) const {
@@ -401,7 +423,7 @@ void PlotWidget::renderTrace(const TraceEntry& te, QPainter& p,
         const float*  buf       = te.cache.samples.data();
 
         p.setRenderHint(QPainter::Antialiasing, true);
-        p.setPen(QPen(te.color, 1.5));
+        p.setPen(QPen(te.color, trace_width_));
 
         auto sx = [&](int64_t i) -> int {
             int64_t raw_s = (out_count > 1)
@@ -520,6 +542,14 @@ void PlotWidget::paintEvent(QPaintEvent*) {
     p.fillRect(rect(), theme_.bg_outer);
     p.fillRect(pr,     theme_.bg_plot);
 
+    // Title
+    if (!plot_title_.isEmpty()) {
+        QFont tf = font(); tf.setPointSize(10); tf.setBold(true); p.setFont(tf);
+        p.setPen(theme_.legend_text);
+        p.drawText(QRect(ML, 0, width() - ML - MR, MT_TITLE),
+                   Qt::AlignHCenter | Qt::AlignVCenter, plot_title_);
+    }
+
     if (traces_.empty() || view_end_ <= view_start_) {
         QColor tc = theme_.axis_text; tc.setAlpha(160);
         p.setPen(tc);
@@ -561,20 +591,21 @@ void PlotWidget::paintEvent(QPaintEvent*) {
 
     // Threshold lines
     if (show_thresholds_) {
-        const QColor thr_color(255, 160, 0, 220);  // orange
-        QPen thr_pen(thr_color, 1, Qt::DashLine);
-        p.setPen(thr_pen);
-        QFont tf = font(); tf.setPointSize(8); tf.setBold(true); p.setFont(tf);
-        for (double tv : {threshold_pos_, threshold_neg_}) {
+        const QColor thr_color(220, 120, 0, 230);  // amber-orange
+        QPen thr_pen(thr_color, 1.2, Qt::DashLine);
+        QFont tf = font(); tf.setPointSize(8); tf.setBold(true);
+        auto drawThrLine = [&](double tv) {
             int ty = valueToPixel(static_cast<float>(tv), pr, ymin, ymax);
             if (ty >= pr.top() && ty <= pr.bottom()) {
                 p.setPen(thr_pen);
                 p.drawLine(pr.left(), ty, pr.right(), ty);
+                p.setFont(tf);
                 p.setPen(thr_color);
-                p.drawText(pr.left() + 4, ty - 3,
-                           QString("%1").arg(tv, 0, 'f', 1));
+                p.drawText(pr.left() + 4, ty - 3, QString("%1").arg(tv, 0, 'f', 2));
             }
-        }
+        };
+        drawThrLine(threshold_pos_);
+        if (!threshold_one_sided_) drawThrLine(threshold_neg_);
     }
 
     // Crop range overlays (drawn on top of traces)
