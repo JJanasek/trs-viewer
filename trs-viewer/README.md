@@ -8,16 +8,6 @@ Interactive power-trace viewer and side-channel analysis toolkit for Riscure `.t
 
 ---
 
-## Screenshots
-
-![Trace browser and pipeline](docs/trace_browser.gif)
-
-![T-test result and PDF export](docs/ttest_export.gif)
-
-![Cross-correlation heatmap](docs/heatmap.gif)
-
----
-
 ## Features
 
 ### Trace Viewing
@@ -43,6 +33,8 @@ Transforms stack in order and are applied live on every render:
 | Offset | Add constant |
 | Scale | Multiply by constant |
 
+![Trace browser and pipeline](docs/trace_browser.gif)
+
 ### Welch T-Test
 
 Computes the per-sample Welch t-statistic between two trace groups (labelled 0 / 1 via the first auxiliary data byte, or the `ttest` parameter map entry).
@@ -54,6 +46,8 @@ Computes the per-sample Welch t-statistic between two trace groups (labelled 0 /
 - **Style…** — set plot title, line width, trace colour, dark/light theme
 - **Export PDF…** — A4 landscape vector PDF (ideal after switching to light theme)
 - Export as `.npy` or `.trs`
+
+![T-test result and PDF export](docs/ttest_export.gif)
 
 ### Cross-Correlation Matrix
 
@@ -80,6 +74,8 @@ The correlation matrix opens as an interactive false-colour heatmap:
 - **Gaussian blur** (σ-controlled) for pattern smoothing
 - **Abs value** mode and **binary threshold** on `|v|`
 - Export as PNG (≤ 2400 px) or `.npy`
+
+![Cross-correlation heatmap](docs/heatmap.gif)
 
 ### NPY / NPZ Support
 
