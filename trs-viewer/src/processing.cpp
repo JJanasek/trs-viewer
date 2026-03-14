@@ -87,7 +87,7 @@ int64_t MovingAverageTransform::apply(float* buf, int64_t count, int64_t) {
         ring_sum_ -= static_cast<double>(ring_[ring_pos_]);
         ring_[ring_pos_] = buf[i];
         ring_sum_ += static_cast<double>(buf[i]);
-        ring_pos_ = (ring_pos_ + 1) % window_size_;
+        if (++ring_pos_ >= window_size_) ring_pos_ = 0;
         ring_count_++;
 
         int64_t n = std::min(ring_count_, static_cast<int64_t>(window_size_));

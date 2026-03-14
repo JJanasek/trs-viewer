@@ -7,13 +7,17 @@
 #include <algorithm>
 #include <cmath>
 
+#ifdef _OPENMP
+#  include <omp.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Separable Gaussian blur (clamp-to-edge boundary)
 // ---------------------------------------------------------------------------
-static void gaussianBlur(const float* src, float* dst, int M, float sigma) {
-    if (M <= 0) return;
+static void gaussianBlur(const float* src, float* dst, int rows, int cols, float sigma) {
+    if (rows <= 0 || cols <= 0) return;
     if (sigma <= 0.0f) {
-        std::copy(src, src + static_cast<size_t>(M) * M, dst);
+        std::copy(src, src + static_cast<size_t>(rows) * cols, dst);
         return;
     }
     int r = std::max(1, static_cast<int>(std::ceil(3.0f * sigma)));
@@ -27,29 +31,31 @@ static void gaussianBlur(const float* src, float* dst, int M, float sigma) {
     }
     for (auto& k : kernel) k /= ksum;
 
-    std::vector<float> tmp(static_cast<size_t>(M) * M);
+    std::vector<float> tmp(static_cast<size_t>(rows) * cols);
 
     // Horizontal pass
-    for (int row = 0; row < M; row++) {
-        for (int col = 0; col < M; col++) {
+#pragma omp parallel for schedule(static)
+    for (int row = 0; row < rows; row++) {
+        for (int col = 0; col < cols; col++) {
             float acc = 0.0f;
             for (int ki = 0; ki < ksize; ki++) {
-                int c = std::clamp(col + ki - r, 0, M - 1);
-                acc += src[row * M + c] * kernel[ki];
+                int c = std::clamp(col + ki - r, 0, cols - 1);
+                acc += src[row * cols + c] * kernel[ki];
             }
-            tmp[row * M + col] = acc;
+            tmp[row * cols + col] = acc;
         }
     }
 
     // Vertical pass
-    for (int row = 0; row < M; row++) {
-        for (int col = 0; col < M; col++) {
+#pragma omp parallel for schedule(static)
+    for (int row = 0; row < rows; row++) {
+        for (int col = 0; col < cols; col++) {
             float acc = 0.0f;
             for (int ki = 0; ki < ksize; ki++) {
-                int rr = std::clamp(row + ki - r, 0, M - 1);
-                acc += tmp[rr * M + col] * kernel[ki];
+                int rr = std::clamp(row + ki - r, 0, rows - 1);
+                acc += tmp[rr * cols + col] * kernel[ki];
             }
-            dst[row * M + col] = acc;
+            dst[row * cols + col] = acc;
         }
     }
 }
@@ -82,6 +88,10 @@ static const CmapEntry kPlasma[] = {
     {0.50f, 237, 104,  60}, {0.75f, 246, 200,  33},
     {1.00f, 240, 249,  33},
 };
+static const CmapEntry kLukasz[] = {
+    {0.0f,   0,   0,   0},
+    {1.0f,   0, 255,   0},
+};
 
 static QRgb interpColormap(float t, const CmapEntry* cm, int n) {
     t = std::clamp(t, 0.0f, 1.0f);
@@ -105,8 +115,43 @@ QRgb HeatmapWidget::colormap(float v) const {
     case ColorScheme::Hot:       return interpColormap(t, kHot,       4);
     case ColorScheme::Viridis:   return interpColormap(t, kViridis,   5);
     case ColorScheme::Plasma:    return interpColormap(t, kPlasma,    5);
+    case ColorScheme::Lukasz:    return interpColormap(t, kLukasz,   2);
     default: /* RdBu */          return interpColormap(t, kRdBu,      5);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Screen-space renderer: maps a W×H image to data region [x0,x1)×[y0,y1).
+// Only reads the visible subset of display_matrix_, colormapped per pixel.
+// Rows are processed in parallel with OpenMP.
+// ---------------------------------------------------------------------------
+QImage HeatmapWidget::renderRegion(int W, int H,
+                                    double x0, double y0,
+                                    double x1, double y1) const
+{
+    QImage img(W, H, QImage::Format_RGB32);
+    if (rows_ <= 0 || cols_ <= 0 || display_matrix_.empty() || W <= 0 || H <= 0)
+        return img;
+
+    QRgb* bits = reinterpret_cast<QRgb*>(img.bits());
+    const int bpl = img.bytesPerLine() / static_cast<int>(sizeof(QRgb));
+
+    const double dx = (x1 - x0) / W;
+    const double dy = (y1 - y0) / H;
+    const int    Nr = rows_, Nc = cols_;
+    const float* dm = display_matrix_.data();
+
+#pragma omp parallel for schedule(static)
+    for (int row = 0; row < H; row++) {
+        const int data_row = std::clamp(static_cast<int>(y0 + (row + 0.5) * dy), 0, Nr - 1);
+        const float* src   = dm + static_cast<size_t>(data_row) * Nc;
+        QRgb*        line  = bits + row * bpl;
+        for (int col = 0; col < W; col++) {
+            const int data_col = std::clamp(static_cast<int>(x0 + (col + 0.5) * dx), 0, Nc - 1);
+            line[col] = colormap(src[data_col]);
+        }
+    }
+    return img;
 }
 
 // ---------------------------------------------------------------------------
@@ -119,19 +164,30 @@ HeatmapWidget::HeatmapWidget(QWidget* parent) : QWidget(parent) {
     setAutoFillBackground(true);
 }
 
-void HeatmapWidget::setMatrix(const std::vector<float>& data, int32_t M) {
+void HeatmapWidget::setMatrix(const std::vector<float>& data, int32_t rows, int32_t cols) {
     matrix_ = data;
-    M_      = M;
+    rows_   = rows;
+    cols_   = cols;
     resetView();
     applyProcessing();
-    rebuildImage();
     update();
 }
 
 void HeatmapWidget::setGaussianSigma(float sigma) {
     gaussian_sigma_ = std::max(0.0f, sigma);
     applyProcessing();
-    rebuildImage();
+    update();
+}
+
+void HeatmapWidget::setAbsValue(bool enabled) {
+    abs_value_ = enabled;
+    applyProcessing();
+    update();
+}
+
+void HeatmapWidget::setPowerGamma(float gamma) {
+    power_gamma_ = std::max(1.0f, gamma);
+    applyProcessing();
     update();
 }
 
@@ -139,13 +195,11 @@ void HeatmapWidget::setBinaryThreshold(bool enabled, float threshold) {
     threshold_enabled_ = enabled;
     threshold_value_   = threshold;
     applyProcessing();
-    rebuildImage();
     update();
 }
 
 void HeatmapWidget::setColorScheme(ColorScheme scheme) {
     color_scheme_ = scheme;
-    rebuildImage();
     update();
 }
 
@@ -153,48 +207,85 @@ void HeatmapWidget::setColorRange(float vmin, float vmax) {
     if (vmax <= vmin) vmax = vmin + 1e-6f;
     vmin_ = vmin;
     vmax_ = vmax;
-    rebuildImage();
     update();
 }
 
 void HeatmapWidget::resetView() {
     view_x0_ = 0.0;
-    view_x1_ = static_cast<double>(M_);
+    view_x1_ = static_cast<double>(cols_);
     view_y0_ = 0.0;
-    view_y1_ = static_cast<double>(M_);
+    view_y1_ = static_cast<double>(rows_);
     update();
 }
 
 void HeatmapWidget::applyProcessing() {
-    if (M_ <= 0 || static_cast<int64_t>(matrix_.size()) < static_cast<int64_t>(M_) * M_)
+    if (rows_ <= 0 || cols_ <= 0 ||
+        static_cast<int64_t>(matrix_.size()) < static_cast<int64_t>(rows_) * cols_)
         return;
+    const int sz = static_cast<int>(matrix_.size());
     display_matrix_.resize(matrix_.size());
-    gaussianBlur(matrix_.data(), display_matrix_.data(), M_, gaussian_sigma_);
+
+    // Step 1: Gaussian blur
+    gaussianBlur(matrix_.data(), display_matrix_.data(), rows_, cols_, gaussian_sigma_);
+
+    // Step 2: Absolute value — makes negative correlations as visible as positive ones
+    if (abs_value_) {
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < sz; i++)
+            display_matrix_[i] = std::abs(display_matrix_[i]);
+    }
+
+    // Step 3: Power/gamma — compresses the dynamic range.
+    // Values are clamped to [0,1] before raising to the power, so the
+    // mapping stays well-defined regardless of the sign or magnitude.
+    // A gamma > 1 darkens the background and sharpens peaks;
+    // the diagonal (value=1) stays at 1.
+    if (power_gamma_ > 1.0f) {
+        const float inv_range = (vmax_ != vmin_) ? 1.0f / (vmax_ - vmin_) : 1.0f;
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < sz; i++) {
+            float t = std::clamp((display_matrix_[i] - vmin_) * inv_range, 0.0f, 1.0f);
+            display_matrix_[i] = std::pow(t, power_gamma_) * (vmax_ - vmin_) + vmin_;
+        }
+    }
+
+    // Step 4: Binary threshold
     if (threshold_enabled_) {
-        for (auto& v : display_matrix_)
-            v = (std::abs(v) >= threshold_value_) ? 1.0f : 0.0f;
+#pragma omp parallel for schedule(static)
+        for (int i = 0; i < sz; i++)
+            display_matrix_[i] = (std::abs(display_matrix_[i]) >= threshold_value_) ? 1.0f : 0.0f;
     }
 }
 
-void HeatmapWidget::rebuildImage() {
-    if (M_ <= 0 || display_matrix_.size() < static_cast<size_t>(M_) * M_)
-        return;
+void HeatmapWidget::computeClipRange(float percentile,
+                                      float& out_vmin, float& out_vmax) const {
+    if (display_matrix_.empty()) { out_vmin = vmin_; out_vmax = vmax_; return; }
+    std::vector<float> vals = display_matrix_;
+    const size_t n = vals.size();
 
-    cached_image_ = QImage(M_, M_, QImage::Format_RGB32);
-    for (int row = 0; row < M_; row++) {
-        QRgb* line = reinterpret_cast<QRgb*>(cached_image_.scanLine(row));
-        const float* src = display_matrix_.data() + static_cast<size_t>(row) * static_cast<size_t>(M_);
-        for (int col = 0; col < M_; col++)
-            line[col] = colormap(src[col]);
-    }
+    // Upper clip point
+    size_t hi = static_cast<size_t>(std::clamp(percentile, 0.0f, 1.0f) * (n - 1));
+    std::nth_element(vals.begin(), vals.begin() + hi, vals.end());
+    out_vmax = vals[hi];
+
+    // Lower clip point (symmetric: 1 - percentile)
+    size_t lo = static_cast<size_t>(std::clamp(1.0f - percentile, 0.0f, 1.0f) * (n - 1));
+    std::nth_element(vals.begin(), vals.begin() + lo, vals.end());
+    out_vmin = vals[lo];
+
+    if (out_vmax <= out_vmin) out_vmax = out_vmin + 1e-6f;
 }
 
 bool HeatmapWidget::exportPng(const QString& path, int max_pixels) const {
-    if (cached_image_.isNull()) return false;
-    QImage img = cached_image_;
-    if (img.width() > max_pixels || img.height() > max_pixels)
-        img = img.scaled(max_pixels, max_pixels,
-                         Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    if (rows_ <= 0 || cols_ <= 0 || display_matrix_.empty()) return false;
+    // Scale to max_pixels on the longer side, preserving aspect ratio.
+    int W = cols_, H = rows_;
+    if (W > max_pixels || H > max_pixels) {
+        if (W >= H) { W = max_pixels; H = std::max(1, max_pixels * rows_ / cols_); }
+        else        { H = max_pixels; W = std::max(1, max_pixels * cols_ / rows_); }
+    }
+    QImage img = renderRegion(W, H, 0.0, 0.0,
+                               static_cast<double>(cols_), static_cast<double>(rows_));
     return img.save(path, "PNG");
 }
 
@@ -205,27 +296,26 @@ QRect HeatmapWidget::plotRect() const {
 // ---------------------------------------------------------------------------
 void HeatmapWidget::paintEvent(QPaintEvent*) {
     QPainter p(this);
-    p.setRenderHint(QPainter::SmoothPixmapTransform, true);
 
     QRect pr = plotRect();
 
-    if (M_ <= 0 || cached_image_.isNull()) {
+    if (rows_ <= 0 || cols_ <= 0 || display_matrix_.empty()) {
         p.setPen(QColor(180, 180, 200));
         p.drawText(rect(), Qt::AlignCenter, "No data.\nRun SCA → Cross-Correlation.");
         return;
     }
 
-    // Draw heatmap: map view window (in matrix coords) to plot rect
-    QRectF src(view_x0_, view_y0_,
-               view_x1_ - view_x0_,
-               view_y1_ - view_y0_);
-    p.drawImage(QRectF(pr), cached_image_, src);
+    // Render only the visible viewport — O(W×H) not O(M²)
+    QImage viewport = renderRegion(pr.width(), pr.height(),
+                                    view_x0_, view_y0_,
+                                    view_x1_, view_y1_);
+    p.drawImage(pr.topLeft(), viewport);
 
     // Border
     p.setPen(QColor(80, 80, 100));
     p.drawRect(pr);
 
-    // Axis labels (X = bottom, Y = left), ~6 ticks each
+    // Axis labels
     p.setPen(QColor(180, 180, 200));
     QFont f = font(); f.setPointSize(8); p.setFont(f);
 
@@ -239,26 +329,23 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
     double span_y = view_y1_ - view_y0_;
 
     for (int i = 0; i <= 6; i++) {
-        // X axis
         double fx = view_x0_ + span_x * i / 6.0;
         int px = pr.left() + pr.width() * i / 6;
         p.drawLine(px, pr.bottom(), px, pr.bottom() + 4);
         p.drawText(px - 28, pr.bottom() + 5, 56, 18, Qt::AlignCenter, fmt(fx));
 
-        // Y axis
         double fy = view_y0_ + span_y * i / 6.0;
         int py = pr.top() + pr.height() * i / 6;
         p.drawLine(pr.left() - 4, py, pr.left(), py);
         p.drawText(0, py - 9, ML - 6, 18, Qt::AlignRight | Qt::AlignVCenter, fmt(fy));
     }
 
-    // Colour bar (right side) — vertical strip mapping [vmin_, vmax_] → color
+    // Colour bar
     {
         const int bar_w = 10;
         const int bar_x = pr.right() + 2;
         const int bar_h = pr.height();
         for (int yi = 0; yi < bar_h; yi++) {
-            // yi=0 is top (vmax), yi=bar_h-1 is bottom (vmin)
             float v = vmax_ - (vmax_ - vmin_) * static_cast<float>(yi) / bar_h;
             QRgb c  = colormap(v);
             p.setPen(QColor(c));
@@ -266,8 +353,6 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
         }
         p.setPen(QColor(80, 80, 100));
         p.drawRect(bar_x, pr.top(), bar_w, bar_h);
-
-        // vmax/vmin labels
         p.setPen(QColor(180, 180, 200));
         p.setFont(f);
         p.drawText(bar_x + bar_w + 2, pr.top() + 10,
@@ -300,21 +385,20 @@ void HeatmapWidget::mouseMoveEvent(QMouseEvent* e) {
 
         double span_x = view_x1_ - view_x0_;
         double span_y = view_y1_ - view_y0_;
-        view_x0_ = std::clamp(drag_x0_ + dx, 0.0, static_cast<double>(M_) - span_x);
+        view_x0_ = std::clamp(drag_x0_ + dx, 0.0, static_cast<double>(cols_) - span_x);
         view_x1_ = view_x0_ + span_x;
-        view_y0_ = std::clamp(drag_y0_ + dy, 0.0, static_cast<double>(M_) - span_y);
+        view_y0_ = std::clamp(drag_y0_ + dy, 0.0, static_cast<double>(rows_) - span_y);
         view_y1_ = view_y0_ + span_y;
         update();
     }
 
-    // Hover info
-    if (M_ > 0 && pr.contains(e->pos())) {
+    if (rows_ > 0 && cols_ > 0 && pr.contains(e->pos())) {
         double fx = view_x0_ + (view_x1_ - view_x0_) * (e->pos().x() - pr.left()) / pr.width();
         double fy = view_y0_ + (view_y1_ - view_y0_) * (e->pos().y() - pr.top())  / pr.height();
         int s1 = static_cast<int>(fy);
         int s2 = static_cast<int>(fx);
-        if (s1 >= 0 && s1 < M_ && s2 >= 0 && s2 < M_)
-            emit hoverInfo(s1, s2, matrix_[static_cast<size_t>(s1 * M_ + s2)]);
+        if (s1 >= 0 && s1 < rows_ && s2 >= 0 && s2 < cols_)
+            emit hoverInfo(s1, s2, matrix_[static_cast<size_t>(s1 * cols_ + s2)]);
     }
 }
 
@@ -336,7 +420,6 @@ void HeatmapWidget::wheelEvent(QWheelEvent* e) {
     double py = e->posF().y();
 #endif
 
-    // Pivot in matrix coordinates
     double cx = view_x0_ + (view_x1_ - view_x0_) * (px - pr.left()) / pr.width();
     double cy = view_y0_ + (view_y1_ - view_y0_) * (py - pr.top())  / pr.height();
 
@@ -344,20 +427,20 @@ void HeatmapWidget::wheelEvent(QWheelEvent* e) {
     double span_x = std::max(2.0, (view_x1_ - view_x0_) * factor);
     double span_y = std::max(2.0, (view_y1_ - view_y0_) * factor);
 
-    // Keep pivot fixed
     double frac_x = (pr.width()  > 0) ? (px - pr.left()) / pr.width()  : 0.5;
     double frac_y = (pr.height() > 0) ? (py - pr.top())  / pr.height() : 0.5;
     double nx0 = cx - frac_x * span_x;
     double ny0 = cy - frac_y * span_y;
 
-    double Md = static_cast<double>(M_);
-    view_x0_ = std::clamp(nx0, 0.0, Md - span_x);
+    double Md_x = static_cast<double>(cols_);
+    double Md_y = static_cast<double>(rows_);
+    view_x0_ = std::clamp(nx0, 0.0, Md_x - span_x);
     view_x1_ = view_x0_ + span_x;
-    if (view_x1_ > Md) { view_x1_ = Md; view_x0_ = std::max(0.0, Md - span_x); }
+    if (view_x1_ > Md_x) { view_x1_ = Md_x; view_x0_ = std::max(0.0, Md_x - span_x); }
 
-    view_y0_ = std::clamp(ny0, 0.0, Md - span_y);
+    view_y0_ = std::clamp(ny0, 0.0, Md_y - span_y);
     view_y1_ = view_y0_ + span_y;
-    if (view_y1_ > Md) { view_y1_ = Md; view_y0_ = std::max(0.0, Md - span_y); }
+    if (view_y1_ > Md_y) { view_y1_ = Md_y; view_y0_ = std::max(0.0, Md_y - span_y); }
 
     update();
 }

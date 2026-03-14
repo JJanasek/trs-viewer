@@ -10,9 +10,7 @@
 #include <limits>
 #include <vector>
 
-static constexpr int64_t RENDER_CHUNK    = 1 << 20;  // 1 M samples = 4 MB
-static constexpr int64_t STRIDE_THRESHOLD = 8;
-static constexpr int64_t YRANGE_SAMPLES  = 2048;
+static constexpr int64_t RENDER_CHUNK = 1 << 20;  // 1 M samples = 4 MB
 
 // ---------------------------------------------------------------------------
 // PlotTheme built-ins
@@ -115,7 +113,7 @@ void PlotWidget::addTrace(TrsFile* file, int32_t trace_idx,
     te.trace_idx  = trace_idx;
     te.color      = color;
     te.label      = label.isEmpty() ? QString("Trace %1").arg(trace_idx) : label;
-    te.transforms = transforms_;
+    for (const auto& t : transforms_) te.transforms.push_back(t->clone());
     traces_.push_back(std::move(te));
 
     if (file && total_samples_ == 0) {
@@ -133,7 +131,7 @@ void PlotWidget::addTrace(std::shared_ptr<std::vector<float>> data,
     te.mem_data  = std::move(data);
     te.color     = color;
     te.label     = label.isEmpty() ? QString("T-statistic") : label;
-    te.transforms = transforms_;
+    for (const auto& t : transforms_) te.transforms.push_back(t->clone());
     traces_.push_back(std::move(te));
 
     if (total_samples_ == 0 && !traces_.back().mem_data->empty()) {
@@ -153,7 +151,11 @@ void PlotWidget::clearTraces() {
 
 void PlotWidget::setTransforms(const std::vector<std::shared_ptr<ITransform>>& tx) {
     transforms_ = tx;
-    for (auto& te : traces_) te.transforms = tx;
+    for (auto& te : traces_) {
+        te.transforms.clear();
+        for (const auto& t : tx) te.transforms.push_back(t->clone());
+        te.cache.valid = false;
+    }
     update();
 }
 
@@ -163,6 +165,7 @@ void PlotWidget::resetView() {
         startup = std::max(startup, t->startupSamples());
     view_start_ = std::min(startup, total_samples_);
     view_end_   = total_samples_;
+    y_scale_    = 1.0f;
     clearMeasurement();
     emit viewChanged(view_start_, view_end_, total_samples_);
     update();
@@ -189,6 +192,21 @@ void PlotWidget::zoomOut() {
     view_start_ = std::max(INT64_C(0), c - h);
     view_end_   = std::min(total_samples_, c + h);
     emit viewChanged(view_start_, view_end_, total_samples_);
+    update();
+}
+
+void PlotWidget::zoomInY() {
+    y_scale_ = std::clamp(y_scale_ * 0.75f, 0.05f, 200.0f);
+    update();
+}
+
+void PlotWidget::zoomOutY() {
+    y_scale_ = std::clamp(y_scale_ / 0.75f, 0.05f, 200.0f);
+    update();
+}
+
+void PlotWidget::resetYZoom() {
+    y_scale_ = 1.0f;
     update();
 }
 
@@ -244,34 +262,114 @@ int64_t PlotWidget::readTraceSamples(const TraceEntry& te,
 }
 
 // ---------------------------------------------------------------------------
-// Y-range estimation
+// Trace cache builder — called once per visible trace per frame.
+// Re-uses the existing cache if (view_start, view_end, W) have not changed.
+// ---------------------------------------------------------------------------
+
+void PlotWidget::buildTraceCache(TraceEntry& te, int W)
+{
+    if (!te.visible || (!te.file && !te.mem_data)) return;
+
+    if (te.cache.valid &&
+        te.cache.view_start == view_start_ &&
+        te.cache.view_end   == view_end_   &&
+        te.cache.W          == W)
+        return;   // cache is fresh
+
+    const int64_t view_len = view_end_ - view_start_;
+    if (view_len <= 0) { te.cache.valid = false; return; }
+
+    te.cache.view_start = view_start_;
+    te.cache.view_end   = view_end_;
+    te.cache.W          = W;
+    te.cache.valid      = true;
+    te.cache.ymin       =  std::numeric_limits<float>::max();
+    te.cache.ymax       =  std::numeric_limits<float>::lowest();
+
+    for (auto& t : te.transforms) t->reset();
+
+    // ------------------------------------------------------------------
+    // ZOOMED-IN: read all view samples, apply full pipeline, keep array.
+    // ------------------------------------------------------------------
+    if (view_len <= W) {
+        te.cache.pix_min.clear();
+        te.cache.pix_max.clear();
+        te.cache.samples.resize(static_cast<size_t>(view_len));
+        int64_t raw_read  = readTraceSamples(te, view_start_, view_len,
+                                             te.cache.samples.data());
+        if (raw_read <= 0) { te.cache.valid = false; return; }
+        int64_t out_count = raw_read;
+        for (auto& t : te.transforms)
+            out_count = t->apply(te.cache.samples.data(), out_count, view_start_);
+        te.cache.samples.resize(static_cast<size_t>(std::max(INT64_C(0), out_count)));
+        te.cache.raw_read = raw_read;
+
+        for (float v : te.cache.samples) {
+            te.cache.ymin = std::min(te.cache.ymin, v);
+            te.cache.ymax = std::max(te.cache.ymax, v);
+        }
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // ZOOMED-OUT: chunk-based processing → per-pixel min/max aggregates.
+    // Never calls apply() on a single float — always passes full chunks.
+    // ------------------------------------------------------------------
+    te.cache.samples.clear();
+    te.cache.raw_read = 0;
+    te.cache.pix_min.assign(static_cast<size_t>(W),  std::numeric_limits<float>::max());
+    te.cache.pix_max.assign(static_cast<size_t>(W),  std::numeric_limits<float>::lowest());
+
+    std::vector<float> buf;
+    buf.reserve(RENDER_CHUNK);
+
+    int64_t chunk_start = view_start_;
+    while (chunk_start < view_end_) {
+        int64_t chunk_end = std::min(chunk_start + RENDER_CHUNK, view_end_);
+        int64_t chunk_len = chunk_end - chunk_start;
+        buf.resize(static_cast<size_t>(chunk_len));
+        int64_t raw_read  = readTraceSamples(te, chunk_start, chunk_len, buf.data());
+        if (raw_read <= 0) break;
+        int64_t out_count = raw_read;
+        for (auto& t : te.transforms)
+            out_count = t->apply(buf.data(), out_count, chunk_start);
+
+        for (int64_t i = 0; i < out_count; i++) {
+            int64_t s  = chunk_start + i * raw_read / out_count;
+            int     px = static_cast<int>((s - view_start_) * W / view_len);
+            if (px >= 0 && px < W) {
+                float v = buf[static_cast<size_t>(i)];
+                auto& mn = te.cache.pix_min[static_cast<size_t>(px)];
+                auto& mx = te.cache.pix_max[static_cast<size_t>(px)];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+            }
+        }
+        chunk_start = chunk_end;
+    }
+
+    for (int px = 0; px < W; px++) {
+        float mn = te.cache.pix_min[static_cast<size_t>(px)];
+        float mx = te.cache.pix_max[static_cast<size_t>(px)];
+        if (mn != std::numeric_limits<float>::max()) {
+            if (mn < te.cache.ymin) te.cache.ymin = mn;
+            if (mx > te.cache.ymax) te.cache.ymax = mx;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Y-range — trivially derived from the pre-built caches.
 // ---------------------------------------------------------------------------
 
 void PlotWidget::computeYRange(float& ymin, float& ymax) {
-    ymin = std::numeric_limits<float>::max();
-    ymax = std::numeric_limits<float>::lowest();
-
-    int64_t view_len = view_end_ - view_start_;
-    if (view_len <= 0) { ymin = -1; ymax = 1; return; }
-
-    // The render stride path samples at view_len/(4*W). Ensure the Y-range
-    // estimate is never coarser, so peaks the renderer draws are not outside
-    // the computed range (which would cause visual clipping on the plot border).
-    int64_t W = std::max(1, plotRect().width());
-    int64_t n_points = std::max(static_cast<int64_t>(YRANGE_SAMPLES), W * INT64_C(4));
-    int64_t stride = std::max(INT64_C(1), view_len / n_points);
+    ymin =  std::numeric_limits<float>::max();
+    ymax =  std::numeric_limits<float>::lowest();
 
     for (const auto& te : traces_) {
-        if (!te.visible || (!te.file && !te.mem_data)) continue;
-        float v;
-        for (int64_t s = view_start_; s < view_end_; s += stride) {
-            readTraceSamples(te, s, 1, &v);
-            for (const auto& t : te.transforms)
-                if (!t->requiresSequential())
-                    t->apply(&v, 1, s);
-            ymin = std::min(ymin, v);
-            ymax = std::max(ymax, v);
-        }
+        if (!te.visible || !te.cache.valid) continue;
+        if (te.cache.ymin < ymin) ymin = te.cache.ymin;
+        if (te.cache.ymax > ymax) ymax = te.cache.ymax;
     }
 
     if (ymin == std::numeric_limits<float>::max()) { ymin = -1; ymax = 1; return; }
@@ -283,49 +381,28 @@ void PlotWidget::computeYRange(float& ymin, float& ymax) {
 }
 
 // ---------------------------------------------------------------------------
-// Trace rendering
+// Trace rendering — reads exclusively from the pre-built cache.
 // ---------------------------------------------------------------------------
 
-void PlotWidget::renderTrace(TraceEntry& te, QPainter& p,
+void PlotWidget::renderTrace(const TraceEntry& te, QPainter& p,
                               const QRect& pr, float ymin, float ymax)
 {
-    if (!te.visible || (!te.file && !te.mem_data)) return;
-    int W = pr.width();
-    if (W <= 0) return;
-
-    int64_t view_len = view_end_ - view_start_;
-    if (view_len <= 0) return;
-
-    std::vector<float> pixMin(W,  std::numeric_limits<float>::max());
-    std::vector<float> pixMax(W,  std::numeric_limits<float>::lowest());
-
-    bool has_sequential = false;
-    for (const auto& t : te.transforms)
-        if (t->requiresSequential()) { has_sequential = true; break; }
-
-    for (auto& t : te.transforms) t->reset();
-
-    int64_t spp = (view_len + W - 1) / W;
+    if (!te.visible || !te.cache.valid) return;
+    const int     W        = pr.width();
+    const int64_t view_len = view_end_ - view_start_;
+    if (W <= 0 || view_len <= 0) return;
 
     // ------------------------------------------------------------------
-    // ZOOMED-IN PATH: fewer samples than pixels — draw connected polyline.
-    // At most `view_len` samples are read (≤ widget width), so memory
-    // stays tiny. Dots are drawn when there is enough space per sample.
+    // ZOOMED-IN: draw connected polyline from cached sample array.
     // ------------------------------------------------------------------
-    if (view_len <= W) {
-        std::vector<float> buf(view_len);
-        int64_t raw_read = readTraceSamples(te, view_start_, view_len, buf.data());
-        if (raw_read <= 0) return;
-        int64_t out_count = raw_read;
-        for (auto& t : te.transforms)
-            out_count = t->apply(buf.data(), out_count, view_start_);
-        if (out_count <= 0) return;
+    if (!te.cache.samples.empty()) {
+        const int64_t out_count = static_cast<int64_t>(te.cache.samples.size());
+        const int64_t raw_read  = te.cache.raw_read;
+        const float*  buf       = te.cache.samples.data();
 
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setPen(QPen(te.color, 1.5));
 
-        // Map output sample i to x pixel via its position in raw coordinates.
-        // Output sample i covers raw[i * raw_read/out_count .. (i+1) * raw_read/out_count).
         auto sx = [&](int64_t i) -> int {
             int64_t raw_s = (out_count > 1)
                 ? view_start_ + i * raw_read / out_count
@@ -334,12 +411,10 @@ void PlotWidget::renderTrace(TraceEntry& te, QPainter& p,
                 static_cast<double>(raw_s - view_start_) * W / view_len);
         };
 
-        // Line segments
         for (int64_t i = 1; i < out_count; i++)
-            p.drawLine(sx(i - 1), valueToPixel(buf[i-1], pr, ymin, ymax),
-                       sx(i),     valueToPixel(buf[i],   pr, ymin, ymax));
+            p.drawLine(sx(i-1), valueToPixel(buf[i-1], pr, ymin, ymax),
+                       sx(i),   valueToPixel(buf[i],   pr, ymin, ymax));
 
-        // Sample dots when >= 4 pixels per output sample
         if (out_count > 0 && W / out_count >= 4) {
             p.setBrush(te.color);
             p.setPen(Qt::NoPen);
@@ -347,78 +422,37 @@ void PlotWidget::renderTrace(TraceEntry& te, QPainter& p,
                 p.drawEllipse(QPoint(sx(i), valueToPixel(buf[i], pr, ymin, ymax)), 3, 3);
             p.setBrush(Qt::NoBrush);
         }
-
         p.setRenderHint(QPainter::Antialiasing, false);
         return;
     }
 
-    if (!has_sequential && spp > STRIDE_THRESHOLD) {
-        int64_t stride = std::max(INT64_C(1), spp / 4);
-        float   sbuf;
-        for (int64_t s = view_start_; s < view_end_; s += stride) {
-            readTraceSamples(te, s, 1, &sbuf);
-            for (auto& t : te.transforms) t->apply(&sbuf, 1, s);
-            int px = static_cast<int>((s - view_start_) * W / view_len);
-            if (px >= 0 && px < W) {
-                pixMin[px] = std::min(pixMin[px], sbuf);
-                pixMax[px] = std::max(pixMax[px], sbuf);
-            }
-        }
-    } else {
-        std::vector<float> buf;
-        buf.reserve(RENDER_CHUNK);
-        int64_t chunk_start = view_start_;
-        while (chunk_start < view_end_) {
-            int64_t chunk_end = std::min(chunk_start + RENDER_CHUNK, view_end_);
-            int64_t chunk_len = chunk_end - chunk_start;
-            buf.resize(chunk_len);
-            int64_t raw_read = readTraceSamples(te, chunk_start, chunk_len, buf.data());
-            if (raw_read <= 0) break;
-            int64_t out_count = raw_read;
-            for (auto& t : te.transforms)
-                out_count = t->apply(buf.data(), out_count, chunk_start);
-            // Map each output sample back to a raw-coordinate pixel.
-            // Output sample i covers raw[chunk_start + i*raw_read/out_count .. ].
-            for (int64_t i = 0; i < out_count; i++) {
-                int64_t s = (out_count > 0)
-                    ? chunk_start + i * raw_read / out_count
-                    : chunk_start;
-                int px = static_cast<int>((s - view_start_) * W / view_len);
-                if (px >= 0 && px < W) {
-                    pixMin[px] = std::min(pixMin[px], buf[i]);
-                    pixMax[px] = std::max(pixMax[px], buf[i]);
-                }
-            }
-            chunk_start = chunk_end;
-        }
-    }
-
-    // Draw per-pixel min-max segments with gap bridging.
+    // ------------------------------------------------------------------
+    // ZOOMED-OUT: draw per-pixel min-max segments with gap bridging.
     // valueToPixel maps larger values to smaller y (top of screen), so:
-    //   bot = valueToPixel(pixMin) — large y, bottom of bar on screen
-    //   top = valueToPixel(pixMax) — small y, top of bar on screen
-    // When the signal jumps between consecutive columns the bars may not
-    // overlap; we extend the current bar to close the gap so the trace
-    // appears continuous.
+    //   bot = valueToPixel(pix_min) — large y, bottom of bar on screen
+    //   top = valueToPixel(pix_max) — small y, top of bar on screen
+    // When the signal jumps between columns the bars may not overlap;
+    // extend the current bar to close the gap so the trace looks continuous.
+    // ------------------------------------------------------------------
     p.setPen(QPen(te.color, 1));
     int prev_top = INT_MAX, prev_bot = INT_MAX;
+
     for (int px = 0; px < W; px++) {
-        if (pixMin[px] == std::numeric_limits<float>::max()) {
+        float mn = te.cache.pix_min[static_cast<size_t>(px)];
+        float mx = te.cache.pix_max[static_cast<size_t>(px)];
+        if (mn == std::numeric_limits<float>::max()) {
             prev_top = prev_bot = INT_MAX;
             continue;
         }
-        int top = valueToPixel(pixMax[px], pr, ymin, ymax);
-        int bot = valueToPixel(pixMin[px], pr, ymin, ymax);
+        int top = valueToPixel(mx, pr, ymin, ymax);
+        int bot = valueToPixel(mn, pr, ymin, ymax);
 
         if (prev_top != INT_MAX) {
-            // Signal jumped up  → current bar is above the previous bar → extend down
-            if (bot < prev_top)  bot = prev_top;
-            // Signal jumped down → current bar is below the previous bar → extend up
-            else if (top > prev_bot) top = prev_bot;
+            if      (bot < prev_top) bot = prev_top;   // gap upward
+            else if (top > prev_bot) top = prev_bot;   // gap downward
         }
-        // Keep original unextended values for next iteration
-        prev_top = valueToPixel(pixMax[px], pr, ymin, ymax);
-        prev_bot = valueToPixel(pixMin[px], pr, ymin, ymax);
+        prev_top = valueToPixel(mx, pr, ymin, ymax);
+        prev_bot = valueToPixel(mn, pr, ymin, ymax);
 
         if (top > bot) std::swap(top, bot);
         if (top == bot) p.drawPoint(pr.left() + px, top);
@@ -493,8 +527,20 @@ void PlotWidget::paintEvent(QPaintEvent*) {
         return;
     }
 
+    // Build (or reuse) per-pixel min/max caches — one pass per trace per frame.
+    const int W = pr.width();
+    for (auto& te : traces_)
+        buildTraceCache(te, W);
+
     float ymin, ymax;
     computeYRange(ymin, ymax);
+    // Apply Y-axis zoom (Ctrl+scroll): expand/contract range around centre.
+    if (y_scale_ != 1.0f) {
+        float center = (ymin + ymax) * 0.5f;
+        float half   = (ymax - ymin) * 0.5f * y_scale_;
+        ymin = center - half;
+        ymax = center + half;
+    }
     last_ymin_ = ymin;
     last_ymax_ = ymax;
 
@@ -740,6 +786,14 @@ void PlotWidget::mouseReleaseEvent(QMouseEvent* e) {
 }
 
 void PlotWidget::wheelEvent(QWheelEvent* e) {
+    // Ctrl+scroll or Shift+scroll → Y-axis zoom (expand/contract amplitude range)
+    if (e->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier)) {
+        float factor = (e->angleDelta().y() > 0) ? 0.75f : 1.0f / 0.75f;
+        y_scale_ = std::clamp(y_scale_ * factor, 0.05f, 200.0f);
+        update();
+        return;
+    }
+
     QRect   pr   = plotRect();
     int64_t vlen = view_end_ - view_start_;
 

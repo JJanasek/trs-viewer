@@ -36,6 +36,29 @@ enum class InteractionMode {
 };
 
 // ---------------------------------------------------------------------------
+// Per-trace render cache (rebuilt when view or widget width changes)
+// ---------------------------------------------------------------------------
+struct TraceCache {
+    // Key — what the cache was built for
+    int64_t view_start = -1;
+    int64_t view_end   = -1;
+    int     W          =  0;
+    bool    valid      = false;
+
+    // Zoomed-in path (view_len <= W): processed sample array
+    std::vector<float> samples;   // length = out_count after pipeline
+    int64_t            raw_read = 0;
+
+    // Zoomed-out path (view_len > W): per-pixel min/max aggregates
+    std::vector<float> pix_min;
+    std::vector<float> pix_max;
+
+    // Data range (no padding), used by computeYRange
+    float ymin = 0;
+    float ymax = 0;
+};
+
+// ---------------------------------------------------------------------------
 // Trace entry
 // ---------------------------------------------------------------------------
 struct TraceEntry {
@@ -46,6 +69,7 @@ struct TraceEntry {
     bool      visible   = true;
     std::shared_ptr<std::vector<float>> mem_data; // non-null for in-memory traces
     std::vector<std::shared_ptr<ITransform>> transforms;
+    TraceCache cache;
 };
 
 // ---------------------------------------------------------------------------
@@ -71,6 +95,12 @@ public:
     void clearMeasurement();
     void zoomIn();
     void zoomOut();
+    // Y-axis (amplitude) zoom.  Also triggered by Ctrl+scroll.
+    // y_scale_ < 1 → taller traces; y_scale_ > 1 → shorter traces.
+    void zoomInY();         // shrink y range → taller traces
+    void zoomOutY();        // expand y range → shorter traces
+    void resetYZoom();
+    float yScale() const { return y_scale_; }
     void setThresholds(bool show, double pos = 4.5, double neg = -4.5);
 
     // View accessors
@@ -103,7 +133,9 @@ protected:
 
 private:
     QRect   plotRect() const;
-    void    renderTrace(TraceEntry& te, QPainter& p,
+    // Build (or reuse) the per-pixel cache for one trace.
+    void    buildTraceCache(TraceEntry& te, int W);
+    void    renderTrace(const TraceEntry& te, QPainter& p,
                         const QRect& pr, float ymin, float ymax);
     void    computeYRange(float& ymin, float& ymax);
     void    drawMeasurement(QPainter& p, const QRect& pr,
@@ -155,6 +187,11 @@ private:
     // Cached y-range from last paint (needed to map click y → value)
     float last_ymin_ = -1.0f;
     float last_ymax_ =  1.0f;
+
+    // Y-axis zoom: multiplier on the auto-fit half-range.
+    // 1.0 = auto-fit, >1 = zoomed out (more space), <1 = zoomed in.
+    // Ctrl+scroll adjusts this; resetView() restores it to 1.0.
+    float y_scale_ = 1.0f;
 
     bool   show_thresholds_ = false;
     double threshold_pos_   =  4.5;

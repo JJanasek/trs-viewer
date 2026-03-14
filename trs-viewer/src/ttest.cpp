@@ -33,6 +33,25 @@ void TTestAccumulator::addTrace(int group, const float* samples, int32_t count) 
     N_[group]++;
 }
 
+void TTestAccumulator::computeWelchDf(std::vector<double>& df_out) const {
+    df_out.resize(num_samples_);
+    double n0 = static_cast<double>(N_[0]);
+    double n1 = static_cast<double>(N_[1]);
+    for (int32_t s = 0; s < num_samples_; s++) {
+        double mean0 = sum_[0][s] / n0;
+        double mean1 = sum_[1][s] / n1;
+        double var0 = (sum2_[0][s] - sum_[0][s] * mean0) / (n0 - 1.0);
+        double var1 = (sum2_[1][s] - sum_[1][s] * mean1) / (n1 - 1.0);
+        if (var0 < 0.0) var0 = 0.0;
+        if (var1 < 0.0) var1 = 0.0;
+        double u0  = var0 / n0;
+        double u1  = var1 / n1;
+        double num = (u0 + u1) * (u0 + u1);
+        double den = u0 * u0 / (n0 - 1.0) + u1 * u1 / (n1 - 1.0);
+        df_out[s]  = (den > 1e-300) ? num / den : n0 + n1 - 2.0;
+    }
+}
+
 int64_t TTestAccumulator::countGroup(int g) const {
     return (g == 0 || g == 1) ? N_[g] : 0;
 }

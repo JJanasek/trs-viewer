@@ -33,7 +33,35 @@
 #include <QVBoxLayout>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
+
+// ---------------------------------------------------------------------------
+// Statistical helpers for t-test threshold calculation
+// ---------------------------------------------------------------------------
+
+// Rational approximation for Φ^{-1}(p) — Abramowitz & Stegun 26.2.17
+// Max |error| ≤ 4.5×10^{-4}.
+static double invNormCdf(double p) {
+    if (p <= 0.0) return -1e300;
+    if (p >= 1.0) return  1e300;
+    bool upper = (p > 0.5);
+    double q = upper ? 1.0 - p : p;
+    double t = std::sqrt(-2.0 * std::log(q));
+    double z = t - (2.515517 + t * (0.802853 + t * 0.010328))
+                   / (1.0 + t * (1.432788 + t * (0.189269 + t * 0.001308)));
+    return upper ? z : -z;
+}
+
+// Inverse t-distribution CDF using Cornish-Fisher expansion (accurate for df > 5).
+// Falls back to normal approximation for df >= 200.
+static double invTCdf(double p, double df) {
+    double z = invNormCdf(p);
+    if (df >= 200.0) return z;
+    double g = (z*z*z + z) / (4.0 * df);
+    double h = (5.0*z*z*z*z*z + 16.0*z*z*z + 3.0*z) / (96.0 * df * df);
+    return z + g + h;
+}
 
 const QColor MainWindow::TRACE_COLORS[] = {
     QColor("#4fc3f7"),  // light blue
@@ -195,14 +223,21 @@ MainWindow::MainWindow(QWidget* parent)
     btn_zoom_in_  = new QPushButton("＋ Zoom In");
     btn_zoom_out_ = new QPushButton("－ Zoom Out");
     btn_reset_    = new QPushButton("⟳ Reset  [R]");
-    btn_zoom_in_->setToolTip("Zoom in (also: scroll wheel up)");
-    btn_zoom_out_->setToolTip("Zoom out (also: scroll wheel down)");
+    btn_zoom_in_->setToolTip("Zoom in X (also: scroll wheel up)");
+    btn_zoom_out_->setToolTip("Zoom out X (also: scroll wheel down)");
+
+    auto* btn_yzoom_in  = new QPushButton("↑ Amp");
+    auto* btn_yzoom_out = new QPushButton("↓ Amp");
+    btn_yzoom_in ->setToolTip("Zoom in Y / taller traces (also: Ctrl/Shift+scroll up)");
+    btn_yzoom_out->setToolTip("Zoom out Y / shorter traces (also: Ctrl/Shift+scroll down)");
 
     // plot_widget_ hasn't been constructed yet at this point, so use lambdas
     // that capture `this` — by the time the button is clicked, plot_widget_ is valid.
     connect(btn_zoom_in_,  &QPushButton::clicked, this, [this](){ plot_widget_->zoomIn(); });
     connect(btn_zoom_out_, &QPushButton::clicked, this, [this](){ plot_widget_->zoomOut(); });
     connect(btn_reset_,    &QPushButton::clicked, this, &MainWindow::onResetView);
+    connect(btn_yzoom_in,  &QPushButton::clicked, this, [this](){ plot_widget_->zoomInY(); });
+    connect(btn_yzoom_out, &QPushButton::clicked, this, [this](){ plot_widget_->zoomOutY(); });
 
     // Theme selector
     combo_theme_ = new QComboBox;
@@ -217,6 +252,8 @@ MainWindow::MainWindow(QWidget* parent)
     toolbar_l->addWidget(btn_zoom_in_);
     toolbar_l->addWidget(btn_zoom_out_);
     toolbar_l->addWidget(btn_reset_);
+    toolbar_l->addWidget(btn_yzoom_in);
+    toolbar_l->addWidget(btn_yzoom_out);
     toolbar_l->addWidget(sep2);
     toolbar_l->addWidget(new QLabel("Theme:"));
     toolbar_l->addWidget(combo_theme_);
@@ -371,10 +408,17 @@ void MainWindow::updateFileInfo() {
     case SampleType::FLOAT32: type_str = "float32"; break;
     }
 
-    lbl_info_->setText(
-        QString("Traces:  %1\nSamples: %2\nType:    %3\nData:    %4 B/trace")
-            .arg(h.num_traces).arg(h.num_samples)
-            .arg(type_str).arg(h.data_length));
+    // Compute effective sample count after pipeline (decimating transforms shrink it).
+    int64_t effective_samples = h.num_samples;
+    for (const auto& t : pipeline_)
+        effective_samples = t->transformedCount(effective_samples);
+
+    QString info = QString("Traces:  %1\nSamples: %2\nType:    %3\nData:    %4 B/trace")
+        .arg(h.num_traces).arg(h.num_samples)
+        .arg(type_str).arg(h.data_length);
+    if (effective_samples != h.num_samples)
+        info += QString("\nAfter pipeline: %1").arg(effective_samples);
+    lbl_info_->setText(info);
 }
 
 void MainWindow::onApplyTraces() {
@@ -400,6 +444,7 @@ void MainWindow::onAddTransform() {
     if (!tx) return;
     pipeline_.push_back(tx);
     rebuildTransformList();
+    updateFileInfo();
     plot_widget_->setTransforms(pipeline_);
     plot_widget_->update();
 }
@@ -409,6 +454,7 @@ void MainWindow::onRemoveTransform() {
     if (row < 0 || row >= static_cast<int>(pipeline_.size())) return;
     pipeline_.erase(pipeline_.begin() + row);
     rebuildTransformList();
+    updateFileInfo();
     plot_widget_->setTransforms(pipeline_);
     plot_widget_->update();
 }
@@ -419,6 +465,7 @@ void MainWindow::onMoveTransformUp() {
     std::swap(pipeline_[row], pipeline_[row - 1]);
     rebuildTransformList();
     list_transforms_->setCurrentRow(row - 1);
+    updateFileInfo();
     plot_widget_->setTransforms(pipeline_);
     plot_widget_->update();
 }
@@ -429,6 +476,7 @@ void MainWindow::onMoveTransformDown() {
     std::swap(pipeline_[row], pipeline_[row + 1]);
     rebuildTransformList();
     list_transforms_->setCurrentRow(row + 1);
+    updateFileInfo();
     plot_widget_->setTransforms(pipeline_);
     plot_widget_->update();
 }
@@ -439,9 +487,18 @@ void MainWindow::onResetView() {
 }
 
 void MainWindow::onViewChanged(int64_t start, int64_t end, int64_t /*total*/) {
-    lbl_view_->setText(
-        QString("View: [%1 – %2]\nSpan: %3 samples")
-            .arg(start).arg(end).arg(end - start));
+    int64_t raw_span = end - start;
+    int64_t eff_span = raw_span;
+    for (const auto& t : pipeline_)
+        eff_span = t->transformedCount(eff_span);
+    if (eff_span != raw_span)
+        lbl_view_->setText(
+            QString("View: [%1 – %2]\nSpan: %3  (%4 after pipeline)")
+                .arg(start).arg(end).arg(raw_span).arg(eff_span));
+    else
+        lbl_view_->setText(
+            QString("View: [%1 – %2]\nSpan: %3 samples")
+                .arg(start).arg(end).arg(raw_span));
 }
 
 void MainWindow::onMeasurementUpdated(int64_t s1, double v1,
@@ -843,6 +900,73 @@ void MainWindow::onLoadNpyTTest() {
             QMessageBox::information(dlg, "Saved", "Saved: " + p);
     });
 
+    auto* btn_calc_th_npy = new QPushButton("Calc TH…");
+    connect(btn_calc_th_npy, &QPushButton::clicked, dlg, [=]() {
+        auto* cd = new QDialog(dlg);
+        cd->setWindowTitle("Threshold Calculator");
+        cd->setWindowModality(Qt::WindowModal);
+        auto* fl = new QFormLayout(cd);
+
+        auto* sp_alpha = new QDoubleSpinBox;
+        sp_alpha->setRange(1e-6, 0.5); sp_alpha->setDecimals(6);
+        sp_alpha->setValue(0.05);      sp_alpha->setSingleStep(0.01);
+
+        int64_t n_L = static_cast<int64_t>(tstat_ptr->size());
+        auto* lbl_nL = new QLabel(QString::number(n_L));
+
+        // No accumulator available — let user enter group sizes
+        auto* sp_nA = new QSpinBox; sp_nA->setRange(2, 10000000); sp_nA->setValue(100);
+        auto* sp_nB = new QSpinBox; sp_nB->setRange(2, 10000000); sp_nB->setValue(100);
+
+        auto* lbl_ath = new QLabel;
+        auto* lbl_nu  = new QLabel;
+        auto* lbl_th  = new QLabel;
+        lbl_th->setTextFormat(Qt::RichText);
+
+        // Equal-variance Welch df from n_A, n_B
+        auto calc_nu = [](int64_t nA, int64_t nB) -> double {
+            double a = static_cast<double>(nA), b = static_cast<double>(nB);
+            double num = (1.0/a + 1.0/b) * (1.0/a + 1.0/b);
+            double den = 1.0/(a*a*(a-1.0)) + 1.0/(b*b*(b-1.0));
+            return (den > 0.0) ? num / den : a + b - 2.0;
+        };
+
+        auto recalc = [=]() {
+            double a    = sp_alpha->value();
+            double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
+            double nu   = calc_nu(sp_nA->value(), sp_nB->value());
+            double th   = invTCdf(1.0 - a_th / 2.0, nu);
+            lbl_ath->setText(QString::number(a_th, 'g', 4));
+            lbl_nu ->setText(QString::number(nu, 'f', 1));
+            lbl_th ->setText(QString("<b>%1</b>").arg(th, 0, 'f', 4));
+        };
+        connect(sp_alpha, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                cd, [=](double) { recalc(); });
+        connect(sp_nA, QOverload<int>::of(&QSpinBox::valueChanged), cd, [=](int) { recalc(); });
+        connect(sp_nB, QOverload<int>::of(&QSpinBox::valueChanged), cd, [=](int) { recalc(); });
+        recalc();
+
+        auto* bb = new QDialogButtonBox(QDialogButtonBox::Apply | QDialogButtonBox::Close);
+        connect(bb->button(QDialogButtonBox::Apply), &QPushButton::clicked, cd, [=]() {
+            double a    = sp_alpha->value();
+            double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
+            double nu   = calc_nu(sp_nA->value(), sp_nB->value());
+            spin_thr->setValue(invTCdf(1.0 - a_th / 2.0, nu));
+        });
+        connect(bb, &QDialogButtonBox::rejected, cd, &QDialog::close);
+
+        fl->addRow("Significance level α:", sp_alpha);
+        fl->addRow("Trace length n_L:",      lbl_nL);
+        fl->addRow("Group A  n_A:",           sp_nA);
+        fl->addRow("Group B  n_B:",           sp_nB);
+        fl->addRow(new QLabel);
+        fl->addRow("Bonferroni α_TH:",        lbl_ath);
+        fl->addRow("Approx. Welch ν̂:",        lbl_nu);
+        fl->addRow("Threshold TH:",           lbl_th);
+        fl->addRow(bb);
+        cd->show();
+    });
+
     auto* ctrl   = new QWidget(dlg);
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
@@ -851,8 +975,19 @@ void MainWindow::onLoadNpyTTest() {
     auto* lbl_f = qobject_cast<QLabel*>(ctrl_l->itemAt(0)->widget());
     if (lbl_f) lbl_f->setTextFormat(Qt::RichText);
     ctrl_l->addStretch();
+    auto* btn_yzi_npy = new QPushButton("↑ Amp");
+    auto* btn_yzo_npy = new QPushButton("↓ Amp");
+    btn_yzi_npy->setToolTip("Zoom in Y (Ctrl/Shift+scroll up)");
+    btn_yzo_npy->setToolTip("Zoom out Y / shorter traces (Ctrl/Shift+scroll down)");
+    connect(btn_yzi_npy, &QPushButton::clicked, dlg, [pw](){ pw->zoomInY(); });
+    connect(btn_yzo_npy, &QPushButton::clicked, dlg, [pw](){ pw->zoomOutY(); });
+
     ctrl_l->addWidget(lbl_thr);
     ctrl_l->addWidget(spin_thr);
+    ctrl_l->addWidget(btn_calc_th_npy);
+    ctrl_l->addSpacing(8);
+    ctrl_l->addWidget(btn_yzi_npy);
+    ctrl_l->addWidget(btn_yzo_npy);
     ctrl_l->addStretch();
     ctrl_l->addWidget(btn_exp_npy);
 
@@ -939,6 +1074,30 @@ void MainWindow::onLoadNpyHeatmap() {
         heatmap->setGaussianSigma(static_cast<float>(v));
     });
 
+    auto* chk_abs    = new QCheckBox("Abs value");
+    connect(chk_abs, &QCheckBox::toggled, [=](bool on) {
+        heatmap->setAbsValue(on);
+        // Abs collapses all values to [0, vmax] — snap vmin to 0 so the
+        // colour range is correct; restore symmetric range when unchecked.
+        if (on) {
+            sp_vmin->setValue(0.0);
+            heatmap->setColorRange(0.0f, static_cast<float>(sp_vmax->value()));
+        } else {
+            double vm = sp_vmax->value();
+            sp_vmin->setValue(-vm);
+            heatmap->setColorRange(static_cast<float>(-vm), static_cast<float>(vm));
+        }
+    });
+
+    auto* lbl_gamma  = new QLabel("Power γ:");
+    auto* sp_gamma   = new QDoubleSpinBox;
+    // min=1.0 so setSpecialValueText shows "off" at the off-state (gamma=1)
+    sp_gamma->setRange(1.0, 10.0); sp_gamma->setDecimals(2); sp_gamma->setSingleStep(0.1);
+    sp_gamma->setValue(1.0); sp_gamma->setSpecialValueText("off");
+    connect(sp_gamma, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
+        heatmap->setPowerGamma(static_cast<float>(v));
+    });
+
     auto* chk_thresh  = new QCheckBox("Binary threshold |v|≥");
     auto* sp_thresh   = new QDoubleSpinBox;
     sp_thresh->setRange(0.0, 1e9); sp_thresh->setDecimals(4);
@@ -955,6 +1114,15 @@ void MainWindow::onLoadNpyHeatmap() {
 
     auto* btn_reset_view = new QPushButton("Reset View");
     connect(btn_reset_view, &QPushButton::clicked, heatmap, &HeatmapWidget::resetView);
+
+    auto* btn_autoclip = new QPushButton("Auto-clip 98%");
+    connect(btn_autoclip, &QPushButton::clicked, dlg, [=]() {
+        float cmin, cmax;
+        heatmap->computeClipRange(0.98f, cmin, cmax);
+        sp_vmin->setValue(static_cast<double>(cmin));
+        sp_vmax->setValue(static_cast<double>(cmax));
+        heatmap->setColorRange(cmin, cmax);
+    });
 
     // Keep a shared_ptr so the export lambda can safely capture the data
     auto data_ptr = std::make_shared<std::vector<float>>(std::move(data));
@@ -1000,6 +1168,7 @@ void MainWindow::onLoadNpyHeatmap() {
     row1_l->addWidget(sp_vmin);
     row1_l->addWidget(lbl_vmax);
     row1_l->addWidget(sp_vmax);
+    row1_l->addWidget(btn_autoclip);
     row1_l->addWidget(btn_reset_view);
     row1_l->addWidget(btn_exp_png);
     row1_l->addWidget(btn_exp_npy);
@@ -1012,7 +1181,12 @@ void MainWindow::onLoadNpyHeatmap() {
     row2_l->addSpacing(12);
     row2_l->addWidget(lbl_sigma);
     row2_l->addWidget(sp_sigma);
-    row2_l->addSpacing(12);
+    row2_l->addSpacing(8);
+    row2_l->addWidget(chk_abs);
+    row2_l->addSpacing(8);
+    row2_l->addWidget(lbl_gamma);
+    row2_l->addWidget(sp_gamma);
+    row2_l->addSpacing(8);
     row2_l->addWidget(chk_thresh);
     row2_l->addWidget(sp_thresh);
     row2_l->addStretch();
@@ -1081,8 +1255,13 @@ void MainWindow::onRunTTest() {
     int32_t byte_idx = have_ttest_param ? auto_byte_idx
                                         : static_cast<int32_t>(sp_byte->value());
 
+    // Effective sample count after pipeline
+    int64_t effective_samples = h.num_samples;
+    for (const auto& t : pipeline_)
+        effective_samples = t->transformedCount(effective_samples);
+
     // Memory estimate warning
-    int64_t mem_bytes = static_cast<int64_t>(h.num_samples) * 4LL * static_cast<int64_t>(sizeof(double));
+    int64_t mem_bytes = effective_samples * 4LL * static_cast<int64_t>(sizeof(double));
     if (mem_bytes > 2LL * 1024 * 1024 * 1024) {
         if (QMessageBox::warning(this, "Memory warning",
                 QString("Accumulators will require ~%1 GB.\nContinue?")
@@ -1092,14 +1271,15 @@ void MainWindow::onRunTTest() {
     }
 
     // --- Accumulation ---
-    TTestAccumulator acc(h.num_samples);
+    auto acc_ptr = std::make_shared<TTestAccumulator>(static_cast<int32_t>(effective_samples));
+    TTestAccumulator& acc = *acc_ptr;
 
     QProgressDialog prog("Accumulating traces…", "Cancel", 0, count, this);
     prog.setWindowModality(Qt::WindowModal);
     prog.setMinimumDuration(400);
 
-    constexpr int64_t CHUNK = 256 * 1024;
-    std::vector<float> buf(CHUNK);
+    // Full-trace buffer for pipeline application
+    std::vector<float> trace_buf(static_cast<size_t>(h.num_samples));
     int32_t skipped = 0;
 
     for (int32_t ti = 0; ti < count; ti++) {
@@ -1113,17 +1293,16 @@ void MainWindow::onRunTTest() {
         if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { skipped++; continue; }
         int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
 
-        // Read all samples of this trace in chunks and accumulate
-        for (int32_t s = 0; s < h.num_samples; ) {
-            int64_t chunk = std::min(CHUNK, static_cast<int64_t>(h.num_samples - s));
-            int64_t read  = trs_file_->readSamples(src_idx, s, chunk, buf.data());
-            if (read <= 0) break;
-            // Apply non-sequential pipeline transforms (so t-test is on processed data)
-            for (const auto& t : pipeline_)
-                if (!t->requiresSequential()) t->apply(buf.data(), read, s);
-            acc.addTrace(group, buf.data(), static_cast<int32_t>(read));
-            s += static_cast<int32_t>(read);
-        }
+        // Read full trace, apply pipeline, accumulate once
+        int64_t got = trs_file_->readSamples(src_idx, 0, h.num_samples, trace_buf.data());
+        if (got <= 0) { skipped++; continue; }
+        if (got < h.num_samples)
+            std::fill(trace_buf.begin() + static_cast<size_t>(got), trace_buf.end(), 0.0f);
+        for (const auto& t : pipeline_) t->reset();
+        int64_t n_out = got;
+        for (const auto& t : pipeline_)
+            n_out = t->apply(trace_buf.data(), n_out, 0);
+        acc.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
     }
     prog.setValue(count);
 
@@ -1208,13 +1387,86 @@ void MainWindow::onRunTTest() {
             QMessageBox::information(dlg, "Export complete", "Saved: " + path);
     });
 
+    auto* btn_calc_th = new QPushButton("Calc TH…");
+    connect(btn_calc_th, &QPushButton::clicked, dlg, [=]() {
+        auto* cd = new QDialog(dlg);
+        cd->setWindowTitle("Threshold Calculator");
+        cd->setWindowModality(Qt::WindowModal);
+        auto* fl = new QFormLayout(cd);
+
+        auto* sp_alpha = new QDoubleSpinBox;
+        sp_alpha->setRange(1e-6, 0.5); sp_alpha->setDecimals(6);
+        sp_alpha->setValue(0.05);      sp_alpha->setSingleStep(0.01);
+
+        int64_t n_L = static_cast<int64_t>(tstat_ptr->size());
+        auto* lbl_nL  = new QLabel(QString::number(n_L));
+        auto* lbl_nA  = new QLabel(QString::number(n0));
+        auto* lbl_nB  = new QLabel(QString::number(n1));
+
+        auto* lbl_ath = new QLabel;
+        auto* lbl_nu  = new QLabel;
+        auto* lbl_th  = new QLabel;
+        lbl_th->setTextFormat(Qt::RichText);
+
+        // Compute median Welch df from the accumulator (data-driven)
+        std::vector<double> df_vec;
+        acc_ptr->computeWelchDf(df_vec);
+        std::vector<double> df_sorted = df_vec;
+        std::sort(df_sorted.begin(), df_sorted.end());
+        double median_nu = df_sorted.empty()
+            ? static_cast<double>(n0 + n1 - 2)
+            : df_sorted[df_sorted.size() / 2];
+
+        auto recalc = [=]() {
+            double a    = sp_alpha->value();
+            double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
+            double th   = invTCdf(1.0 - a_th / 2.0, median_nu);
+            lbl_ath->setText(QString::number(a_th, 'g', 4));
+            lbl_nu ->setText(QString::number(median_nu, 'f', 1));
+            lbl_th ->setText(QString("<b>%1</b>").arg(th, 0, 'f', 4));
+        };
+        connect(sp_alpha, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                cd, [=](double) { recalc(); });
+        recalc();
+
+        auto* bb = new QDialogButtonBox(QDialogButtonBox::Apply | QDialogButtonBox::Close);
+        connect(bb->button(QDialogButtonBox::Apply), &QPushButton::clicked, cd, [=]() {
+            double a    = sp_alpha->value();
+            double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
+            spin_thr->setValue(invTCdf(1.0 - a_th / 2.0, median_nu));
+        });
+        connect(bb, &QDialogButtonBox::rejected, cd, &QDialog::close);
+
+        fl->addRow("Significance level α:", sp_alpha);
+        fl->addRow("Trace length n_L:",      lbl_nL);
+        fl->addRow("Group A  n_A:",           lbl_nA);
+        fl->addRow("Group B  n_B:",           lbl_nB);
+        fl->addRow(new QLabel);
+        fl->addRow("Bonferroni α_TH:",        lbl_ath);
+        fl->addRow("Median Welch ν̂:",         lbl_nu);
+        fl->addRow("Threshold TH:",           lbl_th);
+        fl->addRow(bb);
+        cd->show();
+    });
+
     auto* ctrl = new QWidget(dlg);
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
     ctrl_l->addWidget(lbl_groups);
     ctrl_l->addStretch();
+    auto* btn_yzi = new QPushButton("↑ Amp");
+    auto* btn_yzo = new QPushButton("↓ Amp");
+    btn_yzi->setToolTip("Zoom in Y (Ctrl/Shift+scroll up)");
+    btn_yzo->setToolTip("Zoom out Y / shorter traces (Ctrl/Shift+scroll down)");
+    connect(btn_yzi, &QPushButton::clicked, dlg, [pw](){ pw->zoomInY(); });
+    connect(btn_yzo, &QPushButton::clicked, dlg, [pw](){ pw->zoomOutY(); });
+
     ctrl_l->addWidget(lbl_thr);
     ctrl_l->addWidget(spin_thr);
+    ctrl_l->addWidget(btn_calc_th);
+    ctrl_l->addSpacing(8);
+    ctrl_l->addWidget(btn_yzi);
+    ctrl_l->addWidget(btn_yzo);
     ctrl_l->addStretch();
     ctrl_l->addWidget(btn_exp_trs);
     ctrl_l->addWidget(btn_exp_npy);
@@ -1486,9 +1738,10 @@ void MainWindow::onRunXCorr() {
     fl_ds->addRow("Output M (samples):", lbl_M);
     fl_ds->addRow("Matrix memory:", lbl_mem);
 
-    // Update M / memory estimate labels
+    // Update M / memory estimate labels (accounts for pipeline decimation)
     auto updateEstimate = [&]() {
         int64_t ns = sp_s_count->value() == 0 ? n_samples : sp_s_count->value();
+        for (const auto& t : pipeline_) ns = t->transformedCount(ns);
         int     st = sp_stride->value();
         int64_t M  = (ns + st - 1) / st;
         lbl_M->setText(QString::number(M));
@@ -1515,9 +1768,11 @@ void MainWindow::onRunXCorr() {
     lbl_dual_warn->setTextFormat(Qt::RichText);
     lbl_dual_warn->setWordWrap(true);
     lbl_dual_warn->setEnabled(false);
+    auto* rb_twowin   = new QRadioButton("Two-Window Template Match  (search × ref rectangular C)");
     vl_method->addWidget(rb_baseline);
     vl_method->addWidget(rb_dual);
     vl_method->addWidget(rb_mp);
+    vl_method->addWidget(rb_twowin);
     vl_method->addWidget(lbl_dual_warn);
 
     connect(rb_dual, &QRadioButton::toggled, lbl_dual_warn, &QLabel::setEnabled);
@@ -1525,12 +1780,23 @@ void MainWindow::onRunXCorr() {
         lbl_dual_warn->setEnabled(rb_dual->isChecked() || rb_mp->isChecked());
     });
 
+    // Reference window (Two-Window mode only)
+    auto* grp_ref   = new QGroupBox("Reference Window (Two-Window mode)");
+    auto* fl_ref    = new QFormLayout(grp_ref);
+    auto* sp_r_first = new QSpinBox; sp_r_first->setRange(0, std::max(0, n_samples - 1)); sp_r_first->setValue(0);
+    auto* sp_r_count = new QSpinBox; sp_r_count->setRange(1, n_samples); sp_r_count->setValue(std::min(512, n_samples));
+    fl_ref->addRow("Ref first sample:", sp_r_first);
+    fl_ref->addRow("Ref count:",        sp_r_count);
+    grp_ref->setVisible(false);
+    connect(rb_twowin, &QRadioButton::toggled, grp_ref, &QWidget::setVisible);
+
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
 
     vl_cfg->addWidget(grp_traces);
     vl_cfg->addWidget(grp_samples);
+    vl_cfg->addWidget(grp_ref);
     vl_cfg->addWidget(grp_ds);
     vl_cfg->addWidget(grp_method);
     vl_cfg->addWidget(cfg_bb);
@@ -1542,13 +1808,16 @@ void MainWindow::onRunXCorr() {
     int64_t first_sample = static_cast<int64_t>(sp_s_first->value());
     int64_t num_samples_req = static_cast<int64_t>(sp_s_count->value()); // 0 = all
     int32_t stride       = static_cast<int32_t>(sp_stride->value());
-    XCorrMethod method   = rb_mp->isChecked()   ? XCorrMethod::MPCleaned
-                         : rb_dual->isChecked()  ? XCorrMethod::DualMatrix
-                                                 : XCorrMethod::Baseline;
+    bool    is_twowin    = rb_twowin->isChecked();
+    XCorrMethod method   = rb_mp->isChecked()     ? XCorrMethod::MPCleaned
+                         : rb_dual->isChecked()    ? XCorrMethod::DualMatrix
+                         : is_twowin               ? XCorrMethod::TwoWindow
+                                                   : XCorrMethod::Baseline;
 
-    // Memory warning for large matrices
+    // Memory warning for large matrices (effective M accounts for pipeline)
     {
         int64_t ns = num_samples_req == 0 ? (n_samples - first_sample) : num_samples_req;
+        for (const auto& t : pipeline_) ns = t->transformedCount(ns);
         int64_t M  = (ns + stride - 1) / stride;
         double  mem_mb = static_cast<double>(M) * M * 4.0 / (1024.0 * 1024.0);
         if (mem_mb > 2048.0) {
@@ -1570,22 +1839,34 @@ void MainWindow::onRunXCorr() {
     XCorrResult result;
     std::string err;
 
-    bool ok = computeXCorr(
-        trs_file_.get(),
-        first_trace, num_traces,
-        first_sample, num_samples_req,
-        stride, method, result,
-        [&](int32_t done, int32_t total) -> bool {
-            if (prog.wasCanceled()) return false;
-            prog.setMaximum(total);
-            prog.setValue(done);
-            prog.setLabelText(
-                total > 0 ? QString("Processing trace %1 / %2…").arg(done).arg(total)
-                          : QString("Processing…"));
-            QApplication::processEvents();
-            return true;
-        },
-        err);
+    auto progCb = [&](int32_t done, int32_t total) -> bool {
+        if (prog.wasCanceled()) return false;
+        prog.setMaximum(total);
+        prog.setValue(done);
+        prog.setLabelText(
+            total > 0 ? QString("Processing trace %1 / %2…").arg(done).arg(total)
+                      : QString("Processing…"));
+        QApplication::processEvents();
+        return true;
+    };
+
+    bool ok;
+    if (is_twowin) {
+        int64_t ref_first = static_cast<int64_t>(sp_r_first->value());
+        int64_t ref_count = static_cast<int64_t>(sp_r_count->value());
+        int64_t ns = (num_samples_req == 0) ? (h.num_samples - first_sample) : num_samples_req;
+        ok = computeTwoWindowCorr(
+            trs_file_.get(), first_trace, num_traces,
+            ref_first, ref_count,
+            first_sample, ns,
+            stride, pipeline_, result, progCb, err);
+    } else {
+        ok = computeXCorr(
+            trs_file_.get(),
+            first_trace, num_traces,
+            first_sample, num_samples_req,
+            stride, method, pipeline_, result, progCb, err);
+    }
 
     prog.setValue(prog.maximum());
 
@@ -1604,9 +1885,13 @@ void MainWindow::onRunXCorr() {
 
     QString method_str = result_ptr->method == XCorrMethod::MPCleaned  ? "MP-Cleaned"
                        : result_ptr->method == XCorrMethod::DualMatrix  ? "Dual Matrix"
+                       : result_ptr->method == XCorrMethod::TwoWindow   ? "Two-Window"
                                                                          : "Baseline";
-    QString title = QString("Cross-Correlation [%1]  M=%2  n=%3")
-                        .arg(method_str).arg(result_ptr->M).arg(result_ptr->n_traces);
+    QString title = (result_ptr->method == XCorrMethod::TwoWindow)
+        ? QString("Two-Window Match  search=%1  ref=%2  n=%3")
+              .arg(result_ptr->rows).arg(result_ptr->cols).arg(result_ptr->n_traces)
+        : QString("Cross-Correlation [%1]  M=%2  n=%3")
+              .arg(method_str).arg(result_ptr->M).arg(result_ptr->n_traces);
     if (result_ptr->method == XCorrMethod::MPCleaned)
         title += QString("  λ+=%1  signal=%2")
                      .arg(result_ptr->lambda_plus, 0, 'g', 4)
@@ -1615,7 +1900,7 @@ void MainWindow::onRunXCorr() {
     dlg->resize(820, 760);
 
     auto* heatmap = new HeatmapWidget(dlg);
-    heatmap->setMatrix(result_ptr->matrix, result_ptr->M);
+    heatmap->setMatrix(result_ptr->matrix, result_ptr->rows, result_ptr->cols);
 
     // Controls row
     auto* lbl_hover   = new QLabel("Hover over matrix to inspect values");
@@ -1664,7 +1949,7 @@ void MainWindow::onRunXCorr() {
     // Processing controls
     auto* lbl_scheme2   = new QLabel("Color scheme:");
     auto* combo_scheme2 = new QComboBox;
-    combo_scheme2->addItems({"RdBu", "Grayscale", "Hot", "Viridis", "Plasma"});
+    combo_scheme2->addItems({"RdBu", "Grayscale", "Hot", "Viridis", "Plasma", "Lukasz"});
     connect(combo_scheme2, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int idx) {
         heatmap->setColorScheme(static_cast<ColorScheme>(idx));
     });
@@ -1675,6 +1960,33 @@ void MainWindow::onRunXCorr() {
     sp_sigma2->setValue(0.0); sp_sigma2->setSpecialValueText("off");
     connect(sp_sigma2, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
         heatmap->setGaussianSigma(static_cast<float>(v));
+    });
+
+    auto* chk_abs2   = new QCheckBox("Abs value");
+    connect(chk_abs2, &QCheckBox::toggled, [=](bool on) {
+        heatmap->setAbsValue(on);
+        if (on) {
+            sp_vmin->setValue(0.0);
+            heatmap->setColorRange(0.0f, static_cast<float>(sp_vmax->value()));
+        } else {
+            double vm = sp_vmax->value();
+            sp_vmin->setValue(-vm);
+            heatmap->setColorRange(static_cast<float>(-vm), static_cast<float>(vm));
+        }
+    });
+
+    // Two-window: default to Lukasz colormap + abs value for template-match look
+    if (result_ptr->method == XCorrMethod::TwoWindow) {
+        combo_scheme2->setCurrentIndex(5);  // Lukasz (black → neon green)
+        chk_abs2->setChecked(true);         // abs: collapses to [0,1], snaps vmin→0
+    }
+
+    auto* lbl_gamma2 = new QLabel("Power γ:");
+    auto* sp_gamma2  = new QDoubleSpinBox;
+    sp_gamma2->setRange(1.0, 10.0); sp_gamma2->setDecimals(2); sp_gamma2->setSingleStep(0.1);
+    sp_gamma2->setValue(1.0); sp_gamma2->setSpecialValueText("off");
+    connect(sp_gamma2, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
+        heatmap->setPowerGamma(static_cast<float>(v));
     });
 
     auto* chk_thresh2 = new QCheckBox("Binary threshold |v|≥");
@@ -1689,6 +2001,15 @@ void MainWindow::onRunXCorr() {
     connect(sp_thresh2, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
         if (chk_thresh2->isChecked())
             heatmap->setBinaryThreshold(true, static_cast<float>(v));
+    });
+
+    auto* btn_autoclip2 = new QPushButton("Auto-clip 98%");
+    connect(btn_autoclip2, &QPushButton::clicked, dlg, [=]() {
+        float cmin, cmax;
+        heatmap->computeClipRange(0.98f, cmin, cmax);
+        sp_vmin->setValue(static_cast<double>(cmin));
+        sp_vmax->setValue(static_cast<double>(cmax));
+        heatmap->setColorRange(cmin, cmax);
     });
 
     connect(btn_exp_png, &QPushButton::clicked, dlg, [=]() {
@@ -1735,6 +2056,7 @@ void MainWindow::onRunXCorr() {
     ctrl_l->addWidget(sp_vmin);
     ctrl_l->addWidget(lbl_vmax);
     ctrl_l->addWidget(sp_vmax);
+    ctrl_l->addWidget(btn_autoclip2);
     ctrl_l->addWidget(btn_reset_view);
     ctrl_l->addWidget(btn_exp_png);
     ctrl_l->addWidget(btn_exp_npy);
@@ -1747,7 +2069,12 @@ void MainWindow::onRunXCorr() {
     proc_row_l->addSpacing(12);
     proc_row_l->addWidget(lbl_sigma2);
     proc_row_l->addWidget(sp_sigma2);
-    proc_row_l->addSpacing(12);
+    proc_row_l->addSpacing(8);
+    proc_row_l->addWidget(chk_abs2);
+    proc_row_l->addSpacing(8);
+    proc_row_l->addWidget(lbl_gamma2);
+    proc_row_l->addWidget(sp_gamma2);
+    proc_row_l->addSpacing(8);
     proc_row_l->addWidget(chk_thresh2);
     proc_row_l->addWidget(sp_thresh2);
     proc_row_l->addStretch();
