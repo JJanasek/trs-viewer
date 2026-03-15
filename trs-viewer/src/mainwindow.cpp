@@ -41,6 +41,17 @@
 // ---------------------------------------------------------------------------
 // Statistical helpers for t-test threshold calculation
 // ---------------------------------------------------------------------------
+// Threshold formula follows:
+//   Zhang, Ding, Durvaux, Standaert, Fei — "Towards Sound and Optimal Leakage
+//   Detection Procedure", IACR ePrint 2017/287 (EuroS&P 2018).
+//
+// The correct per-sample significance level for an overall type I error rate α
+// over n_L independent tests is the Šidák correction (Section 3.1):
+//   α_TH = 1 − (1 − α)^(1/n_L)
+// The t-test threshold is then TH = CDF_t^{−1}(1 − α_TH/2, ν_s), where ν_s
+// are the Welch degrees of freedom.  For large ν_s this converges to the
+// standard normal quantile.
+// ---------------------------------------------------------------------------
 
 // Rational approximation for Φ^{-1}(p) — Abramowitz & Stegun 26.2.17
 // Max |error| ≤ 4.5×10^{-4}.
@@ -1193,7 +1204,9 @@ void MainWindow::onLoadNpyTTest() {
     dlg->resize(1100, 520);
 
     auto* pw = new PlotWidget(dlg);
-    pw->addTrace(tstat_ptr, QColor("#4fc3f7"), "t-statistic");
+    pw->addTrace(tstat_ptr, QColor("#4488ff"), "t-stat range");
+    pw->setTraceFilled(0, true);
+    pw->setAxisLabels("Sample Index", "t-value");
     pw->setThresholds(true, 4.5, -4.5);
     pw->resetView();
 
@@ -1283,7 +1296,7 @@ void MainWindow::onLoadNpyTTest() {
         fl->addRow("Group A  n_A:",           sp_nA);
         fl->addRow("Group B  n_B:",           sp_nB);
         fl->addRow(new QLabel);
-        fl->addRow("Bonferroni α_TH:",        lbl_ath);
+        fl->addRow("Šidák α_TH:",              lbl_ath);
         fl->addRow("Approx. Welch ν̂:",        lbl_nu);
         fl->addRow("Threshold TH:",           lbl_th);
         fl->addRow(bb);
@@ -1999,7 +2012,9 @@ void MainWindow::onRunTTest() {
     dlg->resize(1100, 520);
 
     auto* pw = new PlotWidget(dlg);
-    pw->addTrace(tstat_ptr, QColor("#4fc3f7"), "t-statistic");
+    pw->addTrace(tstat_ptr, QColor("#4488ff"), "t-stat range");
+    pw->setTraceFilled(0, true);
+    pw->setAxisLabels("Sample Index", "t-value");
     pw->setThresholds(true, 4.5, -4.5);
     pw->resetView();
 
@@ -2072,7 +2087,7 @@ void MainWindow::onRunTTest() {
 
         auto* sp_alpha = new QDoubleSpinBox;
         sp_alpha->setRange(1e-6, 0.5); sp_alpha->setDecimals(6);
-        sp_alpha->setValue(0.05);      sp_alpha->setSingleStep(0.01);
+        sp_alpha->setValue(0.001);      sp_alpha->setSingleStep(0.01);
 
         int64_t n_L = static_cast<int64_t>(tstat_ptr->size());
         auto* lbl_nL  = new QLabel(QString::number(n_L));
@@ -2118,7 +2133,7 @@ void MainWindow::onRunTTest() {
         fl->addRow("Group A  n_A:",           lbl_nA);
         fl->addRow("Group B  n_B:",           lbl_nB);
         fl->addRow(new QLabel);
-        fl->addRow("Bonferroni α_TH:",        lbl_ath);
+        fl->addRow("Šidák α_TH:",              lbl_ath);
         fl->addRow("Median Welch ν̂:",         lbl_nu);
         fl->addRow("Threshold TH:",           lbl_th);
         fl->addRow(bb);

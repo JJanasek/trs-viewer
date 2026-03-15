@@ -67,6 +67,7 @@ struct TraceEntry {
     QColor    color;
     QString   label;
     bool      visible   = true;
+    bool      filled    = false;  // render as filled min/max band (zoomed-out mode)
     std::shared_ptr<std::vector<float>> mem_data; // non-null for in-memory traces
     std::vector<std::shared_ptr<ITransform>> transforms;
     TraceCache cache;
@@ -110,6 +111,10 @@ public:
     void setTraceWidth(float w);
     // Change the color of an already-added trace by index.
     void setTraceColor(int idx, const QColor& c);
+    // Render trace as a filled min/max band (good for dense t-test signals).
+    void setTraceFilled(int idx, bool filled);
+    // Axis labels drawn outside the plot area (empty = none).
+    void setAxisLabels(const QString& x_label, const QString& y_label);
 
     // View accessors
     int64_t viewStart()     const { return view_start_; }
@@ -208,12 +213,16 @@ private:
 
     // Visual style
     QString plot_title_;
+    QString axis_label_x_;
+    QString axis_label_y_;
     float   trace_width_ = 1.5f;
 
     // Plot area margins (pixels)
-    static constexpr int ML      = 65;
-    static constexpr int MR      = 12;
-    static constexpr int MT      = 12;
-    static constexpr int MB      = 36;
+    static constexpr int ML       = 65;
+    static constexpr int ML_YLBL  = 83;  // left margin when y-axis label is set
+    static constexpr int MR       = 12;
+    static constexpr int MT       = 12;
+    static constexpr int MB       = 36;
+    static constexpr int MB_XLBL  = 52;  // bottom margin when x-axis label is set
     static constexpr int MT_TITLE = 30;  // top margin when title is set
 };
