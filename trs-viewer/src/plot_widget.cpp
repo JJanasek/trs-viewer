@@ -126,6 +126,20 @@ void PlotWidget::setTraceColor(int idx, const QColor& c) {
     update();
 }
 
+void PlotWidget::setTraceFilled(int idx, bool filled) {
+    if (idx < 0 || idx >= static_cast<int>(traces_.size())) return;
+    traces_[static_cast<size_t>(idx)].filled = filled;
+    update();
+}
+
+void PlotWidget::setAxisLabels(const QString& x_label, const QString& y_label) {
+    axis_label_x_ = x_label;
+    axis_label_y_ = y_label;
+    // invalidate caches — plot rect size changed
+    for (auto& te : traces_) te.cache.valid = false;
+    update();
+}
+
 void PlotWidget::addTrace(TrsFile* file, int32_t trace_idx,
                            QColor color, const QString& label)
 {
@@ -237,7 +251,9 @@ void PlotWidget::resetYZoom() {
 
 QRect PlotWidget::plotRect() const {
     int mt = plot_title_.isEmpty() ? MT : MT_TITLE;
-    return QRect(ML, mt, width() - ML - MR, height() - mt - MB);
+    int ml = axis_label_y_.isEmpty() ? ML : ML_YLBL;
+    int mb = axis_label_x_.isEmpty() ? MB : MB_XLBL;
+    return QRect(ml, mt, width() - ml - MR, height() - mt - mb);
 }
 
 int64_t PlotWidget::pixelToSample(int px, const QRect& pr) const {
@@ -449,12 +465,38 @@ void PlotWidget::renderTrace(const TraceEntry& te, QPainter& p,
     }
 
     // ------------------------------------------------------------------
-    // ZOOMED-OUT: draw per-pixel min-max segments with gap bridging.
-    // valueToPixel maps larger values to smaller y (top of screen), so:
-    //   bot = valueToPixel(pix_min) — large y, bottom of bar on screen
-    //   top = valueToPixel(pix_max) — small y, top of bar on screen
-    // When the signal jumps between columns the bars may not overlap;
-    // extend the current bar to close the gap so the trace looks continuous.
+    // ZOOMED-OUT filled band: build polygon from upper (max) envelope
+    // going L→R, then lower (min) envelope going R→L, and fill it.
+    // ------------------------------------------------------------------
+    if (te.filled) {
+        std::vector<QPointF> upper_pts, lower_pts;
+        upper_pts.reserve(static_cast<size_t>(W));
+        lower_pts.reserve(static_cast<size_t>(W));
+        for (int px = 0; px < W; px++) {
+            float mn = te.cache.pix_min[static_cast<size_t>(px)];
+            float mx = te.cache.pix_max[static_cast<size_t>(px)];
+            if (mn == std::numeric_limits<float>::max()) continue;
+            upper_pts.emplace_back(pr.left() + px,
+                                   valueToPixel(mx, pr, ymin, ymax));
+            lower_pts.emplace_back(pr.left() + px,
+                                   valueToPixel(mn, pr, ymin, ymax));
+        }
+        if (!upper_pts.empty()) {
+            std::vector<QPointF> poly = upper_pts;
+            poly.insert(poly.end(), lower_pts.rbegin(), lower_pts.rend());
+            QColor fill = te.color;
+            fill.setAlpha(80);
+            p.setRenderHint(QPainter::Antialiasing, false);
+            p.setBrush(fill);
+            p.setPen(Qt::NoPen);
+            p.drawPolygon(poly.data(), static_cast<int>(poly.size()));
+            p.setBrush(Qt::NoBrush);
+        }
+        return;
+    }
+
+    // ------------------------------------------------------------------
+    // ZOOMED-OUT line: draw per-pixel min-max segments with gap bridging.
     // ------------------------------------------------------------------
     p.setPen(QPen(te.color, 1));
     int prev_top = INT_MAX, prev_bot = INT_MAX;
@@ -470,8 +512,8 @@ void PlotWidget::renderTrace(const TraceEntry& te, QPainter& p,
         int bot = valueToPixel(mn, pr, ymin, ymax);
 
         if (prev_top != INT_MAX) {
-            if      (bot < prev_top) bot = prev_top;   // gap upward
-            else if (top > prev_bot) top = prev_bot;   // gap downward
+            if      (bot < prev_top) bot = prev_top;
+            else if (top > prev_bot) top = prev_bot;
         }
         prev_top = valueToPixel(mx, pr, ymin, ymax);
         prev_bot = valueToPixel(mn, pr, ymin, ymax);
@@ -639,6 +681,23 @@ void PlotWidget::paintEvent(QPaintEvent*) {
     p.setPen(theme_.border);
     p.drawRect(pr);
 
+    // Axis name labels
+    if (!axis_label_x_.isEmpty() || !axis_label_y_.isEmpty()) {
+        QFont lf = font(); lf.setPointSize(9); lf.setBold(false); p.setFont(lf);
+        p.setPen(theme_.axis_text);
+        if (!axis_label_x_.isEmpty())
+            p.drawText(QRect(pr.left(), height() - 18, pr.width(), 18),
+                       Qt::AlignHCenter | Qt::AlignVCenter, axis_label_x_);
+        if (!axis_label_y_.isEmpty()) {
+            p.save();
+            p.translate(12, pr.top() + pr.height() / 2);
+            p.rotate(-90);
+            p.drawText(QRect(-pr.height()/2, -14, pr.height(), 16),
+                       Qt::AlignHCenter | Qt::AlignVCenter, axis_label_y_);
+            p.restore();
+        }
+    }
+
     // X-axis labels
     p.setPen(theme_.axis_text);
     QFont f = font(); f.setPointSize(8); p.setFont(f);
@@ -666,15 +725,39 @@ void PlotWidget::paintEvent(QPaintEvent*) {
 
     // Legend
     {
+        QFont lf = font(); lf.setPointSize(8); p.setFont(lf);
         int lx = pr.right() - 6;
         int ly = pr.top() + 8;
         for (const auto& te : traces_) {
             if (!te.visible) continue;
-            p.setPen(te.color);
+            if (te.filled) {
+                QColor swatch = te.color; swatch.setAlpha(80);
+                p.fillRect(lx - 18, ly - 5, 18, 10, swatch);
+                p.setPen(QPen(te.color, 1));
+                p.drawRect(lx - 18, ly - 5, 18, 10);
+            } else {
+                p.setPen(te.color);
+                p.drawLine(lx - 18, ly, lx, ly);
+            }
+            p.setPen(theme_.legend_text);
+            p.drawText(lx - 150, ly - 8, 128, 16, Qt::AlignRight, te.label);
+            ly += 18;
+        }
+        if (show_thresholds_) {
+            const QColor thr_color(220, 120, 0, 230);
+            p.setPen(QPen(thr_color, 1, Qt::DashLine));
             p.drawLine(lx - 18, ly, lx, ly);
             p.setPen(theme_.legend_text);
-            p.drawText(lx - 130, ly - 8, 108, 16, Qt::AlignRight, te.label);
+            p.drawText(lx - 150, ly - 8, 128, 16, Qt::AlignRight,
+                       QString("Threshold (+%1)").arg(threshold_pos_, 0, 'f', 1));
             ly += 18;
+            if (!threshold_one_sided_) {
+                p.setPen(QPen(thr_color, 1, Qt::DashLine));
+                p.drawLine(lx - 18, ly, lx, ly);
+                p.setPen(theme_.legend_text);
+                p.drawText(lx - 150, ly - 8, 128, 16, Qt::AlignRight,
+                           QString("Threshold (-%1)").arg(threshold_pos_, 0, 'f', 1));
+            }
         }
     }
 

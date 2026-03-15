@@ -1,5 +1,9 @@
 # trs-viewer
 
+<p align="center">
+  <img src="docs/logo.svg" alt="trs-viewer logo" width="320"/>
+</p>
+
 Interactive power-trace viewer and side-channel analysis toolkit for Riscure `.trs` files and NumPy trace sets.
 
 ![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue)
