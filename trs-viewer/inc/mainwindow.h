@@ -42,15 +42,19 @@ private slots:
     void onRunTTest();
     void onCropEdit();
     void onRunXCorr();
+    void onAlignTraces();
     void onLoadNpyTTest();
     void onLoadNpyHeatmap();
     void onOpenNpyTraces();
     void onExportNpy();
     void onExportNpz();
+    void onRunCpa();
+    void onDragAlignChanged();
 
 private:
     void setupMenuBar();
     void updateFileInfo();
+    void updateTraceDataDisplay();
     void rebuildTransformList();
     std::shared_ptr<ITransform> createTransform(int combo_index);
 
@@ -58,12 +62,26 @@ private:
     std::unique_ptr<TrsFile> trs_file_;
     std::vector<std::shared_ptr<ITransform>> pipeline_;
 
+    // Last-applied alignment state — populated by "Apply to Main View" or
+    // by drag-align on file-backed traces.  Consumed by CPA.
+    std::vector<int32_t> align_shifts_;        // raw per-trace shifts
+    int32_t              align_first_trace_  = 0;
+    int64_t              align_first_sample_ = 0; // crop offset (0 for drag-align)
+    int64_t              align_n_samples_    = 0; // 0 = nothing stored
+
+    // Track whether the main plot holds file-backed traces (true) or
+    // in-memory baked-in traces from "Apply to Main View" (false).
+    int32_t              plot_first_trace_   = 0;
+    bool                 plot_file_backed_   = false;
+
     // Widgets
     PlotWidget*  plot_widget_     = nullptr;
 
     // Side panel
     QLabel*      lbl_file_        = nullptr;
     QLabel*      lbl_info_        = nullptr;
+    QLabel*      lbl_trace_data_  = nullptr;
+    QSpinBox*    spin_data_idx_   = nullptr;
     QSpinBox*    spin_first_      = nullptr;
     QSpinBox*    spin_count_      = nullptr;
     QPushButton* btn_apply_       = nullptr;
@@ -80,6 +98,7 @@ private:
     QPushButton*  btn_mode_pan_      = nullptr;
     QPushButton*  btn_mode_measure_  = nullptr;
     QPushButton*  btn_mode_box_zoom_ = nullptr;
+    QPushButton*  btn_mode_align_    = nullptr;
     QPushButton*  btn_zoom_in_       = nullptr;
     QPushButton*  btn_zoom_out_     = nullptr;
     QPushButton*  btn_reset_        = nullptr;

@@ -44,6 +44,13 @@ else()
     FetchContent_MakeAvailable(eigen)
 endif()
 
+# ---------------------------------------------------------------------------
+# Python3 + NumPy (for CPA leakage model scripting)
+# ---------------------------------------------------------------------------
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)
+message(STATUS "Python3 version: ${Python3_VERSION}")
+message(STATUS "NumPy include:   ${Python3_NumPy_INCLUDE_DIRS}")
+
 set(SOURCES
     resources.qrc
     src/main.cpp
@@ -53,10 +60,17 @@ set(SOURCES
     src/plot_widget.cpp
     src/ttest.cpp
     src/xcorr.cpp
+    src/align.cpp
     src/heatmap_widget.cpp
     inc/mainwindow.h
     inc/plot_widget.h
     inc/heatmap_widget.h
+    src/leakage_model.cpp
+    src/cpa.cpp
+    src/leakage_model_dialog.cpp
+    inc/leakage_model.h
+    inc/leakage_model_dialog.h
+    inc/cpa.h
 )
 
 add_executable(trs-viewer ${SOURCES})
@@ -65,8 +79,10 @@ target_link_libraries(trs-viewer PRIVATE
     ${QT_LIBS}
     OpenMP::OpenMP_CXX
     Eigen3::Eigen
+    Python3::Python
+    Python3::NumPy
 )
-target_include_directories(trs-viewer PRIVATE src inc)
+target_include_directories(trs-viewer PRIVATE src inc ${Python3_NumPy_INCLUDE_DIRS})
 
 target_compile_options(trs-viewer PRIVATE
     -O2

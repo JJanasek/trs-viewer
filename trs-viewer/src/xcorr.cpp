@@ -46,6 +46,7 @@ bool computeXCorr(
     int32_t        stride,
     XCorrMethod    method,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    const std::vector<int32_t>& shifts,
     XCorrResult&   out,
     XCorrProgress  progress,
     std::string&   error)
@@ -118,10 +119,17 @@ bool computeXCorr(
     // -----------------------------------------------------------------------
     std::vector<float> raw_full(static_cast<size_t>(num_samples));
     auto loadTrace = [&](int ti, float* out_m) {
-        int32_t src = first_trace + ti;
-        int64_t got = file->readSamples(src, first_sample, num_samples, raw_full.data());
-        if (got < num_samples)
-            std::fill(raw_full.begin() + static_cast<size_t>(got), raw_full.end(), 0.0f);
+        int32_t src   = first_trace + ti;
+        int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
+        const int64_t total_samples = h.num_samples;
+        const int64_t adj_start = first_sample + shift;
+        std::fill(raw_full.begin(), raw_full.end(), 0.0f);
+        if (adj_start < total_samples && adj_start + num_samples > 0) {
+            int64_t src_start = std::max<int64_t>(0, adj_start);
+            int64_t src_end   = std::min<int64_t>(total_samples, adj_start + num_samples);
+            int64_t dst_off   = src_start - adj_start;
+            file->readSamples(src, src_start, src_end - src_start, raw_full.data() + dst_off);
+        }
         for (const auto& t : pipeline) t->reset();
         int64_t n_out = num_samples;
         for (const auto& t : pipeline)
@@ -330,6 +338,7 @@ bool computeXCorrNaive(
     int64_t        num_samples,
     int32_t        stride,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    const std::vector<int32_t>& shifts,
     XCorrResult&   out,
     XCorrProgress  progress,
     std::string&   error)
@@ -373,10 +382,17 @@ bool computeXCorrNaive(
     std::vector<float> raw(static_cast<size_t>(M));
 
     auto loadTrace = [&](int ti, float* out_m) {
-        int32_t src = first_trace + ti;
-        int64_t got = file->readSamples(src, first_sample, num_samples, raw_full.data());
-        if (got < num_samples)
-            std::fill(raw_full.begin() + static_cast<size_t>(got), raw_full.end(), 0.0f);
+        int32_t src   = first_trace + ti;
+        int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
+        const int64_t total_samples = h.num_samples;
+        const int64_t adj_start = first_sample + shift;
+        std::fill(raw_full.begin(), raw_full.end(), 0.0f);
+        if (adj_start < total_samples && adj_start + num_samples > 0) {
+            int64_t src_start = std::max<int64_t>(0, adj_start);
+            int64_t src_end   = std::min<int64_t>(total_samples, adj_start + num_samples);
+            int64_t dst_off   = src_start - adj_start;
+            file->readSamples(src, src_start, src_end - src_start, raw_full.data() + dst_off);
+        }
         for (const auto& t : pipeline) t->reset();
         int64_t n_out = num_samples;
         for (const auto& t : pipeline)
@@ -478,12 +494,19 @@ static void loadWindow(TrsFile* file, int32_t first_trace,
                        const std::vector<std::shared_ptr<ITransform>>& pipeline,
                        int ti, int64_t first_sample, int64_t num_samples,
                        int32_t stride, int32_t M_out,
-                       float* work_buf, float* out_buf)
+                       float* work_buf, float* out_buf,
+                       int32_t shift = 0)
 {
+    const int64_t total_samples = file->header().num_samples;
     int32_t src = first_trace + ti;
-    int64_t got = file->readSamples(src, first_sample, num_samples, work_buf);
-    if (got < num_samples)
-        std::fill(work_buf + got, work_buf + num_samples, 0.0f);
+    const int64_t adj_start = first_sample + shift;
+    std::fill(work_buf, work_buf + num_samples, 0.0f);
+    if (adj_start < total_samples && adj_start + num_samples > 0) {
+        int64_t src_start = std::max<int64_t>(0, adj_start);
+        int64_t src_end   = std::min<int64_t>(total_samples, adj_start + num_samples);
+        int64_t dst_off   = src_start - adj_start;
+        file->readSamples(src, src_start, src_end - src_start, work_buf + dst_off);
+    }
     for (const auto& t : pipeline) t->reset();
     int64_t n_out = num_samples;
     for (const auto& t : pipeline) n_out = t->apply(work_buf, n_out, 0);
@@ -503,6 +526,7 @@ bool computeTwoWindowCorr(
     int64_t        search_num_samples,
     int32_t        stride,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    const std::vector<int32_t>& shifts,
     XCorrResult&   out,
     XCorrProgress  progress,
     std::string&   error)
@@ -561,9 +585,10 @@ bool computeTwoWindowCorr(
     for (int ti = 0; ti < n; ti++) {
         if (progress && !progress(ti, 3 * n)) { error = "Cancelled."; return false; }
 
+        int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
         loadWindow(file, first_trace, pipeline, ti,
                    ref_first_sample, ref_num_samples, stride, M_ref,
-                   work_r.data(), raw_r.data());
+                   work_r.data(), raw_r.data(), shift);
         for (int j = 0; j < M_ref; j++) {
             double x     = static_cast<double>(raw_r[j]);
             double delta = x - ref_wf_mean[j];
@@ -573,7 +598,7 @@ bool computeTwoWindowCorr(
 
         loadWindow(file, first_trace, pipeline, ti,
                    search_first_sample, search_num_samples, stride, M_search,
-                   work_s.data(), raw_s.data());
+                   work_s.data(), raw_s.data(), shift);
         for (int j = 0; j < M_search; j++) {
             double x     = static_cast<double>(raw_s[j]);
             double delta = x - sea_wf_mean[j];
@@ -603,15 +628,16 @@ bool computeTwoWindowCorr(
     for (int ti = 0; ti < n; ti++) {
         if (progress && !progress(n + ti, 3 * n)) { error = "Cancelled."; return false; }
 
+        int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
         loadWindow(file, first_trace, pipeline, ti,
                    ref_first_sample, ref_num_samples, stride, M_ref,
-                   work_r.data(), raw_r.data());
+                   work_r.data(), raw_r.data(), shift);
         Eigen::Map<Eigen::VectorXf> vr(raw_r.data(), M_ref);
         A_ref.col(ti) = ((vr.cast<double>() - ref_mean).cwiseProduct(ref_inv_std)).cast<float>();
 
         loadWindow(file, first_trace, pipeline, ti,
                    search_first_sample, search_num_samples, stride, M_search,
-                   work_s.data(), raw_s.data());
+                   work_s.data(), raw_s.data(), shift);
         Eigen::Map<Eigen::VectorXf> vs(raw_s.data(), M_search);
         A_search.col(ti) = ((vs.cast<double>() - sea_mean).cwiseProduct(sea_inv_std)).cast<float>();
     }

@@ -42,6 +42,7 @@ bool computeXCorr(
     int32_t        stride,
     XCorrMethod    method,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    const std::vector<int32_t>& shifts,
     XCorrResult&   out,
     XCorrProgress  progress,
     std::string&   error);
@@ -57,6 +58,7 @@ bool computeXCorrNaive(
     int64_t        num_samples,
     int32_t        stride,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    const std::vector<int32_t>& shifts,
     XCorrResult&   out,
     XCorrProgress  progress,
     std::string&   error);
@@ -75,6 +77,7 @@ bool computeTwoWindowCorr(
     int64_t        search_num_samples,
     int32_t        stride,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    const std::vector<int32_t>& shifts,
     XCorrResult&   out,
     XCorrProgress  progress,
     std::string&   error);
