@@ -33,6 +33,7 @@ enum class InteractionMode {
     Measure,    // left-click sets P1 then P2; third click resets
     BoxZoom,    // left-drag to rubber-band zoom
     CropSelect, // left-drag to add a sample range to the crop list
+    AlignDrag,  // left-drag a trace left/right to shift it in real time
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +69,7 @@ struct TraceEntry {
     QString   label;
     bool      visible   = true;
     bool      filled    = false;  // render as filled min/max band (zoomed-out mode)
+    int32_t   shift     = 0;      // sample shift applied during read (AlignDrag)
     std::shared_ptr<std::vector<float>> mem_data; // non-null for in-memory traces
     std::vector<std::shared_ptr<ITransform>> transforms;
     TraceCache cache;
@@ -127,6 +129,12 @@ public:
     void    clearCropRanges();
     const   std::vector<std::pair<int64_t,int64_t>>& cropRanges() const { return crop_ranges_; }
 
+    // Per-trace sample shifts (set by AlignDrag; also settable programmatically)
+    int32_t             traceShift(int idx) const;
+    std::vector<int32_t> traceShifts() const;
+    void    setTraceShift(int idx, int32_t shift);
+    void    clearTraceShifts();  // reset all shifts to 0
+
 signals:
     void viewChanged(int64_t view_start, int64_t view_end, int64_t total_samples);
     // Emitted whenever measurement points change.
@@ -135,6 +143,8 @@ signals:
                              int64_t s2, double v2, bool has_p2);
     // Emitted whenever the crop ranges list changes
     void cropRangesChanged();
+    // Emitted when any trace shift changes (AlignDrag released or setTraceShift called)
+    void traceShiftsChanged();
 
 protected:
     void paintEvent(QPaintEvent*) override;
@@ -188,6 +198,15 @@ private:
     bool   rubber_band_active_  = false;
     QPoint rubber_band_start_;
     QPoint rubber_band_current_;
+
+    // AlignDrag state
+    int     align_drag_idx_           = -1;   // index of trace being dragged
+    int64_t align_drag_sample_origin_ = 0;    // sample under cursor at press
+    int32_t align_drag_shift_origin_  = 0;    // trace shift at press
+    // Helper: find the trace index whose y-value is closest to (px,py).
+    int     nearestTrace(int px, int py, const QRect& pr) const;
+    // Helper: get cached data value for trace te at raw sample s.
+    double  traceValueAt(const TraceEntry& te, int64_t s) const;
 
     // Crop ranges
     std::vector<std::pair<int64_t,int64_t>> crop_ranges_;

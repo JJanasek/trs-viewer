@@ -1,7 +1,11 @@
 #include "mainwindow.h"
 #include "heatmap_widget.h"
 #include "ttest.h"
+#include "align.h"
 #include "xcorr.h"
+#include "cpa.h"
+#include "leakage_model.h"
+#include "leakage_model_dialog.h"
 
 #include <QApplication>
 #include <QButtonGroup>
@@ -32,6 +36,8 @@
 #include <QRadioButton>
 #include <QSpinBox>
 #include <QSplitter>
+#include <QHeaderView>
+#include <QTableWidget>
 #include <QVBoxLayout>
 
 #include <algorithm>
@@ -130,6 +136,8 @@ MainWindow::MainWindow(QWidget* parent)
     spin_count_->setValue(1);
     btn_apply_ = new QPushButton("Load / Refresh");
     connect(btn_apply_, &QPushButton::clicked, this, &MainWindow::onApplyTraces);
+    connect(spin_first_, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, [this](int v){ spin_data_idx_->setValue(v); });
     tfl->addRow("First trace:", spin_first_);
     tfl->addRow("Count:", spin_count_);
     tfl->addRow(btn_apply_);
@@ -183,8 +191,46 @@ MainWindow::MainWindow(QWidget* parent)
     txl->addWidget(list_transforms_);
     txl->addLayout(tx_btns);
 
+    // Trace data inspector
+    QGroupBox*   grp_data = new QGroupBox("Trace Data");
+    QVBoxLayout* dl       = new QVBoxLayout(grp_data);
+
+    // Navigation row: ◀  [index spinbox]  ▶
+    auto* data_nav   = new QWidget;
+    auto* data_nav_l = new QHBoxLayout(data_nav);
+    data_nav_l->setContentsMargins(0, 0, 0, 0);
+    auto* btn_data_prev  = new QPushButton("◀");
+    auto* btn_data_next  = new QPushButton("▶");
+    spin_data_idx_ = new QSpinBox;
+    spin_data_idx_->setMinimum(0);
+    spin_data_idx_->setValue(0);
+    spin_data_idx_->setKeyboardTracking(false);
+    btn_data_prev->setFixedWidth(28);
+    btn_data_next->setFixedWidth(28);
+    data_nav_l->addWidget(btn_data_prev);
+    data_nav_l->addWidget(spin_data_idx_, 1);
+    data_nav_l->addWidget(btn_data_next);
+
+    lbl_trace_data_ = new QLabel("–");
+    lbl_trace_data_->setWordWrap(true);
+    lbl_trace_data_->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    lbl_trace_data_->setFont(QFont("Monospace", 8));
+
+    dl->addWidget(data_nav);
+    dl->addWidget(lbl_trace_data_);
+
+    connect(spin_data_idx_, QOverload<int>::of(&QSpinBox::valueChanged),
+            this, &MainWindow::updateTraceDataDisplay);
+    connect(btn_data_prev, &QPushButton::clicked, this, [this](){
+        spin_data_idx_->setValue(spin_data_idx_->value() - 1);
+    });
+    connect(btn_data_next, &QPushButton::clicked, this, [this](){
+        spin_data_idx_->setValue(spin_data_idx_->value() + 1);
+    });
+
     side_l->addWidget(grp_file);
     side_l->addWidget(grp_trace);
+    side_l->addWidget(grp_data);
     side_l->addWidget(lbl_view_);
     side_l->addWidget(grp_meas);
     side_l->addWidget(grp_tx);
@@ -206,26 +252,31 @@ MainWindow::MainWindow(QWidget* parent)
     btn_mode_pan_      = new QPushButton("Pan");
     btn_mode_measure_  = new QPushButton("Measure");
     btn_mode_box_zoom_ = new QPushButton("⬚ Box Zoom");
+    btn_mode_align_    = new QPushButton("↔ Align");
     btn_mode_pan_->setCheckable(true);
     btn_mode_measure_->setCheckable(true);
     btn_mode_box_zoom_->setCheckable(true);
+    btn_mode_align_->setCheckable(true);
     btn_mode_pan_->setChecked(true);
     btn_mode_pan_->setToolTip("Drag to pan, scroll wheel to zoom");
     btn_mode_measure_->setToolTip("Click two points to measure distance (P)");
     btn_mode_box_zoom_->setToolTip("Drag to select a region and zoom into it (Z)");
+    btn_mode_align_->setToolTip("Click and drag a trace left/right to shift it");
 
     mode_group_ = new QButtonGroup(this);
     mode_group_->addButton(btn_mode_pan_,      0);
     mode_group_->addButton(btn_mode_measure_,  1);
     mode_group_->addButton(btn_mode_box_zoom_, 2);
+    mode_group_->addButton(btn_mode_align_,    3);
     mode_group_->setExclusive(true);
 
     connect(mode_group_, &QButtonGroup::idClicked, this, [this](int id) {
         InteractionMode m = id == 0 ? InteractionMode::Pan
                           : id == 1 ? InteractionMode::Measure
-                                    : InteractionMode::BoxZoom;
+                          : id == 2 ? InteractionMode::BoxZoom
+                                    : InteractionMode::AlignDrag;
         plot_widget_->setMode(m);
-        if (id == 0 || id == 2) lbl_measure_->setText("–");
+        if (id == 0 || id == 2 || id == 3) lbl_measure_->setText("–");
     });
 
     // Separator
@@ -261,6 +312,7 @@ MainWindow::MainWindow(QWidget* parent)
     toolbar_l->addWidget(btn_mode_pan_);
     toolbar_l->addWidget(btn_mode_measure_);
     toolbar_l->addWidget(btn_mode_box_zoom_);
+    toolbar_l->addWidget(btn_mode_align_);
     toolbar_l->addWidget(sep1);
     toolbar_l->addWidget(btn_zoom_in_);
     toolbar_l->addWidget(btn_zoom_out_);
@@ -278,6 +330,8 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onViewChanged);
     connect(plot_widget_, &PlotWidget::measurementUpdated,
             this, &MainWindow::onMeasurementUpdated);
+    connect(plot_widget_, &PlotWidget::traceShiftsChanged,
+            this, &MainWindow::onDragAlignChanged);
 
     right_l->addWidget(toolbar);
     right_l->addWidget(plot_widget_, 1);
@@ -373,6 +427,14 @@ void MainWindow::setupMenuBar() {
     connect(act_xcorr, &QAction::triggered, this, &MainWindow::onRunXCorr);
     sca_menu->addAction(act_xcorr);
 
+    auto* act_dpa = new QAction("&CPA…", this);
+    connect(act_dpa, &QAction::triggered, this, &MainWindow::onRunCpa);
+    sca_menu->addAction(act_dpa);
+
+    auto* act_align = new QAction("&Align Traces…", this);
+    connect(act_align, &QAction::triggered, this, &MainWindow::onAlignTraces);
+    sca_menu->addAction(act_align);
+
     sca_menu->addSeparator();
 
     auto* act_load_npy_ttest = new QAction("Load t-test &NPY…", this);
@@ -405,7 +467,11 @@ void MainWindow::openFile(const QString& path) {
     }
     trs_file_ = std::move(f);
 
-    // Clear pipeline whenever a new file is opened.
+    // Clear pipeline and alignment state whenever a new file is opened.
+    align_shifts_.clear();
+    align_first_trace_ = 0;
+    align_first_sample_ = 0;
+    align_n_samples_ = 0;
     pipeline_.clear();
     rebuildTransformList();
     plot_widget_->setTransforms(pipeline_);
@@ -419,8 +485,18 @@ void MainWindow::openFile(const QString& path) {
     onApplyTraces();
 }
 
+static QString hexBytes(const uint8_t* p, size_t n, int group = 0) {
+    QString s;
+    for (size_t i = 0; i < n; i++) {
+        if (group > 0 && i > 0 && i % static_cast<size_t>(group) == 0) s += ' ';
+        s += QString("%1").arg(p[i], 2, 16, QChar('0'));
+    }
+    return s;
+}
+
 void MainWindow::updateFileInfo() {
-    if (!trs_file_) { lbl_file_->setText("No file"); lbl_info_->clear(); return; }
+    if (!trs_file_) { lbl_file_->setText("No file"); lbl_info_->clear();
+                      lbl_trace_data_->setText("–"); return; }
 
     const auto& h = trs_file_->header();
     lbl_file_->setText(QString::fromStdString(trs_file_->path()).section('/', -1));
@@ -433,7 +509,6 @@ void MainWindow::updateFileInfo() {
     case SampleType::FLOAT32: type_str = "float32"; break;
     }
 
-    // Compute effective sample count after pipeline (decimating transforms shrink it).
     int64_t effective_samples = h.num_samples;
     for (const auto& t : pipeline_)
         effective_samples = t->transformedCount(effective_samples);
@@ -444,6 +519,39 @@ void MainWindow::updateFileInfo() {
     if (effective_samples != h.num_samples)
         info += QString("\nAfter pipeline: %1").arg(effective_samples);
     lbl_info_->setText(info);
+
+    // Sync data navigator range
+    spin_data_idx_->setMaximum(std::max(0, h.num_traces - 1));
+
+    updateTraceDataDisplay();
+}
+
+void MainWindow::updateTraceDataDisplay() {
+    if (!trs_file_) { lbl_trace_data_->setText("–"); return; }
+    const auto& h = trs_file_->header();
+    if (h.data_length <= 0) { lbl_trace_data_->setText("(no data)"); return; }
+
+    int ti = spin_data_idx_->value();
+    if (ti >= h.num_traces) { lbl_trace_data_->setText("(out of range)"); return; }
+
+    auto raw = trs_file_->readData(ti);
+    if (raw.empty()) { lbl_trace_data_->setText("(empty)"); return; }
+
+    QString text = QString("Trace %1 / %2\n").arg(ti).arg(h.num_traces - 1);
+
+    auto it = h.param_map.find("LEGACY_DATA");
+    if (it != h.param_map.end() && it->second.length == 32 && it->second.offset == 0
+        && raw.size() >= 32) {
+        text += "PT: " + hexBytes(raw.data(),      16, 4) + "\n";
+        text += "CT: " + hexBytes(raw.data() + 16, 16, 4);
+    } else {
+        for (size_t off = 0; off < raw.size(); off += 16) {
+            size_t n = std::min<size_t>(16, raw.size() - off);
+            text += hexBytes(raw.data() + off, n, 4) + "\n";
+        }
+        text = text.trimmed();
+    }
+    lbl_trace_data_->setText(text);
 }
 
 void MainWindow::onApplyTraces() {
@@ -462,6 +570,30 @@ void MainWindow::onApplyTraces() {
     }
     plot_widget_->setTransforms(pipeline_);
     plot_widget_->resetView();
+
+    // Clear alignment state — new trace set makes old shifts stale.
+    align_shifts_.clear();
+    align_first_trace_ = 0;
+    align_first_sample_ = 0;
+    align_n_samples_ = 0;
+
+    // Mark plot as file-backed so drag-align updates alignment state.
+    plot_first_trace_  = first;
+    plot_file_backed_  = true;
+}
+
+void MainWindow::onDragAlignChanged() {
+    // Called whenever a trace is drag-shifted in the main plot.
+    // Only update alignment state when the plot holds file-backed traces.
+    if (!trs_file_ || !plot_file_backed_) return;
+
+    auto shifts = plot_widget_->traceShifts();
+    if (shifts.empty()) return;
+
+    align_first_trace_  = plot_first_trace_;
+    align_shifts_       = std::move(shifts);
+    align_first_sample_ = 0;
+    align_n_samples_    = trs_file_->header().num_samples;
 }
 
 void MainWindow::onAddTransform() {
@@ -1213,7 +1345,7 @@ void MainWindow::onLoadNpyTTest() {
     auto* lbl_thr  = new QLabel("Threshold ±:");
     auto* spin_thr = new QDoubleSpinBox;
     spin_thr->setRange(0.1, 1000.0); spin_thr->setValue(4.5);
-    spin_thr->setDecimals(2); spin_thr->setSingleStep(0.5);
+    spin_thr->setDecimals(2); spin_thr->setSingleStep(0.1);
     connect(spin_thr, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             [pw](double v) { pw->setThresholds(true, v, -v); });
 
@@ -1703,6 +1835,10 @@ void MainWindow::onOpenNpyTraces() {
                      data_length);
 
     trs_file_ = std::move(f);
+    align_shifts_.clear();
+    align_first_trace_ = 0;
+    align_first_sample_ = 0;
+    align_n_samples_ = 0;
     pipeline_.clear();
     rebuildTransformList();
     plot_widget_->setTransforms(pipeline_);
@@ -1907,9 +2043,41 @@ void MainWindow::onRunTTest() {
     auto* fl        = new QFormLayout(&cfg);
     auto* sp_first  = new QSpinBox; sp_first->setRange(0, std::max(0, n_total-1)); sp_first->setValue(0);
     auto* sp_count  = new QSpinBox; sp_count->setRange(2, n_total); sp_count->setValue(n_total);
-    auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    auto* sp_s_first = new QSpinBox; sp_s_first->setRange(0, std::max(0, (int)h.num_samples - 1)); sp_s_first->setValue(0);
+    auto* sp_s_count = new QSpinBox; sp_s_count->setRange(0, (int)h.num_samples); sp_s_count->setValue(0);
+    sp_s_count->setSpecialValueText("All");
     fl->addRow("First trace:", sp_first);
     fl->addRow("Count:",       sp_count);
+    fl->addRow("First sample:", sp_s_first);
+    fl->addRow("Sample count (0=all):", sp_s_count);
+
+    // Alignment group
+    const bool has_alignment = (align_n_samples_ > 0);
+    auto* grp_align  = new QGroupBox("Alignment");
+    auto* fl_align   = new QFormLayout(grp_align);
+    auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
+    chk_shifts->setChecked(has_alignment);
+    chk_shifts->setEnabled(has_alignment);
+    chk_shifts->setToolTip(has_alignment
+        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3).")
+              .arg(align_shifts_.size()).arg(align_first_sample_).arg(align_n_samples_)
+        : "No alignment has been applied to the main view yet.");
+    fl_align->addRow(chk_shifts);
+    auto applyAlignmentToSpinboxes = [&](bool on) {
+        if (on) {
+            sp_first->setValue(align_first_trace_);
+            sp_count->setValue(static_cast<int>(align_shifts_.size()));
+            sp_s_first->setValue(static_cast<int>(align_first_sample_));
+            sp_s_count->setValue(static_cast<int>(align_n_samples_));
+        }
+        sp_first->setEnabled(!on);
+        sp_count->setEnabled(!on);
+        sp_s_first->setEnabled(!on);
+        sp_s_count->setEnabled(!on);
+    };
+    connect(chk_shifts, &QCheckBox::toggled, [&](bool on){ applyAlignmentToSpinboxes(on); });
+    if (has_alignment) applyAlignmentToSpinboxes(true);
+    fl->addRow(grp_align);
 
     QSpinBox* sp_byte = nullptr;
     if (have_ttest_param) {
@@ -1927,6 +2095,7 @@ void MainWindow::onRunTTest() {
         fl->addRow("Group byte index:", sp_byte);
     }
 
+    auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
@@ -1937,8 +2106,20 @@ void MainWindow::onRunTTest() {
     int32_t byte_idx = have_ttest_param ? auto_byte_idx
                                         : static_cast<int32_t>(sp_byte->value());
 
+    const bool use_alignment = chk_shifts->isChecked();
+    const int32_t eff_first  = use_alignment ? align_first_trace_ : first;
+    const int32_t eff_count  = use_alignment ? static_cast<int32_t>(align_shifts_.size()) : count;
+    const int64_t eff_first_sample = static_cast<int64_t>(sp_s_first->value());
+    const int64_t eff_n_samples    = static_cast<int64_t>(sp_s_count->value()); // 0 = all
+    const std::vector<int32_t> use_shifts = use_alignment ? align_shifts_ : std::vector<int32_t>{};
+
+    // Effective raw sample count for the window
+    const int64_t raw_ns = (eff_n_samples == 0)
+        ? (h.num_samples - eff_first_sample)
+        : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
+
     // Effective sample count after pipeline
-    int64_t effective_samples = h.num_samples;
+    int64_t effective_samples = raw_ns;
     for (const auto& t : pipeline_)
         effective_samples = t->transformedCount(effective_samples);
 
@@ -1956,37 +2137,44 @@ void MainWindow::onRunTTest() {
     auto acc_ptr = std::make_shared<TTestAccumulator>(static_cast<int32_t>(effective_samples));
     TTestAccumulator& acc = *acc_ptr;
 
-    QProgressDialog prog("Accumulating traces…", "Cancel", 0, count, this);
+    QProgressDialog prog("Accumulating traces…", "Cancel", 0, eff_count, this);
     prog.setWindowModality(Qt::WindowModal);
     prog.setMinimumDuration(400);
 
-    // Full-trace buffer for pipeline application
-    std::vector<float> trace_buf(static_cast<size_t>(h.num_samples));
+    // Trace buffer sized for the sample window
+    std::vector<float> trace_buf(static_cast<size_t>(raw_ns));
     int32_t skipped = 0;
 
-    for (int32_t ti = 0; ti < count; ti++) {
+    for (int32_t ti = 0; ti < eff_count; ti++) {
         if (prog.wasCanceled()) return;
-        prog.setLabelText(QString("Accumulating trace %1 / %2…").arg(ti + 1).arg(count));
+        prog.setLabelText(QString("Accumulating trace %1 / %2…").arg(ti + 1).arg(eff_count));
         prog.setValue(ti);
         QApplication::processEvents();
 
-        int32_t src_idx = first + ti;
+        int32_t src_idx = eff_first + ti;
         auto data_bytes = trs_file_->readData(src_idx);
         if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { skipped++; continue; }
         int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
 
-        // Read full trace, apply pipeline, accumulate once
-        int64_t got = trs_file_->readSamples(src_idx, 0, h.num_samples, trace_buf.data());
-        if (got <= 0) { skipped++; continue; }
-        if (got < h.num_samples)
-            std::fill(trace_buf.begin() + static_cast<size_t>(got), trace_buf.end(), 0.0f);
+        // Read window with per-trace shift, zero-pad out of bounds
+        int32_t shift = (ti < static_cast<int32_t>(use_shifts.size())) ? use_shifts[ti] : 0;
+        const int64_t adj_start = eff_first_sample + shift;
+        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+        if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
+            int64_t src_start = std::max<int64_t>(0, adj_start);
+            int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
+            int64_t dst_off   = src_start - adj_start;
+            int64_t got = trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+                                                  trace_buf.data() + dst_off);
+            if (got <= 0) { skipped++; continue; }
+        }
         for (const auto& t : pipeline_) t->reset();
-        int64_t n_out = got;
+        int64_t n_out = raw_ns;
         for (const auto& t : pipeline_)
             n_out = t->apply(trace_buf.data(), n_out, 0);
         acc.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
     }
-    prog.setValue(count);
+    prog.setValue(eff_count);
 
     if (skipped > 0)
         QMessageBox::warning(this, "T-test",
@@ -2008,7 +2196,7 @@ void MainWindow::onRunTTest() {
     auto* dlg = new QDialog(this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     dlg->setWindowTitle(QString("Welch t-test — %1 traces (G0:%2  G1:%3)")
-                            .arg(count).arg(n0).arg(n1));
+                            .arg(eff_count).arg(n0).arg(n1));
     dlg->resize(1100, 520);
 
     auto* pw = new PlotWidget(dlg);
@@ -2538,6 +2726,33 @@ void MainWindow::onRunXCorr() {
         lbl_dual_warn->setEnabled(rb_dual->isChecked() || rb_mp->isChecked());
     });
 
+    // Alignment group
+    const bool has_alignment_xcorr = (align_n_samples_ > 0);
+    auto* grp_align_xcorr  = new QGroupBox("Alignment");
+    auto* fl_align_xcorr   = new QFormLayout(grp_align_xcorr);
+    auto* chk_shifts_xcorr = new QCheckBox("Apply last alignment shifts");
+    chk_shifts_xcorr->setChecked(has_alignment_xcorr);
+    chk_shifts_xcorr->setEnabled(has_alignment_xcorr);
+    chk_shifts_xcorr->setToolTip(has_alignment_xcorr
+        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3).")
+              .arg(align_shifts_.size()).arg(align_first_sample_).arg(align_n_samples_)
+        : "No alignment has been applied to the main view yet.");
+    fl_align_xcorr->addRow(chk_shifts_xcorr);
+    auto applyAlignmentToSpinboxesXCorr = [&](bool on) {
+        if (on) {
+            sp_first->setValue(align_first_trace_);
+            sp_count->setValue(static_cast<int>(align_shifts_.size()));
+            sp_s_first->setValue(static_cast<int>(align_first_sample_));
+            sp_s_count->setValue(static_cast<int>(align_n_samples_));
+        }
+        sp_first->setEnabled(!on);
+        sp_count->setEnabled(!on);
+        sp_s_first->setEnabled(!on);
+        sp_s_count->setEnabled(!on);
+    };
+    connect(chk_shifts_xcorr, &QCheckBox::toggled, [&](bool on){ applyAlignmentToSpinboxesXCorr(on); });
+    if (has_alignment_xcorr) applyAlignmentToSpinboxesXCorr(true);
+
     // Reference window (Two-Window mode only)
     auto* grp_ref   = new QGroupBox("Reference Window (Two-Window mode)");
     auto* fl_ref    = new QFormLayout(grp_ref);
@@ -2554,6 +2769,7 @@ void MainWindow::onRunXCorr() {
 
     vl_cfg->addWidget(grp_traces);
     vl_cfg->addWidget(grp_samples);
+    vl_cfg->addWidget(grp_align_xcorr);
     vl_cfg->addWidget(grp_ref);
     vl_cfg->addWidget(grp_ds);
     vl_cfg->addWidget(grp_method);
@@ -2571,6 +2787,15 @@ void MainWindow::onRunXCorr() {
                          : rb_dual->isChecked()    ? XCorrMethod::DualMatrix
                          : is_twowin               ? XCorrMethod::TwoWindow
                                                    : XCorrMethod::Baseline;
+
+    const bool use_alignment_xcorr = chk_shifts_xcorr->isChecked();
+    if (use_alignment_xcorr) {
+        first_trace      = align_first_trace_;
+        num_traces       = static_cast<int32_t>(align_shifts_.size());
+        first_sample     = align_first_sample_;
+        num_samples_req  = align_n_samples_;
+    }
+    std::vector<int32_t> use_shifts = use_alignment_xcorr ? align_shifts_ : std::vector<int32_t>{};
 
     // Memory warning for large matrices (effective M accounts for pipeline)
     {
@@ -2617,13 +2842,13 @@ void MainWindow::onRunXCorr() {
             trs_file_.get(), first_trace, num_traces,
             ref_first, ref_count,
             first_sample, ns,
-            stride, pipeline_, result, progCb, err);
+            stride, pipeline_, use_shifts, result, progCb, err);
     } else {
         ok = computeXCorr(
             trs_file_.get(),
             first_trace, num_traces,
             first_sample, num_samples_req,
-            stride, method, pipeline_, result, progCb, err);
+            stride, method, pipeline_, use_shifts, result, progCb, err);
     }
 
     prog.setValue(prog.maximum());
@@ -2673,9 +2898,11 @@ void MainWindow::onRunXCorr() {
     sp_vmin->setSingleStep(0.1);
     sp_vmax->setSingleStep(0.1);
 
-    auto* btn_reset_view = new QPushButton("Reset View");
-    auto* btn_exp_png    = new QPushButton("Export PNG…");
-    auto* btn_exp_npy    = new QPushButton("Export .npy…");
+    auto* btn_reset_view     = new QPushButton("Reset View");
+    auto* btn_exp_png        = new QPushButton("Export PNG…");
+    auto* btn_exp_npy        = new QPushButton("Export matrix .npy…");
+    auto* btn_show_traces    = new QPushButton("Show corr traces…");
+    auto* btn_exp_corr_trs   = new QPushButton("Export corr traces .trs…");
 
     // Compute actual data range for sensible default colour bounds
     {
@@ -2806,6 +3033,65 @@ void MainWindow::onRunXCorr() {
         QMessageBox::information(dlg, "Saved", "Saved: " + path);
     });
 
+    // ── Show correlation traces in a PlotWidget ───────────────────────────
+    connect(btn_show_traces, &QPushButton::clicked, dlg, [=]() {
+        int32_t rows = result_ptr->rows;
+        int32_t cols = result_ptr->cols;
+        if (rows <= 0 || cols <= 0) return;
+
+        auto* tdlg = new QDialog(dlg);
+        tdlg->setWindowTitle(
+            QString("Correlation traces — %1 traces × %2 samples").arg(rows).arg(cols));
+        tdlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* tvl = new QVBoxLayout(tdlg);
+        auto* pw  = new PlotWidget(tdlg);
+        tvl->addWidget(pw);
+
+        const float* mat = result_ptr->matrix.data();
+        for (int32_t i = 0; i < rows; i++) {
+            auto trace = std::make_shared<std::vector<float>>(
+                mat + static_cast<ptrdiff_t>(i) * cols,
+                mat + static_cast<ptrdiff_t>(i) * cols + cols);
+            pw->addTrace(std::move(trace),
+                         TRACE_COLORS[i % NUM_COLORS],
+                         QString("C[%1,:]").arg(i));
+        }
+        pw->resetView();
+        tdlg->resize(1100, 500);
+        tdlg->show();
+    });
+
+    // ── Export correlation traces as TRS ─────────────────────────────────
+    connect(btn_exp_corr_trs, &QPushButton::clicked, dlg, [=]() {
+        int32_t rows = result_ptr->rows;
+        int32_t cols = result_ptr->cols;
+        if (rows <= 0 || cols <= 0) return;
+
+        QString path = QFileDialog::getSaveFileName(dlg, "Export correlation traces as TRS",
+                                                    {}, "TRS files (*.trs);;All files (*)");
+        if (path.isEmpty()) return;
+
+        FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
+        if (!fp) {
+            QMessageBox::critical(dlg, "Export failed", "Cannot create:\n" + path);
+            return;
+        }
+        // Write TRS header
+        auto wle32 = [&](int32_t v) {
+            uint8_t b[4] = { uint8_t(v), uint8_t(v>>8), uint8_t(v>>16), uint8_t(v>>24) };
+            std::fwrite(b, 1, 4, fp);
+        };
+        std::fputc(0x41, fp); std::fputc(4, fp); wle32(rows);  // NUMBER_TRACES
+        std::fputc(0x42, fp); std::fputc(4, fp); wle32(cols);  // NUMBER_SAMPLES
+        std::fputc(0x43, fp); std::fputc(1, fp); std::fputc(0x14, fp); // SAMPLE_CODING: float32
+        std::fputc(0x5F, fp); std::fputc(0, fp);               // TRACE_BLOCK
+        // Write trace data (each row of the matrix is one trace)
+        std::fwrite(result_ptr->matrix.data(), sizeof(float),
+                    static_cast<size_t>(rows) * static_cast<size_t>(cols), fp);
+        std::fclose(fp);
+        QMessageBox::information(dlg, "Saved", "Saved: " + path);
+    });
+
     auto* ctrl = new QWidget(dlg);
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
@@ -2818,6 +3104,8 @@ void MainWindow::onRunXCorr() {
     ctrl_l->addWidget(btn_reset_view);
     ctrl_l->addWidget(btn_exp_png);
     ctrl_l->addWidget(btn_exp_npy);
+    ctrl_l->addWidget(btn_show_traces);
+    ctrl_l->addWidget(btn_exp_corr_trs);
 
     auto* proc_row  = new QWidget(dlg);
     auto* proc_row_l = new QHBoxLayout(proc_row);
@@ -2912,4 +3200,764 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
     }
     default: return nullptr;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Trace alignment dialog
+// ---------------------------------------------------------------------------
+void MainWindow::onAlignTraces()
+{
+    if (!trs_file_) {
+        QMessageBox::information(this, "Align Traces", "No file loaded.");
+        return;
+    }
+    const TrsHeader& h = trs_file_->header();
+
+    auto* dlg = new QDialog(this);
+    dlg->setWindowTitle("Align Traces");
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    auto* vl = new QVBoxLayout(dlg);
+
+    // ── Parameters ───────────────────────────────────────────────────────────
+    auto* grp = new QGroupBox("Parameters");
+    auto* fl  = new QFormLayout(grp);
+
+    // Reference trace
+    auto* sp_ref = new QSpinBox;
+    sp_ref->setRange(0, h.num_traces - 1);
+    sp_ref->setValue(spin_first_->value());
+    sp_ref->setToolTip("Absolute trace index used as the alignment template.");
+
+    // Reference region
+    auto* sp_ref_first = new QSpinBox;
+    sp_ref_first->setRange(0, h.num_samples - 1);
+    auto* sp_ref_len = new QSpinBox;
+    sp_ref_len->setRange(2, h.num_samples);
+    sp_ref_len->setValue(std::min(200, h.num_samples));
+
+    // Seed from first crop range if one exists
+    if (!plot_widget_->cropRanges().empty()) {
+        auto [cs, ce] = plot_widget_->cropRanges()[0];
+        sp_ref_first->setValue(static_cast<int>(cs));
+        sp_ref_len->setValue(static_cast<int>(std::max<int64_t>(2, ce - cs)));
+    }
+
+    // "Draw on plot" button — puts the main plot into CropSelect mode;
+    // when the user draws a region the spinboxes update automatically.
+    auto* btn_draw = new QPushButton("Draw on plot →");
+    btn_draw->setToolTip("Switch the main plot to crop-select mode.\n"
+                         "Drag to mark the reference region, then come back here.");
+
+    connect(btn_draw, &QPushButton::clicked, dlg, [=]() {
+        plot_widget_->clearCropRanges();
+        plot_widget_->setMode(InteractionMode::CropSelect);
+        btn_draw->setText("Drawing… (drag on plot)");
+        btn_draw->setEnabled(false);
+    });
+
+    // A QObject parented to dlg so the connection is torn down when the dialog
+    // closes, even if the user never finishes drawing.
+    auto* crop_guard = new QObject(dlg);
+    connect(plot_widget_, &PlotWidget::cropRangesChanged, crop_guard, [=]() {
+        const auto& ranges = plot_widget_->cropRanges();
+        if (ranges.empty()) return;
+        auto [s, e] = ranges.back();
+        sp_ref_first->setValue(static_cast<int>(s));
+        sp_ref_len->setValue(static_cast<int>(std::max<int64_t>(2, e - s)));
+        // Restore normal mode and re-enable button
+        plot_widget_->setMode(InteractionMode::Pan);
+        btn_draw->setText("Draw on plot →");
+        btn_draw->setEnabled(true);
+    });
+
+    // Restore Pan mode if the dialog is closed mid-draw
+    connect(dlg, &QDialog::finished, dlg, [=](int) {
+        if (plot_widget_->mode() == InteractionMode::CropSelect)
+            plot_widget_->setMode(InteractionMode::Pan);
+    });
+
+    auto* region_row = new QWidget;
+    auto* region_hl  = new QHBoxLayout(region_row);
+    region_hl->setContentsMargins(0, 0, 0, 0);
+    region_hl->addWidget(new QLabel("First:"));
+    region_hl->addWidget(sp_ref_first);
+    region_hl->addWidget(new QLabel("Length:"));
+    region_hl->addWidget(sp_ref_len);
+    region_hl->addWidget(btn_draw);
+    region_hl->addStretch();
+
+    // Method
+    auto* combo_method = new QComboBox;
+    combo_method->addItem("Peak alignment");
+    combo_method->addItem("Cross-correlation");
+    combo_method->setToolTip(
+        "Peak: each trace's highest peak within the search window is matched "
+        "to the reference peak.\n"
+        "Cross-correlation: the reference region is used as a template; "
+        "the lag with maximum normalised correlation is used.");
+
+    // Search window
+    auto* sp_search = new QSpinBox;
+    sp_search->setRange(1, h.num_samples / 2);
+    sp_search->setValue(50);
+    sp_search->setToolTip("Maximum shift to consider (± samples around the reference position).");
+
+    // Peak mode row (hidden for XCorr)
+    auto* peak_row = new QWidget;
+    auto* peak_hl  = new QHBoxLayout(peak_row);
+    peak_hl->setContentsMargins(0, 0, 0, 0);
+    auto* combo_peak = new QComboBox;
+    combo_peak->addItem("Absolute max  |v|");
+    combo_peak->addItem("Signed max");
+    peak_hl->addWidget(new QLabel("Peak mode:"));
+    peak_hl->addWidget(combo_peak);
+    peak_hl->addStretch();
+
+    connect(combo_method, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            dlg, [peak_row](int idx) { peak_row->setVisible(idx == 0); });
+
+    // Traces to align
+    auto* sp_tr_first = new QSpinBox;
+    sp_tr_first->setRange(0, h.num_traces - 1);
+    sp_tr_first->setValue(spin_first_->value());
+    auto* sp_tr_count = new QSpinBox;
+    sp_tr_count->setRange(1, h.num_traces);
+    sp_tr_count->setValue(spin_count_->value());
+
+    auto* tr_row = new QWidget;
+    auto* tr_hl  = new QHBoxLayout(tr_row);
+    tr_hl->setContentsMargins(0, 0, 0, 0);
+    tr_hl->addWidget(new QLabel("First:"));
+    tr_hl->addWidget(sp_tr_first);
+    tr_hl->addWidget(new QLabel("Count:"));
+    tr_hl->addWidget(sp_tr_count);
+    tr_hl->addStretch();
+
+    fl->addRow("Reference trace:",   sp_ref);
+    fl->addRow("Reference region:",  region_row);
+    fl->addRow("Method:",            combo_method);
+    fl->addRow("Search window ±:",   sp_search);
+    fl->addRow(peak_row);
+    fl->addRow("Traces:",            tr_row);
+    vl->addWidget(grp);
+
+    auto* btn_run = new QPushButton("Run");
+    vl->addWidget(btn_run);
+
+    // ── Results (shown after a successful run) ────────────────────────────────
+    auto* tbl = new QTableWidget(0, 2);
+    tbl->setHorizontalHeaderLabels({"Trace", "Shift (samples)"});
+    tbl->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    tbl->horizontalHeader()->setStretchLastSection(true);
+    tbl->setMaximumHeight(220);
+    tbl->hide();
+    vl->addWidget(tbl);
+
+    // Output mode selector + show button (hidden until run completes)
+    auto* output_row = new QWidget;
+    auto* output_hl  = new QHBoxLayout(output_row);
+    output_hl->setContentsMargins(0, 0, 0, 0);
+    auto* combo_output = new QComboBox;
+    combo_output->addItem("Full trace — pad with average");
+    combo_output->addItem("Full trace — pad with zeros");
+    combo_output->addItem("Crop to common range");
+    combo_output->setToolTip(
+        "Pad with average: fill the shifted-in region with the mean of each trace.\n"
+        "Pad with zeros: fill with 0.\n"
+        "Crop: trim all traces to the sample range where every trace has real data.");
+    auto* btn_show  = new QPushButton("Show in New Window…");
+    auto* btn_apply = new QPushButton("Apply to Main View");
+    btn_apply->setToolTip("Replace the main plot with the aligned traces.");
+    output_hl->addWidget(combo_output);
+    output_hl->addWidget(btn_show);
+    output_hl->addWidget(btn_apply);
+    output_row->hide();
+    vl->addWidget(output_row);
+
+    // Shared mutable state between Run and Show
+    auto result_ptr = std::make_shared<AlignResult>();
+
+    // ── Run ──────────────────────────────────────────────────────────────────
+    connect(btn_run, &QPushButton::clicked, dlg, [=]() {
+        int32_t first_tr = static_cast<int32_t>(sp_tr_first->value());
+        int32_t num_tr   = static_cast<int32_t>(sp_tr_count->value());
+        num_tr = std::min(num_tr, h.num_traces - first_tr);
+        if (num_tr <= 0) {
+            QMessageBox::warning(dlg, "Align Traces", "No traces in range.");
+            return;
+        }
+
+        int32_t ref_abs = static_cast<int32_t>(sp_ref->value());
+        int32_t ref_off = ref_abs - first_tr;
+        if (ref_off < 0 || ref_off >= num_tr) {
+            QMessageBox::warning(dlg, "Align Traces",
+                QString("Reference trace %1 is outside the selected range [%2, %3).")
+                    .arg(ref_abs).arg(first_tr).arg(first_tr + num_tr));
+            return;
+        }
+
+        int64_t ref_first = static_cast<int64_t>(sp_ref_first->value());
+        int64_t ref_len   = static_cast<int64_t>(sp_ref_len->value());
+        int32_t shalf     = sp_search->value();
+        bool    use_abs   = (combo_peak->currentIndex() == 0);
+        bool    is_peak   = (combo_method->currentIndex() == 0);
+
+        QProgressDialog prog(
+            is_peak ? "Finding peaks…" : "Cross-correlating…",
+            "Cancel", 0, num_tr, dlg);
+        prog.setWindowModality(Qt::WindowModal);
+        prog.setMinimumDuration(300);
+        prog.setValue(0);
+
+        auto progress_fn = [&](int done, int total) -> bool {
+            prog.setValue(done);
+            prog.setMaximum(total);
+            QApplication::processEvents();
+            return !prog.wasCanceled();
+        };
+
+        std::string err;
+        bool ok;
+        if (is_peak) {
+            ok = alignByPeak(trs_file_.get(), first_tr, num_tr, ref_off,
+                             ref_first, ref_len, shalf, use_abs,
+                             *result_ptr, progress_fn, err);
+        } else {
+            ok = alignByXCorr(trs_file_.get(), first_tr, num_tr, ref_off,
+                              ref_first, ref_len, shalf,
+                              *result_ptr, progress_fn, err);
+        }
+        prog.setValue(num_tr);
+
+        if (!ok) {
+            if (!err.empty())
+                QMessageBox::critical(dlg, "Alignment failed",
+                                      QString::fromStdString(err));
+            return;
+        }
+
+        // Populate results table
+        tbl->setRowCount(0);
+        for (int i = 0; i < num_tr; i++) {
+            int row = tbl->rowCount();
+            tbl->insertRow(row);
+            tbl->setItem(row, 0,
+                new QTableWidgetItem(QString::number(first_tr + i)));
+            tbl->setItem(row, 1,
+                new QTableWidgetItem(
+                    QString::number(result_ptr->shifts[static_cast<size_t>(i)])));
+        }
+        tbl->show();
+        output_row->show();
+        dlg->adjustSize();
+    });
+
+    // ── Show aligned traces ───────────────────────────────────────────────────
+    // ── Shared helper: build aligned trace data into a PlotWidget ────────────
+    // Returns false (and shows a warning) if the crop range is empty.
+    auto buildAligned = [=](PlotWidget* pw, int max_display = INT_MAX) -> bool {
+        const auto& shifts = result_ptr->shifts;
+        int32_t first_tr = static_cast<int32_t>(sp_tr_first->value());
+        int32_t num_tr   = static_cast<int32_t>(shifts.size());
+        int     mode     = combo_output->currentIndex(); // 0=avg-pad,1=zero-pad,2=crop
+
+        int64_t out_start, out_len;
+        if (mode == 2) {
+            int64_t crop_start = 0;
+            int64_t crop_end   = h.num_samples;
+            for (int i = 0; i < num_tr; i++) {
+                int64_t s = shifts[static_cast<size_t>(i)];
+                crop_start = std::max(crop_start, -s);
+                crop_end   = std::min(crop_end, h.num_samples - s);
+            }
+            if (crop_end <= crop_start) {
+                QMessageBox::warning(dlg, "Align Traces",
+                    "No common valid range after cropping (shifts too large).");
+                return false;
+            }
+            out_start = crop_start;
+            out_len   = crop_end - crop_start;
+        } else {
+            out_start = 0;
+            out_len   = h.num_samples;
+        }
+
+        const int display_count = std::min(num_tr, max_display);
+        for (int i = 0; i < display_count; i++) {
+            int64_t shift = static_cast<int64_t>(shifts[static_cast<size_t>(i)]);
+
+            auto data = std::make_shared<std::vector<float>>(
+                static_cast<size_t>(out_len), 0.0f);
+
+            int64_t raw_start = out_start + shift;
+            int64_t raw_end   = raw_start + out_len;
+            int64_t src_start = std::max<int64_t>(0, raw_start);
+            int64_t src_end   = std::min<int64_t>(h.num_samples, raw_end);
+            int64_t dst_off   = src_start - raw_start;
+
+            if (src_start < src_end)
+                trs_file_->readSamples(first_tr + i, src_start,
+                                       src_end - src_start,
+                                       data->data() + static_cast<size_t>(dst_off));
+
+            if (mode == 0) {
+                int64_t valid = src_end - src_start;
+                if (valid > 0) {
+                    double sum = 0.0;
+                    const float* vp = data->data() + static_cast<size_t>(dst_off);
+                    for (int64_t j = 0; j < valid; j++) sum += vp[j];
+                    float avg = static_cast<float>(sum / valid);
+                    if (dst_off > 0)
+                        std::fill(data->begin(),
+                                  data->begin() + static_cast<size_t>(dst_off), avg);
+                    int64_t tail_off = dst_off + valid;
+                    if (tail_off < out_len)
+                        std::fill(data->begin() + static_cast<size_t>(tail_off),
+                                  data->end(), avg);
+                }
+            }
+
+            pw->addTrace(std::move(data),
+                         TRACE_COLORS[i % NUM_COLORS],
+                         QString("T%1 (%2%3)")
+                             .arg(first_tr + i)
+                             .arg(shift >= 0 ? "+" : "")
+                             .arg(shift));
+        }
+        return true;
+    };
+
+    connect(btn_show, &QPushButton::clicked, dlg, [=]() {
+        if (result_ptr->shifts.empty()) return;
+        int32_t num_tr = static_cast<int32_t>(result_ptr->shifts.size());
+
+        auto* vdlg = new QDialog(dlg);
+        vdlg->setWindowTitle(QString("Aligned traces — %1 traces").arg(num_tr));
+        vdlg->setAttribute(Qt::WA_DeleteOnClose);
+        auto* vl2 = new QVBoxLayout(vdlg);
+        auto* pw  = new PlotWidget(vdlg);
+        vl2->addWidget(pw);
+
+        if (!buildAligned(pw)) { vdlg->deleteLater(); return; }
+
+        pw->resetView();
+        vdlg->resize(1100, 500);
+        vdlg->show();
+    });
+
+    connect(btn_apply, &QPushButton::clicked, dlg, [=]() {
+        if (result_ptr->shifts.empty()) return;
+
+        // Compute out_start / out_len (same logic as buildAligned) so we can
+        // store the alignment state for CPA.
+        const auto& raw_shifts = result_ptr->shifts;
+        const int32_t num_tr   = static_cast<int32_t>(raw_shifts.size());
+        const int32_t first_tr = static_cast<int32_t>(sp_tr_first->value());
+        const int     mode     = combo_output->currentIndex();
+        int64_t out_start = 0, out_len = h.num_samples;
+        if (mode == 2) {
+            int64_t crop_start = 0, crop_end = h.num_samples;
+            for (int i = 0; i < num_tr; i++) {
+                int64_t s = static_cast<int64_t>(raw_shifts[static_cast<size_t>(i)]);
+                crop_start = std::max(crop_start, -s);
+                crop_end   = std::min(crop_end, h.num_samples - s);
+            }
+            if (crop_end > crop_start) { out_start = crop_start; out_len = crop_end - crop_start; }
+        }
+
+        // Store alignment state for CPA
+        align_first_trace_  = first_tr;
+        align_first_sample_ = out_start;
+        align_n_samples_    = out_len;
+        align_shifts_.assign(raw_shifts.begin(), raw_shifts.end());
+
+        // Show only NUM_COLORS representative traces in the main plot.
+        // These are in-memory baked-in traces — mark as not file-backed so
+        // drag-align on them won't overwrite the stored alignment state.
+        plot_widget_->clearTraces();
+        if (!buildAligned(plot_widget_, NUM_COLORS)) return;
+        plot_widget_->setTransforms({});
+        plot_widget_->resetView();
+        plot_file_backed_ = false;
+        dlg->accept();
+    });
+
+    dlg->resize(480, 220);
+    dlg->show();
+}
+
+// ---------------------------------------------------------------------------
+// CPA / DPA
+// ---------------------------------------------------------------------------
+void MainWindow::onRunCpa() {
+    if (!trs_file_) {
+        QMessageBox::information(this, "CPA", "No file loaded.");
+        return;
+    }
+    const TrsHeader& h = trs_file_->header();
+    if (h.data_length <= 0) {
+        QMessageBox::warning(this, "CPA",
+            "This trace set has no per-trace data (data_length = 0).\n"
+            "CPA requires plaintext/ciphertext data stored in each trace.");
+        return;
+    }
+
+    const int n_total   = h.num_traces;
+    const int n_samples = h.num_samples;
+
+    // ---- Step 1: Configuration dialog ----
+    QDialog cfg(this);
+    cfg.setWindowTitle("CPA — Configuration");
+    auto* vl_cfg = new QVBoxLayout(&cfg);
+
+    auto* grp_traces = new QGroupBox("Traces");
+    auto* fl_traces  = new QFormLayout(grp_traces);
+    auto* sp_first   = new QSpinBox; sp_first->setRange(0, std::max(0, n_total - 1)); sp_first->setValue(0);
+    auto* sp_count   = new QSpinBox; sp_count->setRange(2, n_total); sp_count->setValue(n_total);
+    fl_traces->addRow("First trace:", sp_first);
+    fl_traces->addRow("Count:",       sp_count);
+
+    auto* grp_samples = new QGroupBox("Samples");
+    auto* fl_samples  = new QFormLayout(grp_samples);
+    auto* sp_s_first  = new QSpinBox; sp_s_first->setRange(0, std::max(0, n_samples - 1)); sp_s_first->setValue(0);
+    auto* sp_s_count  = new QSpinBox; sp_s_count->setRange(0, n_samples); sp_s_count->setValue(0);
+    sp_s_count->setSpecialValueText("All");
+    fl_samples->addRow("First sample:", sp_s_first);
+    fl_samples->addRow("Count (0=all):", sp_s_count);
+
+    auto* grp_hyp = new QGroupBox("Hypotheses");
+    auto* fl_hyp  = new QFormLayout(grp_hyp);
+    auto* sp_m = new QSpinBox;
+    sp_m->setRange(1, 65536);
+    sp_m->setValue(256);
+    sp_m->setToolTip("Number of model evaluations (0 to M-1). 256 for a full AES key byte.");
+    fl_hyp->addRow("M:", sp_m);
+
+    // Alignment shifts option — populated by the last "Apply to Main View" run
+    const bool has_alignment = (align_n_samples_ > 0);
+    auto* grp_align  = new QGroupBox("Alignment");
+    auto* fl_align   = new QFormLayout(grp_align);
+    auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
+    chk_shifts->setChecked(has_alignment);
+    chk_shifts->setEnabled(has_alignment);
+    chk_shifts->setToolTip(has_alignment
+        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3).")
+              .arg(align_shifts_.size()).arg(align_first_sample_).arg(align_n_samples_)
+        : "No alignment has been applied to the main view yet.");
+    fl_align->addRow(chk_shifts);
+
+    // When alignment is toggled, lock/unlock spinboxes and fill in the stored values.
+    // Save originals so we can restore when unchecked.
+    auto applyAlignmentToSpinboxes = [&](bool on) {
+        sp_first ->setEnabled(!on);
+        sp_count ->setEnabled(!on);
+        sp_s_first->setEnabled(!on);
+        sp_s_count->setEnabled(!on);
+        if (on) {
+            sp_first ->setValue(align_first_trace_);
+            sp_count ->setValue(static_cast<int>(align_shifts_.size()));
+            sp_s_first->setValue(static_cast<int>(align_first_sample_));
+            sp_s_count->setValue(static_cast<int>(align_n_samples_));
+        }
+    };
+    connect(chk_shifts, &QCheckBox::toggled, [applyAlignmentToSpinboxes](bool on) {
+        applyAlignmentToSpinboxes(on);
+    });
+    if (has_alignment) applyAlignmentToSpinboxes(true);  // apply immediately if pre-checked
+
+    auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
+    connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    vl_cfg->addWidget(grp_traces);
+    vl_cfg->addWidget(grp_samples);
+    vl_cfg->addWidget(grp_hyp);
+    vl_cfg->addWidget(grp_align);
+    vl_cfg->addWidget(cfg_bb);
+    if (cfg.exec() != QDialog::Accepted) return;
+
+    const int32_t first_trace     = static_cast<int32_t>(sp_first->value());
+    const int32_t num_traces      = static_cast<int32_t>(sp_count->value());
+    const int64_t first_sample    = static_cast<int64_t>(sp_s_first->value());
+    const int64_t num_samples_req = static_cast<int64_t>(sp_s_count->value());
+    const int32_t n_hypotheses    = static_cast<int32_t>(sp_m->value());
+    // When using stored alignment: override trace range and sample window
+    const bool use_alignment = chk_shifts->isChecked();
+    const std::vector<int32_t> use_shifts = use_alignment ? align_shifts_ : std::vector<int32_t>{};
+    const int32_t eff_first_trace  = use_alignment ? align_first_trace_  : first_trace;
+    const int32_t eff_num_traces   = use_alignment
+                                     ? static_cast<int32_t>(align_shifts_.size())
+                                     : num_traces;
+    const int64_t eff_first_sample = use_alignment ? align_first_sample_ : first_sample;
+    const int64_t eff_n_samples    = use_alignment ? align_n_samples_    : num_samples_req;
+
+    // ---- Step 2: Initialise Python (once) ----
+    {
+        std::string py_err;
+        if (!LeakageModel::isInitialized() && !LeakageModel::globalInit(py_err)) {
+            QMessageBox::critical(this, "CPA",
+                "Failed to initialise Python:\n" + QString::fromStdString(py_err));
+            return;
+        }
+    }
+
+    // ---- Step 3: Leakage model editor dialog ----
+    LeakageModelDialog model_dlg(trs_file_.get(), first_trace,
+                                 std::min(5, num_traces), this);
+    if (model_dlg.exec() != QDialog::Accepted) return;
+
+    // Get the compiled model (re-compile if user didn't click Test first)
+    LeakageModel* raw_model = model_dlg.compiledModel();
+    std::unique_ptr<LeakageModel> owned_model;
+    if (!raw_model) {
+        owned_model = std::make_unique<LeakageModel>();
+        std::string err;
+        if (!owned_model->compile(model_dlg.code(), err)) {
+            QMessageBox::critical(this, "CPA",
+                "Failed to compile leakage model:\n" + QString::fromStdString(err));
+            return;
+        }
+        raw_model = owned_model.get();
+    }
+
+    // Build the leakage callback that calls Python
+    LeakageModel* model_ptr = raw_model;
+    LeakageFn leakage_fn = [model_ptr](
+        const std::vector<uint8_t>& data, int data_len,
+        int n_tr, int hypothesis,
+        std::vector<float>& out, std::string& err) -> bool
+    {
+        return model_ptr->evaluate(data, data_len, n_tr, hypothesis, out, err);
+    };
+
+    // ---- Step 4: Run CPA ----
+    QProgressDialog prog("Loading traces...", "Cancel", 0, eff_num_traces + n_hypotheses, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(0);
+    prog.setValue(0);
+    QApplication::processEvents();
+
+    CpaResult result;
+    std::string err;
+
+    auto progCb = [&](int32_t done, int32_t total) -> bool {
+        if (prog.wasCanceled()) return false;
+        prog.setMaximum(total);
+        prog.setValue(done);
+        if (done <= eff_num_traces)
+            prog.setLabelText(QString("Loading trace %1 / %2...").arg(done).arg(eff_num_traces));
+        else
+            prog.setLabelText(QString("Hypothesis %1 / %2...").arg(done - eff_num_traces).arg(n_hypotheses));
+        QApplication::processEvents();
+        return true;
+    };
+
+    bool ok = computeCpa(trs_file_.get(), eff_first_trace, eff_num_traces,
+                         eff_first_sample, eff_n_samples,
+                         n_hypotheses, use_shifts,
+                         pipeline_, leakage_fn, result, progCb, err);
+    prog.setValue(prog.maximum());
+
+    if (!ok) {
+        if (!err.empty())
+            QMessageBox::critical(this, "CPA failed", QString::fromStdString(err));
+        return;
+    }
+
+    // ---- Step 5: Result window ----
+    const int32_t NS = result.n_samples;
+
+    // Rank all hypotheses by peak absolute correlation
+    struct HypPeak { int32_t hyp; float peak_r; int32_t peak_sample; };
+    std::vector<HypPeak> ranked(result.n_hypotheses);
+    for (int k = 0; k < result.n_hypotheses; k++) {
+        const float* row = result.corr.data() + k * NS;
+        float best = 0; int32_t best_s = 0;
+        for (int s = 0; s < NS; s++) {
+            if (std::abs(row[s]) > best) { best = std::abs(row[s]); best_s = s; }
+        }
+        ranked[k] = {k, best, best_s};
+    }
+    std::sort(ranked.begin(), ranked.end(),
+              [](const HypPeak& a, const HypPeak& b){ return a.peak_r > b.peak_r; });
+
+    auto result_ptr = std::make_shared<CpaResult>(std::move(result));
+
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle(QString("CPA  n=%1  M=%2  samples=%3  best=h%4 (r=%5)")
+        .arg(eff_num_traces).arg(n_hypotheses).arg(NS)
+        .arg(ranked[0].hyp).arg(ranked[0].peak_r, 0, 'f', 4));
+    dlg->resize(1100, 720);
+
+    auto* hm = new HeatmapWidget(dlg);
+    hm->setMatrix(result_ptr->corr, result_ptr->n_hypotheses, NS);
+    hm->setColorScheme(ColorScheme::RdBu);
+
+    // Hover label
+    auto* lbl_hover = new QLabel("Hover over heatmap to inspect");
+    connect(hm, &HeatmapWidget::hoverInfo, dlg, [lbl_hover](int row, int col, float val) {
+        if (row >= 0 && col >= 0)
+            lbl_hover->setText(QString("hyp=%1  sample=%2  corr=%3")
+                .arg(row).arg(col).arg(val, 0, 'g', 5));
+        else
+            lbl_hover->setText("Hover over heatmap to inspect");
+    });
+
+    // Top candidates table
+    const int show_n = std::min<int>(static_cast<int>(ranked.size()), 16);
+    const bool show_hex = (n_hypotheses <= 256);
+    auto* tbl = new QTableWidget(show_n, show_hex ? 4 : 3, dlg);
+    tbl->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    tbl->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tbl->setHorizontalHeaderLabels(
+        show_hex ? QStringList{"#", "Hyp", "Hex", "Peak |r|", "Sample"}
+                 : QStringList{"#", "Hyp", "Peak |r|", "Sample"});
+    tbl->horizontalHeader()->setStretchLastSection(false);
+    tbl->verticalHeader()->hide();
+    tbl->setColumnCount(show_hex ? 5 : 4);
+    // rebuild header with correct count
+    tbl->setHorizontalHeaderLabels(
+        show_hex ? QStringList{"#", "Hyp", "Hex", "Peak |r|", "Sample"}
+                 : QStringList{"#", "Hyp", "Peak |r|", "Sample"});
+    for (int r = 0; r < show_n; r++) {
+        const auto& p = ranked[r];
+        int col = 0;
+        auto* rank_item = new QTableWidgetItem(QString::number(r + 1));
+        rank_item->setTextAlignment(Qt::AlignCenter);
+        tbl->setItem(r, col++, rank_item);
+        auto* hyp_item = new QTableWidgetItem(QString::number(p.hyp));
+        hyp_item->setTextAlignment(Qt::AlignCenter);
+        tbl->setItem(r, col++, hyp_item);
+        if (show_hex) {
+            auto* hex_item = new QTableWidgetItem(
+                QString("0x%1").arg(p.hyp, 2, 16, QLatin1Char('0')).toUpper());
+            hex_item->setTextAlignment(Qt::AlignCenter);
+            tbl->setItem(r, col++, hex_item);
+        }
+        auto* r_item = new QTableWidgetItem(QString::number(static_cast<double>(p.peak_r), 'f', 4));
+        r_item->setTextAlignment(Qt::AlignCenter);
+        if (r == 0) {
+            QFont f = r_item->font(); f.setBold(true); r_item->setFont(f);
+        }
+        tbl->setItem(r, col++, r_item);
+        auto* s_item = new QTableWidgetItem(QString::number(p.peak_sample));
+        s_item->setTextAlignment(Qt::AlignCenter);
+        tbl->setItem(r, col++, s_item);
+    }
+    tbl->resizeColumnsToContents();
+    tbl->setFixedWidth(show_hex ? 280 : 220);
+    tbl->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
+
+    // Color range controls
+    auto* sp_vmin = new QDoubleSpinBox; sp_vmin->setRange(-1e9, 1e9); sp_vmin->setDecimals(4); sp_vmin->setValue(-1.0);
+    auto* sp_vmax = new QDoubleSpinBox; sp_vmax->setRange(-1e9, 1e9); sp_vmax->setDecimals(4); sp_vmax->setValue(1.0);
+    {
+        float dmin = result_ptr->corr[0], dmax = result_ptr->corr[0];
+        for (float v : result_ptr->corr) { dmin = std::min(dmin, v); dmax = std::max(dmax, v); }
+        float lim = std::max(std::abs(dmin), std::abs(dmax));
+        sp_vmin->setValue(-lim); sp_vmax->setValue(lim);
+        hm->setColorRange(-lim, lim);
+    }
+    connect(sp_vmin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [hm, sp_vmax](double v) { hm->setColorRange(v, sp_vmax->value()); });
+    connect(sp_vmax, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [hm, sp_vmin](double v) { hm->setColorRange(sp_vmin->value(), v); });
+
+    // Buttons
+    auto* btn_show_key = new QPushButton("Show corr traces...");
+    auto* btn_exp_npy  = new QPushButton("Export .npy...");
+    auto* btn_close    = new QPushButton("Close");
+
+    // Color scheme combo
+    auto* combo_scheme = new QComboBox;
+    combo_scheme->addItems({"RdBu", "Grayscale", "Hot", "Viridis", "Plasma"});
+    connect(combo_scheme, QOverload<int>::of(&QComboBox::currentIndexChanged), [hm](int i) {
+        hm->setColorScheme(static_cast<ColorScheme>(i));
+    });
+
+    // Abs value checkbox
+    auto* chk_abs = new QCheckBox("Abs value");
+    connect(chk_abs, &QCheckBox::toggled, [hm, sp_vmin, sp_vmax](bool on) {
+        hm->setAbsValue(on);
+        if (on) { sp_vmin->setValue(0); }
+    });
+
+    // Show correlation traces for each hypothesis
+    connect(btn_show_key, &QPushButton::clicked, dlg, [this, result_ptr, NS, dlg]() {
+        auto* td = new QDialog(dlg);
+        td->setAttribute(Qt::WA_DeleteOnClose);
+        td->setWindowTitle("CPA — Correlation traces per hypothesis");
+        td->resize(900, 500);
+        auto* pw = new PlotWidget(td);
+        const float* mat = result_ptr->corr.data();
+        for (int k = 0; k < result_ptr->n_hypotheses; k++) {
+            auto trace = std::make_shared<std::vector<float>>(mat + k * NS, mat + k * NS + NS);
+            QColor c = TRACE_COLORS[k % NUM_COLORS];
+            c.setAlpha(180);
+            pw->addTrace(std::move(trace), c, QString("h%1").arg(k));
+        }
+        pw->setAxisLabels("Sample index", "Hypothesis");
+        auto* vl = new QVBoxLayout(td);
+        vl->addWidget(pw);
+        td->show();
+    });
+
+    // Export .npy
+    connect(btn_exp_npy, &QPushButton::clicked, dlg, [this, result_ptr, NS]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export CPA result", {}, "NumPy (*.npy)");
+        if (path.isEmpty()) return;
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly)) return;
+        // Write NPY v1.0 header for float32 array shape (M, NS)
+        QString desc = QString("{'descr': '<f4', 'fortran_order': False, 'shape': (%1, %2), }").arg(result_ptr->n_hypotheses).arg(NS);
+        while ((10 + desc.size()) % 64 != 0) desc += ' ';
+        QByteArray hdr;
+        hdr.append("\x93NUMPY"); hdr.append('\x01'); hdr.append('\x00');
+        uint16_t hlen = static_cast<uint16_t>(desc.size());
+        hdr.append(static_cast<char>(hlen & 0xFF)); hdr.append(static_cast<char>(hlen >> 8));
+        hdr.append(desc.toLatin1());
+        f.write(hdr);
+        f.write(reinterpret_cast<const char*>(result_ptr->corr.data()),
+                static_cast<qint64>(result_ptr->corr.size() * sizeof(float)));
+    });
+
+    connect(btn_close, &QPushButton::clicked, dlg, &QDialog::close);
+
+    // Control row (above heatmap)
+    auto* ctrl = new QHBoxLayout;
+    ctrl->addWidget(lbl_hover);
+    ctrl->addStretch();
+    ctrl->addWidget(new QLabel("Min:")); ctrl->addWidget(sp_vmin);
+    ctrl->addWidget(new QLabel("Max:")); ctrl->addWidget(sp_vmax);
+    ctrl->addWidget(combo_scheme);
+    ctrl->addWidget(chk_abs);
+    ctrl->addWidget(btn_show_key);
+    ctrl->addWidget(btn_exp_npy);
+    ctrl->addWidget(btn_close);
+
+    // Left side: ctrl + heatmap
+    auto* left_widget = new QWidget(dlg);
+    auto* left_vl = new QVBoxLayout(left_widget);
+    left_vl->setContentsMargins(0, 0, 0, 0);
+    left_vl->addLayout(ctrl);
+    left_vl->addWidget(hm, 1);
+
+    // Right side: top candidates table
+    auto* right_widget = new QWidget(dlg);
+    auto* right_vl = new QVBoxLayout(right_widget);
+    right_vl->setContentsMargins(4, 0, 0, 0);
+    auto* lbl_top = new QLabel(
+        QString("<b>Top %1 candidates</b>").arg(show_n));
+    lbl_top->setTextFormat(Qt::RichText);
+    right_vl->addWidget(lbl_top);
+    right_vl->addWidget(tbl, 1);
+
+    auto* splitter = new QSplitter(Qt::Horizontal, dlg);
+    splitter->addWidget(left_widget);
+    splitter->addWidget(right_widget);
+    splitter->setStretchFactor(0, 1);
+    splitter->setStretchFactor(1, 0);
+
+    auto* vl_dlg = new QVBoxLayout(dlg);
+    vl_dlg->addWidget(splitter, 1);
+
+    dlg->show();
 }

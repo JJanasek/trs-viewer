@@ -98,6 +98,82 @@ void PlotWidget::clearCropRanges() {
     update();
 }
 
+// ---------------------------------------------------------------------------
+// Per-trace shifts
+// ---------------------------------------------------------------------------
+
+int32_t PlotWidget::traceShift(int idx) const {
+    if (idx < 0 || idx >= static_cast<int>(traces_.size())) return 0;
+    return traces_[static_cast<size_t>(idx)].shift;
+}
+
+std::vector<int32_t> PlotWidget::traceShifts() const {
+    std::vector<int32_t> out;
+    out.reserve(traces_.size());
+    for (const auto& te : traces_) out.push_back(te.shift);
+    return out;
+}
+
+void PlotWidget::setTraceShift(int idx, int32_t shift) {
+    if (idx < 0 || idx >= static_cast<int>(traces_.size())) return;
+    auto& te = traces_[static_cast<size_t>(idx)];
+    if (te.shift == shift) return;
+    te.shift       = shift;
+    te.cache.valid = false;
+    emit traceShiftsChanged();
+    update();
+}
+
+void PlotWidget::clearTraceShifts() {
+    bool changed = false;
+    for (auto& te : traces_) {
+        if (te.shift != 0) { te.shift = 0; te.cache.valid = false; changed = true; }
+    }
+    if (changed) { emit traceShiftsChanged(); update(); }
+}
+
+// ---------------------------------------------------------------------------
+// AlignDrag helpers
+// ---------------------------------------------------------------------------
+
+double PlotWidget::traceValueAt(const TraceEntry& te, int64_t s) const {
+    if (!te.cache.valid) return std::numeric_limits<double>::quiet_NaN();
+    if (!te.cache.samples.empty()) {
+        int64_t out_count = static_cast<int64_t>(te.cache.samples.size());
+        int64_t raw_read  = te.cache.raw_read;
+        if (raw_read <= 0 || out_count <= 0) return std::numeric_limits<double>::quiet_NaN();
+        int64_t i = (s - te.cache.view_start) * out_count / raw_read;
+        i = std::clamp(i, INT64_C(0), out_count - 1);
+        return te.cache.samples[static_cast<size_t>(i)];
+    }
+    if (!te.cache.pix_min.empty()) {
+        int64_t view_len = te.cache.view_end - te.cache.view_start;
+        int     W        = te.cache.W;
+        if (view_len <= 0 || W <= 0) return std::numeric_limits<double>::quiet_NaN();
+        int px = static_cast<int>((s - te.cache.view_start) * W / view_len);
+        px = std::clamp(px, 0, W - 1);
+        float mn = te.cache.pix_min[static_cast<size_t>(px)];
+        if (mn == std::numeric_limits<float>::max()) return std::numeric_limits<double>::quiet_NaN();
+        return (mn + te.cache.pix_max[static_cast<size_t>(px)]) * 0.5;
+    }
+    return std::numeric_limits<double>::quiet_NaN();
+}
+
+int PlotWidget::nearestTrace(int px, int py, const QRect& pr) const {
+    if (traces_.empty()) return -1;
+    int64_t s       = pixelToSample(px, pr);
+    double  v_click = pixelToValue(py, pr, last_ymin_, last_ymax_);
+    int     best    = -1;
+    double  best_d  = std::numeric_limits<double>::max();
+    for (int i = 0; i < static_cast<int>(traces_.size()); i++) {
+        double v = traceValueAt(traces_[static_cast<size_t>(i)], s);
+        if (std::isnan(v)) continue;
+        double d = std::abs(v - v_click);
+        if (d < best_d) { best_d = d; best = i; }
+    }
+    return best;
+}
+
 void PlotWidget::setThresholds(bool show, double pos, double neg) {
     show_thresholds_ = show;
     threshold_pos_   = pos;
@@ -286,17 +362,41 @@ double PlotWidget::pixelToValue(int py, const QRect& pr, float ymin, float ymax)
 int64_t PlotWidget::readTraceSamples(const TraceEntry& te,
                                       int64_t sample_offset, int64_t count,
                                       float* buf) const {
+    // Apply per-trace shift: positive shift → read from later raw samples
+    //   (trace content moves left); negative → read from earlier (moves right).
+    const int64_t adj = sample_offset + te.shift;
+
+    // Zero-fill the output first so padding regions are silent.
+    std::fill(buf, buf + static_cast<size_t>(count), 0.0f);
+
+    if (count <= 0) return count;
+
+    // Clamp the readable window into [0, total)
+    int64_t total = 0;
+    if (te.mem_data)
+        total = static_cast<int64_t>(te.mem_data->size());
+    else if (te.file)
+        total = te.file->header().num_samples;
+    else
+        return count;   // all zeros
+
+    int64_t src_start = std::max<int64_t>(0, adj);
+    int64_t src_end   = std::min<int64_t>(total, adj + count);
+    if (src_start >= src_end) return count; // entirely outside → all zeros
+
+    int64_t dst_off = src_start - adj;      // leading zeros already filled
+    int64_t n       = src_end - src_start;
+
     if (te.mem_data) {
         const auto& v = *te.mem_data;
-        if (sample_offset >= static_cast<int64_t>(v.size())) return 0;
-        int64_t avail = static_cast<int64_t>(v.size()) - sample_offset;
-        int64_t n = std::min(count, avail);
-        if (n > 0) std::memcpy(buf, v.data() + static_cast<size_t>(sample_offset),
-                               static_cast<size_t>(n) * sizeof(float));
-        return n;
+        std::memcpy(buf + static_cast<size_t>(dst_off),
+                    v.data() + static_cast<size_t>(src_start),
+                    static_cast<size_t>(n) * sizeof(float));
+    } else {
+        te.file->readSamples(te.trace_idx, src_start, n,
+                             buf + static_cast<size_t>(dst_off));
     }
-    if (!te.file) return 0;
-    return te.file->readSamples(te.trace_idx, sample_offset, count, buf);
+    return count;   // always return the requested count (zeros pad the rest)
 }
 
 // ---------------------------------------------------------------------------
@@ -326,10 +426,17 @@ void PlotWidget::buildTraceCache(TraceEntry& te, int W)
 
     for (auto& t : te.transforms) t->reset();
 
+    // Expected output sample count after the full pipeline.
+    int64_t expected_out = view_len;
+    for (const auto& t : te.transforms)
+        expected_out = t->transformedCount(expected_out);
+
     // ------------------------------------------------------------------
     // ZOOMED-IN: read all view samples, apply full pipeline, keep array.
+    // Use output count (not raw view_len) so decimating pipelines still
+    // get the connected-polyline path when their output fits in the widget.
     // ------------------------------------------------------------------
-    if (view_len <= W) {
+    if (expected_out <= W) {
         te.cache.pix_min.clear();
         te.cache.pix_max.clear();
         te.cache.samples.resize(static_cast<size_t>(view_len));
@@ -441,23 +548,27 @@ void PlotWidget::renderTrace(const TraceEntry& te, QPainter& p,
         p.setRenderHint(QPainter::Antialiasing, true);
         p.setPen(QPen(te.color, trace_width_));
 
-        auto sx = [&](int64_t i) -> int {
+        auto sxf = [&](int64_t i) -> float {
             int64_t raw_s = (out_count > 1)
                 ? view_start_ + i * raw_read / out_count
                 : view_start_;
-            return pr.left() + static_cast<int>(
+            return pr.left() + static_cast<float>(
                 static_cast<double>(raw_s - view_start_) * W / view_len);
         };
 
-        for (int64_t i = 1; i < out_count; i++)
-            p.drawLine(sx(i-1), valueToPixel(buf[i-1], pr, ymin, ymax),
-                       sx(i),   valueToPixel(buf[i],   pr, ymin, ymax));
+        {
+            std::vector<QPointF> pts;
+            pts.reserve(static_cast<size_t>(out_count));
+            for (int64_t i = 0; i < out_count; i++)
+                pts.emplace_back(sxf(i), valueToPixel(buf[i], pr, ymin, ymax));
+            p.drawPolyline(pts.data(), static_cast<int>(pts.size()));
+        }
 
         if (out_count > 0 && W / out_count >= 4) {
             p.setBrush(te.color);
             p.setPen(Qt::NoPen);
             for (int64_t i = 0; i < out_count; i++)
-                p.drawEllipse(QPoint(sx(i), valueToPixel(buf[i], pr, ymin, ymax)), 3, 3);
+                p.drawEllipse(QPointF(sxf(i), valueToPixel(buf[i], pr, ymin, ymax)), 3.0, 3.0);
             p.setBrush(Qt::NoBrush);
         }
         p.setRenderHint(QPainter::Antialiasing, false);
@@ -820,6 +931,17 @@ void PlotWidget::mousePressEvent(QMouseEvent* e) {
         return;
     }
 
+    if (mode_ == InteractionMode::AlignDrag) {
+        if (!pr.contains(e->pos())) return;
+        int idx = nearestTrace(e->pos().x(), e->pos().y(), pr);
+        if (idx < 0) return;
+        align_drag_idx_          = idx;
+        align_drag_sample_origin_ = pixelToSample(e->pos().x(), pr);
+        align_drag_shift_origin_  = traces_[static_cast<size_t>(idx)].shift;
+        setCursor(Qt::SizeHorCursor);
+        return;
+    }
+
     // Pan mode
     dragging_            = true;
     drag_origin_         = e->pos();
@@ -833,6 +955,20 @@ void PlotWidget::mouseMoveEvent(QMouseEvent* e) {
         mode_ == InteractionMode::CropSelect) {
         if (rubber_band_active_) {
             rubber_band_current_ = e->pos();
+            update();
+        }
+        return;
+    }
+
+    if (mode_ == InteractionMode::AlignDrag && align_drag_idx_ >= 0) {
+        QRect   pr      = plotRect();
+        int64_t cur_s   = pixelToSample(e->pos().x(), pr);
+        int64_t delta   = cur_s - align_drag_sample_origin_;
+        auto&   te      = traces_[static_cast<size_t>(align_drag_idx_)];
+        int32_t new_shift = align_drag_shift_origin_ + static_cast<int32_t>(delta);
+        if (te.shift != new_shift) {
+            te.shift       = new_shift;
+            te.cache.valid = false;
             update();
         }
         return;
@@ -890,6 +1026,13 @@ void PlotWidget::mouseReleaseEvent(QMouseEvent* e) {
             }
         }
         update();
+        return;
+    }
+
+    if (mode_ == InteractionMode::AlignDrag && align_drag_idx_ >= 0) {
+        align_drag_idx_ = -1;
+        setCursor(Qt::ArrowCursor);
+        emit traceShiftsChanged();
         return;
     }
 

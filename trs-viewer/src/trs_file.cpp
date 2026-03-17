@@ -135,9 +135,11 @@ bool TrsFile::parseHeader(const uint8_t* data, size_t size, std::string& error) 
     while (pos + 2 <= size) {
         uint8_t tag = data[pos++];
 
-        // BER-TLV length decoding:
+        // TRS-format length decoding (resembles BER-TLV but uses little-endian
+        // multi-byte lengths, unlike standard BER which is big-endian):
         //   short form: bit 7 = 0  →  length = that byte (0–127)
-        //   long  form: bit 7 = 1  →  lower 7 bits = number of following length bytes
+        //   long  form: bit 7 = 1  →  lower 7 bits = number of following length bytes,
+        //               stored little-endian (LSB first)
         uint8_t lb = data[pos++];
         size_t  len;
         if (lb & 0x80) {
@@ -148,7 +150,7 @@ bool TrsFile::parseHeader(const uint8_t* data, size_t size, std::string& error) 
             }
             len = 0;
             for (size_t i = 0; i < nb; i++)
-                len = (len << 8) | data[pos++];
+                len |= static_cast<size_t>(data[pos++]) << (8 * i);  // little-endian
         } else {
             len = lb;
         }
