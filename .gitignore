@@ -1,4 +1,4 @@
 *.trs
 *.png
 *.pdf
-trs-viewer/build
+build/
