@@ -25,6 +25,8 @@ Interactive power-trace viewer and side-channel analysis toolkit for Riscure `.t
 
 The side panel shows file metadata (trace count, samples/trace, sample type, data bytes/trace) and a **per-trace data inspector** — use the spin box to step through traces and see their auxiliary data bytes as a hex dump. If no data bytes are present, the inspector shows `(no data)`. When the file carries the optional `LEGACY_DATA` parameter (see below), the bytes are decoded automatically as `PT` / `CT` pairs.
 
+![Trace browser and pipeline](docs/trace_browser.gif)
+
 ### Signal Processing Pipeline
 
 Transforms stack in order and are applied live on every render and on all SCA computations:
@@ -72,6 +74,8 @@ Computes the per-sample Welch t-statistic between two trace groups. No special h
 
 **SCA → Load T-Test NPY…** — load a pre-computed 1-D `float32` t-statistic vector.
 
+![T-test result and PDF export](docs/ttest_export.gif)
+
 ### Cross-Correlation Matrix
 
 **SCA → Cross-Correlation…**
@@ -86,6 +90,8 @@ Computes the M×M normalised Pearson correlation matrix `C[i,j] = Corr(sᵢ, s�
 | **Two-Window** | Rectangular search×ref cross-correlation for template matching |
 
 A **stride** parameter subsamples before computing (`M = ⌈samples / stride⌉`) to reduce memory and computation time.
+
+![Cross-correlation heatmap](docs/heatmap.gif)
 
 ### Correlation Power Analysis (CPA)
 
