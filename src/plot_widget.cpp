@@ -257,6 +257,8 @@ void PlotWidget::clearTraces() {
     traces_.clear();
     total_samples_ = view_start_ = view_end_ = 0;
     meas_count_ = 0;
+    sticky_ymin_ =  std::numeric_limits<float>::infinity();
+    sticky_ymax_ = -std::numeric_limits<float>::infinity();
     update();
 }
 
@@ -277,6 +279,8 @@ void PlotWidget::resetView() {
     view_start_ = std::min(startup, total_samples_);
     view_end_   = total_samples_;
     y_scale_    = 1.0f;
+    sticky_ymin_ =  std::numeric_limits<float>::infinity();
+    sticky_ymax_ = -std::numeric_limits<float>::infinity();
     clearMeasurement();
     emit viewChanged(view_start_, view_end_, total_samples_);
     update();
@@ -318,6 +322,8 @@ void PlotWidget::zoomOutY() {
 
 void PlotWidget::resetYZoom() {
     y_scale_ = 1.0f;
+    sticky_ymin_ =  std::numeric_limits<float>::infinity();
+    sticky_ymax_ = -std::numeric_limits<float>::infinity();
     update();
 }
 
@@ -717,6 +723,12 @@ void PlotWidget::paintEvent(QPaintEvent*) {
 
     float ymin, ymax;
     computeYRange(ymin, ymax);
+    // Sticky range: expand eagerly, never auto-shrink (prevents flicker while panning).
+    // Reset by resetView(), resetYZoom(), or clearTraces().
+    if (ymin < sticky_ymin_) sticky_ymin_ = ymin;
+    if (ymax > sticky_ymax_) sticky_ymax_ = ymax;
+    ymin = sticky_ymin_;
+    ymax = sticky_ymax_;
     // Apply Y-axis zoom (Ctrl+scroll): expand/contract range around centre.
     if (y_scale_ != 1.0f) {
         float center = (ymin + ymax) * 0.5f;

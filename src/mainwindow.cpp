@@ -1,9 +1,11 @@
 #include "mainwindow.h"
+#include <zlib.h>
 #include "heatmap_widget.h"
 #include "ttest.h"
 #include "align.h"
 #include "xcorr.h"
 #include "cpa.h"
+#include "snr.h"
 #include "leakage_model.h"
 #include "leakage_model_dialog.h"
 
@@ -407,6 +409,10 @@ void MainWindow::setupMenuBar() {
     connect(act_exp_npz, &QAction::triggered, this, &MainWindow::onExportNpz);
     export_menu->addAction(act_exp_npz);
 
+    auto* act_exp_dataset = new QAction("Export &Dataset (NPZ)…", this);
+    connect(act_exp_dataset, &QAction::triggered, this, &MainWindow::onExportDataset);
+    export_menu->addAction(act_exp_dataset);
+
     export_menu->addSeparator();
 
     auto* act_exp_png = new QAction("Export plot as &PNG…", this);
@@ -430,6 +436,14 @@ void MainWindow::setupMenuBar() {
     auto* act_dpa = new QAction("&CPA…", this);
     connect(act_dpa, &QAction::triggered, this, &MainWindow::onRunCpa);
     sca_menu->addAction(act_dpa);
+
+    auto* act_snr = new QAction("&SNR…", this);
+    connect(act_snr, &QAction::triggered, this, &MainWindow::onRunSNR);
+    sca_menu->addAction(act_snr);
+
+    auto* act_static_snr = new QAction("Static SNR |μ/σ|…", this);
+    connect(act_static_snr, &QAction::triggered, this, &MainWindow::onRunStaticSNR);
+    sca_menu->addAction(act_static_snr);
 
     auto* act_align = new QAction("&Align Traces…", this);
     connect(act_align, &QAction::triggered, this, &MainWindow::onAlignTraces);
@@ -539,11 +553,37 @@ void MainWindow::updateTraceDataDisplay() {
 
     QString text = QString("Trace %1 / %2\n").arg(ti).arg(h.num_traces - 1);
 
-    auto it = h.param_map.find("LEGACY_DATA");
-    if (it != h.param_map.end() && it->second.length == 32 && it->second.offset == 0
-        && raw.size() >= 32) {
-        text += "PT: " + hexBytes(raw.data(),      16, 4) + "\n";
-        text += "CT: " + hexBytes(raw.data() + 16, 16, 4);
+    // If we have named params, show them by name with decoded integer values
+    if (!h.param_map.empty() && h.param_map.find("LEGACY_DATA") == h.param_map.end()) {
+        for (const auto& kv : h.param_map) {
+            const TrsTraceParam& p = kv.second;
+            if (p.offset + p.length > static_cast<int>(raw.size())) continue;
+            const uint8_t* b = raw.data() + p.offset;
+            int64_t val = 0;
+            // Always interpret as little-endian signed integer for display
+            for (int i = p.length - 1; i >= 0; i--)
+                val = (val << 8) | b[i];
+            // sign-extend if needed (type 2=i16, 4=i32, 8=i64)
+            if (p.type != 1 && p.length <= 8) {
+                int bits = p.length * 8;
+                int64_t sign_bit = int64_t(1) << (bits - 1);
+                if (val & sign_bit) val |= ~((sign_bit << 1) - 1);
+            }
+            text += QString("%1: %2\n").arg(QString::fromStdString(kv.first), -16).arg(val);
+        }
+        text = text.trimmed();
+    } else if (h.param_map.find("LEGACY_DATA") != h.param_map.end()) {
+        auto it = h.param_map.find("LEGACY_DATA");
+        if (it->second.length == 32 && it->second.offset == 0 && raw.size() >= 32) {
+            text += "PT: " + hexBytes(raw.data(),      16, 4) + "\n";
+            text += "CT: " + hexBytes(raw.data() + 16, 16, 4);
+        } else {
+            for (size_t off = 0; off < raw.size(); off += 16) {
+                size_t n = std::min<size_t>(16, raw.size() - off);
+                text += hexBytes(raw.data() + off, n, 4) + "\n";
+            }
+            text = text.trimmed();
+        }
     } else {
         for (size_t off = 0; off < raw.size(); off += 16) {
             size_t n = std::min<size_t>(16, raw.size() - off);
@@ -980,6 +1020,70 @@ static bool loadNpy(const QString& path,
     return true;
 }
 
+static std::vector<uint8_t> buildNpy1DBytes(const std::string& dtype,
+                                              const void* data, int64_t n, size_t elem_size)
+{
+    std::string dict = "{'descr': '" + dtype + "', 'fortran_order': False, 'shape': ("
+                     + std::to_string(n) + ",), }";
+    size_t content_len = dict.size() + 1;
+    size_t header_len  = ((content_len + 10 + 63) / 64) * 64 - 10;
+    dict.resize(header_len - 1, ' ');
+    dict += '\n';
+    uint16_t hl = static_cast<uint16_t>(header_len);
+    size_t data_bytes = static_cast<size_t>(n) * elem_size;
+    std::vector<uint8_t> out;
+    out.reserve(10 + header_len + data_bytes);
+    const uint8_t magic[] = {0x93, 'N', 'U', 'M', 'P', 'Y', 0x01, 0x00,
+                              uint8_t(hl & 0xFF), uint8_t(hl >> 8)};
+    out.insert(out.end(), magic, magic + 10);
+    out.insert(out.end(), dict.begin(), dict.end());
+    const auto* d = reinterpret_cast<const uint8_t*>(data);
+    out.insert(out.end(), d, d + data_bytes);
+    return out;
+}
+
+static bool parseNpyBytesFloat32(const std::vector<uint8_t>& bytes,
+                                  std::vector<float>& out, QString& err)
+{
+    if (bytes.size() < 10 || bytes[0] != 0x93 || bytes[1] != 'N') {
+        err = "Invalid NPY block."; return false;
+    }
+    uint8_t ver = bytes[6];
+    size_t data_start = (ver == 1) ? 10 + (bytes[8] | (bytes[9] << 8))
+                                   : 12 + (bytes.size() < 12 ? 0 :
+                                           (bytes[8] | (bytes[9]<<8) | (bytes[10]<<16) | (bytes[11]<<24)));
+    if (data_start > bytes.size()) { err = "NPY header truncated."; return false; }
+    std::string hdr(bytes.begin() + (ver == 1 ? 10 : 12), bytes.begin() + data_start);
+    if (hdr.find("'<f4'") == std::string::npos && hdr.find("\"<f4\"") == std::string::npos) {
+        err = "Expected float32 ('<f4') array."; return false;
+    }
+    size_t n = (bytes.size() - data_start) / sizeof(float);
+    out.resize(n);
+    std::memcpy(out.data(), bytes.data() + data_start, n * sizeof(float));
+    return true;
+}
+
+static bool parseNpyBytesFloat64(const std::vector<uint8_t>& bytes,
+                                  std::vector<double>& out, QString& err)
+{
+    if (bytes.size() < 10 || bytes[0] != 0x93 || bytes[1] != 'N') {
+        err = "Invalid NPY block."; return false;
+    }
+    uint8_t ver = bytes[6];
+    size_t data_start = (ver == 1) ? 10 + (bytes[8] | (bytes[9] << 8))
+                                   : 12 + (bytes.size() < 12 ? 0 :
+                                           (bytes[8] | (bytes[9]<<8) | (bytes[10]<<16) | (bytes[11]<<24)));
+    if (data_start > bytes.size()) { err = "NPY header truncated."; return false; }
+    std::string hdr(bytes.begin() + (ver == 1 ? 10 : 12), bytes.begin() + data_start);
+    if (hdr.find("'<f8'") == std::string::npos && hdr.find("\"<f8\"") == std::string::npos) {
+        err = "Expected float64 ('<f8') array."; return false;
+    }
+    size_t n = (bytes.size() - data_start) / sizeof(double);
+    out.resize(n);
+    std::memcpy(out.data(), bytes.data() + data_start, n * sizeof(double));
+    return true;
+}
+
 static bool saveNpy(const QString& path, const float* data, int64_t n, QString& err) {
     FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
     if (!fp) { err = "Cannot create: " + path; return false; }
@@ -1142,7 +1246,7 @@ static bool saveNpz(const QString& path,
 
 // ---------------------------------------------------------------------------
 // Minimal NPZ reader: returns named entries as raw byte vectors.
-// Only STORE (method 0) compression is supported.
+// Supports STORE (method 0) and DEFLATE (method 8) compression.
 // ---------------------------------------------------------------------------
 
 static bool loadNpz(const QString& path,
@@ -1201,8 +1305,8 @@ static bool loadNpz(const QString& path,
         std::string fname(reinterpret_cast<const char*>(cd.data() + pos + 46), fname_len);
         pos += 46 + fname_len + extra_len + comm_len;
 
-        if (method != 0) {
-            err = QString("Entry '%1' uses compression method %2; only STORE (0) is supported.")
+        if (method != 0 && method != 8) {
+            err = QString("Entry '%1' uses compression method %2; only STORE (0) and DEFLATE (8) are supported.")
                       .arg(QString::fromStdString(fname)).arg(method);
             std::fclose(fp); return false;
         }
@@ -1217,11 +1321,35 @@ static bool loadNpz(const QString& path,
         std::fseek(fp, data_off, SEEK_SET);
 
         std::vector<uint8_t> data(uncomp_sz);
-        if (std::fread(data.data(), 1, uncomp_sz, fp) != uncomp_sz) {
-            err = QString("Truncated data for entry '%1'.").arg(QString::fromStdString(fname));
-            std::fclose(fp); return false;
+        if (method == 0) {
+            // STORE — raw bytes
+            if (std::fread(data.data(), 1, uncomp_sz, fp) != uncomp_sz) {
+                err = QString("Truncated data for entry '%1'.").arg(QString::fromStdString(fname));
+                std::fclose(fp); return false;
+            }
+        } else {
+            // DEFLATE (raw, no zlib wrapper) — inflate with -MAX_WBITS
+            std::vector<uint8_t> comp(comp_sz);
+            if (std::fread(comp.data(), 1, comp_sz, fp) != comp_sz) {
+                err = QString("Truncated compressed data for entry '%1'.").arg(QString::fromStdString(fname));
+                std::fclose(fp); return false;
+            }
+            z_stream zs{};
+            if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) {
+                err = "zlib inflateInit2 failed."; std::fclose(fp); return false;
+            }
+            zs.next_in  = comp.data();
+            zs.avail_in = static_cast<uInt>(comp_sz);
+            zs.next_out = data.data();
+            zs.avail_out= static_cast<uInt>(uncomp_sz);
+            int zret = inflate(&zs, Z_FINISH);
+            inflateEnd(&zs);
+            if (zret != Z_STREAM_END) {
+                err = QString("DEFLATE decompression failed for entry '%1' (zlib code %2).")
+                          .arg(QString::fromStdString(fname)).arg(zret);
+                std::fclose(fp); return false;
+            }
         }
-        (void)comp_sz;
         entries[fname] = std::move(data);
     }
 
@@ -1255,12 +1383,17 @@ static bool parseNpyBytes(const std::vector<uint8_t>& buf,
     if (hdr_start + header_len > buf.size()) { err = "NPY header truncated."; return false; }
     std::string hdr(reinterpret_cast<const char*>(buf.data() + hdr_start), header_len);
 
-    // dtype must be float32 or uint8
+    // dtype detection
     bool is_f32 = (hdr.find("'<f4'") != std::string::npos || hdr.find("\"<f4\"") != std::string::npos);
+    bool is_f64 = (hdr.find("'<f8'") != std::string::npos || hdr.find("\"<f8\"") != std::string::npos ||
+                   hdr.find("'float64'") != std::string::npos);
     bool is_u8  = (hdr.find("'|u1'") != std::string::npos || hdr.find("\"u1\""  ) != std::string::npos ||
                    hdr.find("'uint8'") != std::string::npos);
-    if (!is_f32 && !is_u8) {
-        err = "Only float32 ('<f4') and uint8 ('|u1') dtypes are supported."; return false;
+    bool is_i16 = (hdr.find("'<i2'") != std::string::npos || hdr.find("\"<i2\"") != std::string::npos);
+    bool is_i32 = (hdr.find("'<i4'") != std::string::npos || hdr.find("\"<i4\"") != std::string::npos);
+    bool is_i64 = (hdr.find("'<i8'") != std::string::npos || hdr.find("\"<i8\"") != std::string::npos);
+    if (!is_f32 && !is_f64 && !is_u8 && !is_i16 && !is_i32 && !is_i64) {
+        err = "Unsupported dtype. Supported: float32, float64, uint8, int16, int32, int64."; return false;
     }
 
     auto sp = hdr.find("'shape'");
@@ -1287,22 +1420,105 @@ static bool parseNpyBytes(const std::vector<uint8_t>& buf,
     for (int64_t d : shape) n_elements *= d;
 
     size_t data_offset = hdr_start + header_len;
-    if (is_f32) {
-        if (data_offset + static_cast<size_t>(n_elements) * 4 > buf.size()) {
-            err = "NPY data truncated."; return false;
-        }
-        data.resize(static_cast<size_t>(n_elements));
-        std::memcpy(data.data(), buf.data() + data_offset,
-                    static_cast<size_t>(n_elements) * sizeof(float));
-    } else {
-        // uint8 → cast to float
-        if (data_offset + static_cast<size_t>(n_elements) > buf.size()) {
-            err = "NPY data truncated."; return false;
-        }
-        data.resize(static_cast<size_t>(n_elements));
-        for (int64_t i = 0; i < n_elements; i++)
-            data[static_cast<size_t>(i)] = static_cast<float>(buf[data_offset + static_cast<size_t>(i)]);
+    size_t elem_bytes = is_f32 ? 4 : is_f64 ? 8 : is_u8 ? 1 : is_i16 ? 2 : is_i32 ? 4 : 8;
+    if (data_offset + static_cast<size_t>(n_elements) * elem_bytes > buf.size()) {
+        err = "NPY data truncated."; return false;
     }
+    data.resize(static_cast<size_t>(n_elements));
+    const uint8_t* src = buf.data() + data_offset;
+    if (is_f32) {
+        std::memcpy(data.data(), src, static_cast<size_t>(n_elements) * 4);
+    } else if (is_f64) {
+        for (int64_t i = 0; i < n_elements; i++) {
+            double v; std::memcpy(&v, src + i * 8, 8);
+            data[static_cast<size_t>(i)] = static_cast<float>(v);
+        }
+    } else if (is_u8) {
+        for (int64_t i = 0; i < n_elements; i++)
+            data[static_cast<size_t>(i)] = static_cast<float>(src[i]);
+    } else if (is_i16) {
+        for (int64_t i = 0; i < n_elements; i++) {
+            int16_t v; std::memcpy(&v, src + i * 2, 2);
+            data[static_cast<size_t>(i)] = static_cast<float>(v);
+        }
+    } else if (is_i32) {
+        for (int64_t i = 0; i < n_elements; i++) {
+            int32_t v; std::memcpy(&v, src + i * 4, 4);
+            data[static_cast<size_t>(i)] = static_cast<float>(v);
+        }
+    } else { // i64
+        for (int64_t i = 0; i < n_elements; i++) {
+            int64_t v; std::memcpy(&v, src + i * 8, 8);
+            data[static_cast<size_t>(i)] = static_cast<float>(v);
+        }
+    }
+    return true;
+}
+
+// Parse NPY bytes without converting to float — returns shape, elem_size, and raw data payload.
+// Supports: |u1 |i1 <u2 <i2 <u4 <i4 <u8 <i8 <f4 <f8
+static bool parseNpyRaw(const std::vector<uint8_t>& buf,
+                        std::vector<int64_t>& shape,
+                        int& elem_size,
+                        std::vector<uint8_t>& payload,
+                        QString& err)
+{
+    if (buf.size() < 10 || buf[0] != 0x93 || buf[1] != 'N' || buf[2] != 'U' ||
+        buf[3] != 'M'  || buf[4] != 'P' || buf[5] != 'Y') {
+        err = "Not a valid NPY entry."; return false;
+    }
+    uint8_t ver = buf[6];
+    uint32_t hlen = 0;
+    size_t hstart;
+    if (ver == 1) {
+        hlen = static_cast<uint32_t>(buf[8]) | (static_cast<uint32_t>(buf[9]) << 8);
+        hstart = 10;
+    } else {
+        if (buf.size() < 12) { err = "NPY v2 header too short."; return false; }
+        hlen = static_cast<uint32_t>(buf[8])  | (static_cast<uint32_t>(buf[9])  << 8)
+             | (static_cast<uint32_t>(buf[10]) << 16) | (static_cast<uint32_t>(buf[11]) << 24);
+        hstart = 12;
+    }
+    if (hstart + hlen > buf.size()) { err = "NPY header truncated."; return false; }
+    std::string hdr(reinterpret_cast<const char*>(buf.data() + hstart), hlen);
+
+    // elem_size from dtype
+    struct { const char* token; int sz; } dtypes[] = {
+        {"|u1",1},{"|i1",1},{"'u1'",1},{"'i1'",1},
+        {"<u2",2},{"<i2",2},{"<u4",4},{"<i4",4},
+        {"<u8",8},{"<i8",8},{"<f4",4},{"<f8",8},
+        {nullptr,0}
+    };
+    elem_size = 0;
+    for (auto& d : dtypes) {
+        if (!d.token) break;
+        if (hdr.find(d.token) != std::string::npos) { elem_size = d.sz; break; }
+    }
+    if (elem_size == 0) { err = "Unsupported dtype in NPY entry."; return false; }
+
+    // shape
+    auto sp = hdr.find("'shape'");
+    if (sp == std::string::npos) sp = hdr.find("\"shape\"");
+    if (sp == std::string::npos) { err = "Cannot find shape."; return false; }
+    auto lp = hdr.find('(', sp);
+    auto rp = hdr.find(')', lp != std::string::npos ? lp : 0);
+    if (lp == std::string::npos || rp == std::string::npos) { err = "Cannot parse shape."; return false; }
+    std::string shape_str = hdr.substr(lp + 1, rp - lp - 1);
+    shape.clear();
+    size_t pos = 0;
+    while (pos < shape_str.size()) {
+        while (pos < shape_str.size() && (shape_str[pos] == ' ' || shape_str[pos] == ',')) pos++;
+        if (pos >= shape_str.size()) break;
+        char* end = nullptr;
+        long long v = std::strtoll(shape_str.c_str() + pos, &end, 10);
+        if (end == shape_str.c_str() + pos) break;
+        shape.push_back(static_cast<int64_t>(v));
+        pos = static_cast<size_t>(end - shape_str.c_str());
+    }
+
+    size_t data_start = hstart + hlen;
+    size_t data_bytes = buf.size() - data_start;
+    payload.assign(buf.data() + data_start, buf.data() + data_start + data_bytes);
     return true;
 }
 
@@ -1312,26 +1528,50 @@ static bool parseNpyBytes(const std::vector<uint8_t>& buf,
 
 void MainWindow::onLoadNpyTTest() {
     QString path = QFileDialog::getOpenFileName(
-        this, "Load t-test NPY", {}, "NumPy files (*.npy);;All files (*)");
+        this, "Load t-test NPY/NPZ", {},
+        "NumPy files (*.npy *.npz);;All files (*)");
     if (path.isEmpty()) return;
 
     std::vector<float> data;
-    std::vector<int64_t> shape;
+    std::vector<double> df_loaded;
     QString err;
-    if (!loadNpy(path, data, shape, err)) {
-        QMessageBox::critical(this, "Load failed", err); return;
-    }
-    if (shape.size() != 1) {
-        QMessageBox::critical(this, "Load failed",
-            QString("Expected a 1-D array, got %1-D.").arg(shape.size())); return;
+
+    if (path.endsWith(".npz", Qt::CaseInsensitive)) {
+        std::map<std::string, std::vector<uint8_t>> entries;
+        if (!loadNpz(path, entries, err)) {
+            QMessageBox::critical(this, "Load failed", err); return;
+        }
+        auto it = entries.find("tstat.npy");
+        if (it == entries.end()) {
+            QMessageBox::critical(this, "Load failed",
+                "NPZ does not contain 'tstat.npy'."); return;
+        }
+        if (!parseNpyBytesFloat32(it->second, data, err)) {
+            QMessageBox::critical(this, "Load failed", err); return;
+        }
+        auto it2 = entries.find("df.npy");
+        if (it2 != entries.end()) {
+            QString df_err;
+            parseNpyBytesFloat64(it2->second, df_loaded, df_err);
+        }
+    } else {
+        std::vector<int64_t> shape;
+        if (!loadNpy(path, data, shape, err)) {
+            QMessageBox::critical(this, "Load failed", err); return;
+        }
+        if (shape.size() != 1) {
+            QMessageBox::critical(this, "Load failed",
+                QString("Expected a 1-D array, got %1-D.").arg(shape.size())); return;
+        }
     }
 
     auto tstat_ptr = std::make_shared<std::vector<float>>(std::move(data));
+    auto df_ptr    = std::make_shared<std::vector<double>>(std::move(df_loaded));
 
     auto* dlg = new QDialog(this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
     dlg->setWindowTitle(QString("T-test — %1 samples — %2")
-                            .arg(shape[0])
+                            .arg(tstat_ptr->size())
                             .arg(QFileInfo(path).fileName()));
     dlg->resize(1100, 520);
 
@@ -1377,60 +1617,84 @@ void MainWindow::onLoadNpyTTest() {
 
         auto* sp_alpha = new QDoubleSpinBox;
         sp_alpha->setRange(1e-6, 0.5); sp_alpha->setDecimals(6);
-        sp_alpha->setValue(0.05);      sp_alpha->setSingleStep(0.01);
+        sp_alpha->setValue(0.01);      sp_alpha->setSingleStep(0.01);
 
         int64_t n_L = static_cast<int64_t>(tstat_ptr->size());
         auto* lbl_nL = new QLabel(QString::number(n_L));
-
-        // No accumulator available — let user enter group sizes
-        auto* sp_nA = new QSpinBox; sp_nA->setRange(2, 10000000); sp_nA->setValue(100);
-        auto* sp_nB = new QSpinBox; sp_nB->setRange(2, 10000000); sp_nB->setValue(100);
 
         auto* lbl_ath = new QLabel;
         auto* lbl_nu  = new QLabel;
         auto* lbl_th  = new QLabel;
         lbl_th->setTextFormat(Qt::RichText);
 
-        // Equal-variance Welch df from n_A, n_B
-        auto calc_nu = [](int64_t nA, int64_t nB) -> double {
-            double a = static_cast<double>(nA), b = static_cast<double>(nB);
-            double num = (1.0/a + 1.0/b) * (1.0/a + 1.0/b);
-            double den = 1.0/(a*a*(a-1.0)) + 1.0/(b*b*(b-1.0));
-            return (den > 0.0) ? num / den : a + b - 2.0;
-        };
-
-        auto recalc = [=]() {
-            double a    = sp_alpha->value();
-            double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
-            double nu   = calc_nu(sp_nA->value(), sp_nB->value());
-            double th   = invTCdf(1.0 - a_th / 2.0, nu);
-            lbl_ath->setText(QString::number(a_th, 'g', 4));
-            lbl_nu ->setText(QString::number(nu, 'f', 1));
-            lbl_th ->setText(QString("<b>%1</b>").arg(th, 0, 'f', 4));
-        };
-        connect(sp_alpha, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-                cd, [=](double) { recalc(); });
-        connect(sp_nA, QOverload<int>::of(&QSpinBox::valueChanged), cd, [=](int) { recalc(); });
-        connect(sp_nB, QOverload<int>::of(&QSpinBox::valueChanged), cd, [=](int) { recalc(); });
-        recalc();
-
         auto* bb = new QDialogButtonBox(QDialogButtonBox::Apply | QDialogButtonBox::Close);
-        connect(bb->button(QDialogButtonBox::Apply), &QPushButton::clicked, cd, [=]() {
-            double a    = sp_alpha->value();
-            double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
-            double nu   = calc_nu(sp_nA->value(), sp_nB->value());
-            spin_thr->setValue(invTCdf(1.0 - a_th / 2.0, nu));
-        });
         connect(bb, &QDialogButtonBox::rejected, cd, &QDialog::close);
 
         fl->addRow("Significance level α:", sp_alpha);
         fl->addRow("Trace length n_L:",      lbl_nL);
-        fl->addRow("Group A  n_A:",           sp_nA);
-        fl->addRow("Group B  n_B:",           sp_nB);
         fl->addRow(new QLabel);
-        fl->addRow("Šidák α_TH:",              lbl_ath);
-        fl->addRow("Approx. Welch ν̂:",        lbl_nu);
-        fl->addRow("Threshold TH:",           lbl_th);
+        fl->addRow("Šidák α_TH:",            lbl_ath);
+
+        if (!df_ptr->empty()) {
+            // Use median Welch df from the loaded df array
+            std::vector<double> df_sorted = *df_ptr;
+            std::sort(df_sorted.begin(), df_sorted.end());
+            double median_nu = df_sorted[df_sorted.size() / 2];
+
+            auto recalc = [=]() {
+                double a    = sp_alpha->value();
+                double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
+                double th   = invTCdf(1.0 - a_th / 2.0, median_nu);
+                lbl_ath->setText(QString::number(a_th, 'g', 4));
+                lbl_nu ->setText(QString::number(median_nu, 'f', 1));
+                lbl_th ->setText(QString("<b>%1</b>").arg(th, 0, 'f', 4));
+            };
+            connect(sp_alpha, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                    cd, [=](double) { recalc(); });
+            connect(bb->button(QDialogButtonBox::Apply), &QPushButton::clicked, cd, [=]() {
+                double a    = sp_alpha->value();
+                double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
+                spin_thr->setValue(invTCdf(1.0 - a_th / 2.0, median_nu));
+            });
+            fl->addRow("Median Welch ν̂:", lbl_nu);
+            recalc();
+        } else {
+            // No df data — let user enter group sizes for approximation
+            auto* sp_nA = new QSpinBox; sp_nA->setRange(2, 10000000); sp_nA->setValue(100);
+            auto* sp_nB = new QSpinBox; sp_nB->setRange(2, 10000000); sp_nB->setValue(100);
+
+            auto calc_nu = [](int64_t nA, int64_t nB) -> double {
+                double a = static_cast<double>(nA), b = static_cast<double>(nB);
+                double num = (1.0/a + 1.0/b) * (1.0/a + 1.0/b);
+                double den = 1.0/(a*a*(a-1.0)) + 1.0/(b*b*(b-1.0));
+                return (den > 0.0) ? num / den : a + b - 2.0;
+            };
+
+            auto recalc = [=]() {
+                double a    = sp_alpha->value();
+                double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
+                double nu   = calc_nu(sp_nA->value(), sp_nB->value());
+                double th   = invTCdf(1.0 - a_th / 2.0, nu);
+                lbl_ath->setText(QString::number(a_th, 'g', 4));
+                lbl_nu ->setText(QString::number(nu, 'f', 1));
+                lbl_th ->setText(QString("<b>%1</b>").arg(th, 0, 'f', 4));
+            };
+            connect(sp_alpha, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                    cd, [=](double) { recalc(); });
+            connect(sp_nA, QOverload<int>::of(&QSpinBox::valueChanged), cd, [=](int) { recalc(); });
+            connect(sp_nB, QOverload<int>::of(&QSpinBox::valueChanged), cd, [=](int) { recalc(); });
+            connect(bb->button(QDialogButtonBox::Apply), &QPushButton::clicked, cd, [=]() {
+                double a    = sp_alpha->value();
+                double a_th = 1.0 - std::pow(1.0 - a, 1.0 / static_cast<double>(n_L));
+                spin_thr->setValue(invTCdf(1.0 - a_th / 2.0, calc_nu(sp_nA->value(), sp_nB->value())));
+            });
+            fl->addRow("Group A  n_A:",       sp_nA);
+            fl->addRow("Group B  n_B:",       sp_nB);
+            fl->addRow("Approx. Welch ν̂:",   lbl_nu);
+            recalc();
+        }
+
+        fl->addRow("Threshold TH:", lbl_th);
         fl->addRow(bb);
         cd->show();
     });
@@ -1500,7 +1764,7 @@ void MainWindow::onLoadNpyTTest() {
     auto* ctrl   = new QWidget(dlg);
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
-    ctrl_l->addWidget(new QLabel(QString("Samples: <b>%1</b>").arg(shape[0])));
+    ctrl_l->addWidget(new QLabel(QString("Samples: <b>%1</b>").arg(tstat_ptr->size())));
     ctrl_l->setSpacing(6);
     auto* lbl_f = qobject_cast<QLabel*>(ctrl_l->itemAt(0)->widget());
     if (lbl_f) lbl_f->setTextFormat(Qt::RichText);
@@ -1748,19 +2012,21 @@ void MainWindow::onOpenNpyTraces() {
     int64_t data_cols = 0;
     QString err;
 
+    struct NamedCol { std::string name; int elem_size; std::vector<uint8_t> payload; };
+    std::vector<NamedCol> named_cols;
+
     if (path.endsWith(".npz", Qt::CaseInsensitive)) {
         std::map<std::string, std::vector<uint8_t>> entries;
         if (!loadNpz(path, entries, err)) {
             QMessageBox::critical(this, "Load failed", err); return;
         }
-        // Look for 'traces', 'traces.npy', or the first 2-D float32 entry
+
+        // --- Find the traces entry (2-D float array) ---
         auto it = entries.find("traces.npy");
         if (it == entries.end()) it = entries.find("traces");
         if (it == entries.end()) {
-            // pick the first 2-D entry
             for (auto& kv : entries) {
-                std::vector<int64_t> sh;
-                std::vector<float> tmp;
+                std::vector<int64_t> sh; std::vector<float> tmp;
                 if (parseNpyBytes(kv.second, tmp, sh, err) && sh.size() == 2) {
                     it = entries.find(kv.first); break;
                 }
@@ -1777,20 +2043,49 @@ void MainWindow::onOpenNpyTraces() {
         }
         if (sh.size() != 2) {
             QMessageBox::critical(this, "Load failed",
-                QString("Traces entry is %1-D; expected 2-D (n_traces × n_samples).").arg(sh.size()));
+                QString("Traces entry is %1-D; expected 2-D.").arg(sh.size()));
             return;
         }
         n_traces = sh[0]; n_samples = sh[1];
+        std::string traces_key = it->first;
 
-        // Optional 'data' or 'data.npy' entry (n_traces × data_length)
-        for (const char* dname : {"data.npy", "data", "labels.npy", "labels"}) {
+        // --- Also check for legacy 2-D data array ---
+        for (const char* dname : {"data.npy","data","labels.npy","labels","textin.npy","textin","plaintext.npy","plaintext"}) {
             auto di = entries.find(dname);
-            if (di == entries.end()) continue;
+            if (di == entries.end() || di->first == traces_key) continue;
             std::vector<int64_t> dsh;
             if (parseNpyBytes(di->second, data_flat, dsh, err) && dsh.size() == 2 && dsh[0] == n_traces) {
                 data_cols = dsh[1];
                 break;
             }
+        }
+
+        // --- Scan all remaining entries for 1-D arrays matching n_traces ---
+        static const char* legacy_names[] = {
+            "data.npy","data","labels.npy","labels",
+            "textin.npy","textin","plaintext.npy","plaintext", nullptr
+        };
+        for (auto& kv : entries) {
+            if (kv.first == traces_key) continue;
+            // skip if already picked up as 2-D data
+            bool skip = false;
+            if (data_cols > 0) {
+                for (int li = 0; legacy_names[li]; li++)
+                    if (kv.first == legacy_names[li]) { skip = true; break; }
+            }
+            if (skip) continue;
+
+            std::vector<int64_t> csh; int esz; std::vector<uint8_t> cpayload; QString cerr;
+            if (!parseNpyRaw(kv.second, csh, esz, cpayload, cerr)) continue;
+            if (csh.size() != 1 || csh[0] != n_traces) continue;
+            if (static_cast<int64_t>(cpayload.size()) < n_traces * esz) continue;
+
+            // strip ".npy" suffix from name
+            std::string colname = kv.first;
+            if (colname.size() > 4 && colname.substr(colname.size()-4) == ".npy")
+                colname = colname.substr(0, colname.size()-4);
+
+            named_cols.push_back({colname, esz, std::move(cpayload)});
         }
     } else {
         // Plain .npy
@@ -1814,7 +2109,41 @@ void MainWindow::onOpenNpyTraces() {
     auto f = std::make_unique<TrsFile>();
     std::vector<uint8_t> data_bytes;
     int16_t data_length = 0;
-    if (data_cols > 0) {
+    std::map<std::string, TrsTraceParam> param_map;
+
+    if (!named_cols.empty()) {
+        // Pack named 1-D columns as raw bytes; build param_map
+        uint16_t offset = 0;
+        for (auto& col : named_cols) {
+            if (offset + col.elem_size > 32767) break; // safety cap
+            TrsTraceParam p;
+            p.offset = offset;
+            p.length = static_cast<uint16_t>(col.elem_size);
+            // type field: 1=u8/i8, 2=i16, 4=i32, 8=i64
+            switch (col.elem_size) {
+                case 1: p.type = 1; break;
+                case 2: p.type = 2; break;
+                case 4: p.type = 4; break;
+                case 8: p.type = 8; break;
+                default: p.type = 0; break;
+            }
+            param_map[col.name] = p;
+            offset += static_cast<uint16_t>(col.elem_size);
+        }
+        data_length = static_cast<int16_t>(offset);
+        data_bytes.resize(static_cast<size_t>(n_traces) * static_cast<size_t>(data_length), 0);
+        for (auto& col : named_cols) {
+            auto pit = param_map.find(col.name);
+            if (pit == param_map.end()) continue;
+            uint16_t off = pit->second.offset;
+            int esz = col.elem_size;
+            for (int64_t ti = 0; ti < n_traces; ti++) {
+                const uint8_t* src = col.payload.data() + static_cast<size_t>(ti) * esz;
+                uint8_t* dst = data_bytes.data() + static_cast<size_t>(ti) * data_length + off;
+                std::memcpy(dst, src, esz);
+            }
+        }
+    } else if (data_cols > 0) {
         data_length = static_cast<int16_t>(std::min(data_cols, (int64_t)32767));
         data_bytes.resize(static_cast<size_t>(n_traces) * static_cast<size_t>(data_length));
         for (int64_t ti = 0; ti < n_traces; ti++) {
@@ -1833,6 +2162,8 @@ void MainWindow::onOpenNpyTraces() {
                      path.toStdString(),
                      data_bytes.empty() ? nullptr : data_bytes.data(),
                      data_length);
+    if (!param_map.empty())
+        f->setParamMap(param_map);
 
     trs_file_ = std::move(f);
     align_shifts_.clear();
@@ -2227,7 +2558,7 @@ void MainWindow::onRunTTest() {
     });
 
     auto* btn_exp_trs = new QPushButton("Export TRS…");
-    auto* btn_exp_npy = new QPushButton("Export .npy…");
+    auto* btn_exp_npy = new QPushButton("Export .npz…");
 
     connect(spin_thr, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             [pw](double v) { pw->setThresholds(true, v, -v); });
@@ -2255,12 +2586,21 @@ void MainWindow::onRunTTest() {
         QMessageBox::information(dlg, "Export complete", "Saved: " + path);
     });
 
-    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, tstat_ptr]() {
+    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, tstat_ptr, acc_ptr]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as NumPy",
-                                                    {}, "NumPy files (*.npy)");
+                                                    {}, "NumPy archive (*.npz)");
         if (path.isEmpty()) return;
+        std::vector<double> df_vec;
+        acc_ptr->computeWelchDf(df_vec);
+        std::vector<std::pair<std::string, std::vector<uint8_t>>> entries;
+        entries.push_back({"tstat.npy", buildNpy1DBytes("<f4", tstat_ptr->data(),
+                                                         static_cast<int64_t>(tstat_ptr->size()),
+                                                         sizeof(float))});
+        entries.push_back({"df.npy", buildNpy1DBytes("<f8", df_vec.data(),
+                                                      static_cast<int64_t>(df_vec.size()),
+                                                      sizeof(double))});
         QString err;
-        if (!saveNpy(path, tstat_ptr->data(), static_cast<int64_t>(tstat_ptr->size()), err))
+        if (!saveNpz(path, entries, err))
             QMessageBox::critical(dlg, "Export failed", err);
         else
             QMessageBox::information(dlg, "Export complete", "Saved: " + path);
@@ -2659,7 +2999,7 @@ void MainWindow::onRunXCorr() {
     auto* grp_traces = new QGroupBox("Traces");
     auto* fl_traces  = new QFormLayout(grp_traces);
     auto* sp_first   = new QSpinBox; sp_first->setRange(0, std::max(0, n_total - 1)); sp_first->setValue(0);
-    auto* sp_count   = new QSpinBox; sp_count->setRange(2, n_total); sp_count->setValue(n_total);
+    auto* sp_count   = new QSpinBox; sp_count->setRange(1, n_total); sp_count->setValue(n_total);
     fl_traces->addRow("First trace:", sp_first);
     fl_traces->addRow("Count:",       sp_count);
 
@@ -3960,4 +4300,783 @@ void MainWindow::onRunCpa() {
     vl_dlg->addWidget(splitter, 1);
 
     dlg->show();
+}
+
+// ---------------------------------------------------------------------------
+// SNR
+// ---------------------------------------------------------------------------
+
+void MainWindow::onRunSNR() {
+    if (!trs_file_) {
+        QMessageBox::information(this, "SNR", "No file loaded.");
+        return;
+    }
+    const TrsHeader& h = trs_file_->header();
+    if (h.data_length <= 0) {
+        QMessageBox::critical(this, "SNR",
+            "This TRS file has no per-trace data bytes.\n"
+            "SNR requires at least 1 data byte per trace for class labels.");
+        return;
+    }
+
+    // --- Configuration dialog ---
+    int n_total = h.num_traces;
+    QDialog cfg(this);
+    cfg.setWindowTitle("SNR — configuration");
+    auto* fl       = new QFormLayout(&cfg);
+
+    auto* sp_first  = new QSpinBox; sp_first->setRange(0, std::max(0, n_total-1)); sp_first->setValue(0);
+    auto* sp_count  = new QSpinBox; sp_count->setRange(2, n_total);                sp_count->setValue(n_total);
+    auto* sp_s_first = new QSpinBox; sp_s_first->setRange(0, std::max(0,(int)h.num_samples-1)); sp_s_first->setValue(0);
+    auto* sp_s_count = new QSpinBox; sp_s_count->setRange(0, (int)h.num_samples);  sp_s_count->setValue(0);
+    sp_s_count->setSpecialValueText("All");
+
+    fl->addRow("First trace:",            sp_first);
+    fl->addRow("Count:",                  sp_count);
+    fl->addRow("First sample:",           sp_s_first);
+    fl->addRow("Sample count (0=all):",   sp_s_count);
+
+    auto* sp_byte = new QSpinBox;
+    sp_byte->setRange(0, h.data_length - 1);
+    sp_byte->setValue(0);
+    sp_byte->setToolTip("Data byte used to derive the class label.");
+    fl->addRow("Data byte index:", sp_byte);
+
+    auto* cmb_mode = new QComboBox;
+    cmb_mode->addItem("Raw byte value  (256 classes, 0–255)");
+    cmb_mode->addItem("Hamming weight  (9 classes, 0–8)");
+    fl->addRow("Class mode:", cmb_mode);
+
+    auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow(cfg_bb);
+    connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
+    connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    if (cfg.exec() != QDialog::Accepted) return;
+
+    const int32_t first    = sp_first->value();
+    const int32_t count    = sp_count->value();
+    const int32_t byte_idx = sp_byte->value();
+    const bool    use_hw   = (cmb_mode->currentIndex() == 1);
+    const int32_t n_classes = use_hw ? 9 : 256;
+
+    const int64_t eff_first_sample = sp_s_first->value();
+    const int64_t eff_n_samples    = sp_s_count->value();
+    const int64_t raw_ns = (eff_n_samples == 0)
+        ? (h.num_samples - eff_first_sample)
+        : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
+
+    int64_t effective_samples = raw_ns;
+    for (const auto& t : pipeline_)
+        effective_samples = t->transformedCount(effective_samples);
+
+    // Memory warning: n_classes * 2 * effective_samples * sizeof(double)
+    int64_t mem_bytes = static_cast<int64_t>(n_classes) * 2LL
+                      * effective_samples * static_cast<int64_t>(sizeof(double));
+    if (mem_bytes > 2LL * 1024 * 1024 * 1024) {
+        if (QMessageBox::warning(this, "Memory warning",
+                QString("Accumulator will require ~%1 GB.\nContinue?")
+                    .arg(double(mem_bytes) / (1024.0*1024*1024), 0, 'f', 1),
+                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+            return;
+    }
+
+    // --- Accumulation ---
+    SNRAccumulator acc(static_cast<int32_t>(effective_samples), n_classes);
+
+    QProgressDialog prog("Accumulating traces…", "Cancel", 0, count, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(400);
+
+    std::vector<float> trace_buf(static_cast<size_t>(raw_ns));
+    int32_t skipped = 0;
+
+    static const int32_t HW_TABLE[256] = {
+        0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4, 1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,
+        1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5, 2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+        1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5, 2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+        2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+        1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5, 2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+        2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+        2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+        3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7, 4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8
+    };
+
+    for (int32_t ti = 0; ti < count; ti++) {
+        if (prog.wasCanceled()) return;
+        prog.setValue(ti);
+        QApplication::processEvents();
+
+        int32_t src_idx  = first + ti;
+        auto data_bytes  = trs_file_->readData(src_idx);
+        if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { skipped++; continue; }
+
+        uint8_t  bval    = data_bytes[byte_idx];
+        int32_t  label   = use_hw ? HW_TABLE[bval] : static_cast<int32_t>(bval);
+
+        const int64_t adj_start = eff_first_sample;
+        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+        if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
+            int64_t src_start = std::max<int64_t>(0, adj_start);
+            int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
+            int64_t dst_off   = src_start - adj_start;
+            int64_t got = trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+                                                  trace_buf.data() + dst_off);
+            if (got <= 0) { skipped++; continue; }
+        }
+        for (const auto& t : pipeline_) t->reset();
+        int64_t n_out = raw_ns;
+        for (const auto& t : pipeline_)
+            n_out = t->apply(trace_buf.data(), n_out, 0);
+        acc.addTrace(label, trace_buf.data(), static_cast<int32_t>(n_out));
+    }
+    prog.setValue(count);
+
+    if (skipped > 0)
+        QMessageBox::warning(this, "SNR",
+            QString("%1 traces skipped (data byte out of range).").arg(skipped));
+
+    // --- Compute ---
+    std::vector<float> snr;
+    std::string        err;
+    if (!acc.compute(snr, err)) {
+        QMessageBox::critical(this, "SNR failed", QString::fromStdString(err));
+        return;
+    }
+
+    // --- Result window ---
+    auto snr_ptr = std::make_shared<std::vector<float>>(std::move(snr));
+
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle(QString("SNR — %1 traces, %2 (%3 classes)")
+                            .arg(acc.totalTraces())
+                            .arg(use_hw ? "Hamming weight" : "raw byte")
+                            .arg(n_classes));
+    dlg->resize(1100, 520);
+
+    auto* pw = new PlotWidget(dlg);
+    pw->addTrace(snr_ptr, QColor("#f4a63a"), "SNR");
+    pw->setTraceFilled(0, true);
+    pw->setAxisLabels("Sample Index", "SNR");
+    pw->setThresholds(false, 0.0, 0.0);
+    pw->resetView();
+
+    auto* btn_exp_npy = new QPushButton("Export .npy…");
+    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, snr_ptr]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export SNR as NumPy",
+                                                    {}, "NumPy files (*.npy)");
+        if (path.isEmpty()) return;
+        QString e;
+        if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
+            QMessageBox::critical(dlg, "Export failed", e);
+        else
+            QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+    });
+
+    auto* btn_exp_pdf = new QPushButton("Export PDF…");
+    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export SNR as PDF",
+                                                    {}, "PDF files (*.pdf)");
+        if (path.isEmpty()) return;
+        QPixmap px = pw->grab();
+        QPdfWriter writer(path);
+        writer.setResolution(150);
+        writer.setPageSize(QPageSize(QPageSize::A4));
+        writer.setPageOrientation(QPageLayout::Landscape);
+        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
+        QPainter painter(&writer);
+        if (painter.isActive())
+            painter.drawPixmap(painter.viewport(), px);
+    });
+
+    auto* hl = new QHBoxLayout;
+    hl->addWidget(btn_exp_npy);
+    hl->addWidget(btn_exp_pdf);
+    hl->addStretch();
+
+    auto* vl = new QVBoxLayout(dlg);
+    vl->addWidget(pw, 1);
+    vl->addLayout(hl);
+
+    dlg->show();
+}
+
+// ---------------------------------------------------------------------------
+// Static SNR  |μ[s] / σ[s]|
+// Run the same operation N times; σ is purely electronic/thermal noise.
+// ---------------------------------------------------------------------------
+
+void MainWindow::onRunStaticSNR() {
+    if (!trs_file_) {
+        QMessageBox::information(this, "Static SNR", "No file loaded.");
+        return;
+    }
+    const TrsHeader& h = trs_file_->header();
+
+    // --- Configuration dialog ---
+    int n_total = h.num_traces;
+    QDialog cfg(this);
+    cfg.setWindowTitle("Static SNR |μ/σ| — configuration");
+    auto* fl = new QFormLayout(&cfg);
+
+    auto* sp_first   = new QSpinBox; sp_first->setRange(0, std::max(0, n_total-1)); sp_first->setValue(0);
+    auto* sp_count   = new QSpinBox; sp_count->setRange(2, n_total);                sp_count->setValue(n_total);
+    auto* sp_s_first = new QSpinBox; sp_s_first->setRange(0, std::max(0,(int)h.num_samples-1)); sp_s_first->setValue(0);
+    auto* sp_s_count = new QSpinBox; sp_s_count->setRange(0, (int)h.num_samples);  sp_s_count->setValue(0);
+    sp_s_count->setSpecialValueText("All");
+
+    fl->addRow("First trace:",          sp_first);
+    fl->addRow("Count:",                sp_count);
+    fl->addRow("First sample:",         sp_s_first);
+    fl->addRow("Sample count (0=all):", sp_s_count);
+
+    auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow(cfg_bb);
+    connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
+    connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    if (cfg.exec() != QDialog::Accepted) return;
+
+    const int32_t first = sp_first->value();
+    const int32_t count = sp_count->value();
+    const int64_t eff_first_sample = sp_s_first->value();
+    const int64_t eff_n_samples    = sp_s_count->value();
+    const int64_t raw_ns = (eff_n_samples == 0)
+        ? (h.num_samples - eff_first_sample)
+        : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
+
+    int64_t effective_samples = raw_ns;
+    for (const auto& t : pipeline_)
+        effective_samples = t->transformedCount(effective_samples);
+
+    // --- Accumulate sum and sum-of-squares ---
+    std::vector<double> sum(static_cast<size_t>(effective_samples), 0.0);
+    std::vector<double> sum2(static_cast<size_t>(effective_samples), 0.0);
+    int64_t N = 0;
+
+    QProgressDialog prog("Accumulating traces…", "Cancel", 0, count, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(400);
+
+    std::vector<float> trace_buf(static_cast<size_t>(raw_ns));
+
+    for (int32_t ti = 0; ti < count; ti++) {
+        if (prog.wasCanceled()) return;
+        prog.setValue(ti);
+        QApplication::processEvents();
+
+        int32_t src_idx = first + ti;
+        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+        const int64_t adj_start = eff_first_sample;
+        if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
+            int64_t src_start = std::max<int64_t>(0, adj_start);
+            int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
+            int64_t dst_off   = src_start - adj_start;
+            int64_t got = trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+                                                  trace_buf.data() + dst_off);
+            if (got <= 0) continue;
+        }
+        for (const auto& t : pipeline_) t->reset();
+        int64_t n_out = raw_ns;
+        for (const auto& t : pipeline_)
+            n_out = t->apply(trace_buf.data(), n_out, 0);
+
+        for (int64_t s = 0; s < n_out; s++) {
+            double v = static_cast<double>(trace_buf[s]);
+            sum[s]  += v;
+            sum2[s] += v * v;
+        }
+        N++;
+    }
+    prog.setValue(count);
+
+    if (N < 2) {
+        QMessageBox::critical(this, "Static SNR", "Need at least 2 traces.");
+        return;
+    }
+
+    // --- Compute |μ / σ| per sample ---
+    std::vector<float> snr(static_cast<size_t>(effective_samples));
+    double nd = static_cast<double>(N);
+    for (int64_t s = 0; s < effective_samples; s++) {
+        double mean = sum[s] / nd;
+        double var  = (sum2[s] - sum[s] * mean) / (nd - 1.0);
+        if (var < 0.0) var = 0.0;
+        double sigma = std::sqrt(var);
+        snr[s] = (sigma > 0.0) ? static_cast<float>(std::abs(mean) / sigma) : 0.0f;
+    }
+
+    // --- Result window ---
+    auto snr_ptr = std::make_shared<std::vector<float>>(std::move(snr));
+
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle(QString("Static SNR |μ/σ| — %1 traces").arg(N));
+    dlg->resize(1100, 520);
+
+    auto* pw = new PlotWidget(dlg);
+    pw->addTrace(snr_ptr, QColor("#4fc3f7"), "|μ/σ|");
+    pw->setTraceFilled(0, true);
+    pw->setAxisLabels("Sample Index", "|μ/σ|");
+    pw->setThresholds(false, 0.0, 0.0);
+    pw->resetView();
+
+    auto* btn_exp_npy = new QPushButton("Export .npy…");
+    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, snr_ptr]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export static SNR as NumPy",
+                                                    {}, "NumPy files (*.npy)");
+        if (path.isEmpty()) return;
+        QString e;
+        if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
+            QMessageBox::critical(dlg, "Export failed", e);
+        else
+            QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+    });
+
+    auto* btn_exp_pdf = new QPushButton("Export PDF…");
+    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export static SNR as PDF",
+                                                    {}, "PDF files (*.pdf)");
+        if (path.isEmpty()) return;
+        QPixmap px = pw->grab();
+        QPdfWriter writer(path);
+        writer.setResolution(150);
+        writer.setPageSize(QPageSize(QPageSize::A4));
+        writer.setPageOrientation(QPageLayout::Landscape);
+        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
+        QPainter painter(&writer);
+        if (painter.isActive())
+            painter.drawPixmap(painter.viewport(), px);
+    });
+
+    auto* hl = new QHBoxLayout;
+    hl->addWidget(btn_exp_npy);
+    hl->addWidget(btn_exp_pdf);
+    hl->addStretch();
+
+    auto* vl = new QVBoxLayout(dlg);
+    vl->addWidget(pw, 1);
+    vl->addLayout(hl);
+
+    dlg->show();
+}
+
+// ---------------------------------------------------------------------------
+// Dataset export
+// ---------------------------------------------------------------------------
+
+struct LabelDef {
+    enum Type { RawValue, HammingWeight, Bit, BitRange };
+
+    QString name;
+    Type    type     = RawValue;
+    int     byte_off = 0;
+    int     byte_cnt = 1;    // bytes to read (RawValue, HW, BitRange)
+    bool    big_end  = false; // endianness (RawValue, BitRange)
+    int     bit_lo   = 0;    // Bit: bit index (0=LSB); BitRange: low bit (inclusive)
+    int     bit_hi   = 0;    // BitRange: high bit (inclusive)
+
+    static size_t bitsToElemSize(int bits) {
+        if (bits <=  8) return 1;
+        if (bits <= 16) return 2;
+        if (bits <= 32) return 4;
+        return 8;
+    }
+    static std::string bitsToNpyDtype(int bits) {
+        if (bits <=  8) return "|u1";
+        if (bits <= 16) return "<u2";
+        if (bits <= 32) return "<u4";
+        return "<u8";
+    }
+
+    std::string dtype() const {
+        switch (type) {
+            case HammingWeight: case Bit: return "|u1";
+            case BitRange:  return bitsToNpyDtype(bit_hi - bit_lo + 1);
+            case RawValue:
+                switch (byte_cnt) {
+                    case 1: return "|u1"; case 2: return "<u2";
+                    case 3: case 4: return "<u4"; default: return "<u8";
+                }
+        }
+        return "|u1";
+    }
+    size_t elem_size() const {
+        switch (type) {
+            case HammingWeight: case Bit: return 1;
+            case BitRange:  return bitsToElemSize(bit_hi - bit_lo + 1);
+            case RawValue:
+                switch (byte_cnt) {
+                    case 1: return 1; case 2: return 2;
+                    case 3: case 4: return 4; default: return 8;
+                }
+        }
+        return 1;
+    }
+
+    uint64_t readInt(const std::vector<uint8_t>& data, int off, int cnt, bool be) const {
+        int avail = static_cast<int>(data.size());
+        int n = std::min(cnt, avail - off);
+        if (n <= 0) return 0;
+        uint64_t val = 0;
+        if (be)
+            for (int i = 0; i < n; i++)      val = (val << 8) | data[off + i];
+        else
+            for (int i = n - 1; i >= 0; i--) val = (val << 8) | data[off + i];
+        return val;
+    }
+
+    uint64_t compute(const std::vector<uint8_t>& data) const {
+        int avail = static_cast<int>(data.size());
+        if (byte_off >= avail) return 0;
+        switch (type) {
+            case Bit:
+                return (data[byte_off] >> bit_lo) & 1u;
+            case HammingWeight: {
+                int cnt = std::min(byte_cnt, avail - byte_off);
+                uint32_t hw = 0;
+                for (int i = 0; i < cnt; i++)
+                    hw += static_cast<uint32_t>(__builtin_popcount(data[byte_off + i]));
+                return hw;
+            }
+            case BitRange: {
+                uint64_t val  = readInt(data, byte_off, byte_cnt, big_end);
+                int      width = bit_hi - bit_lo + 1;
+                uint64_t mask  = (width >= 64) ? ~0ULL : ((1ULL << width) - 1);
+                return (val >> bit_lo) & mask;
+            }
+            case RawValue:
+                return readInt(data, byte_off, byte_cnt, big_end);
+        }
+        return 0;
+    }
+
+    QString summary() const {
+        switch (type) {
+            case RawValue:
+                return QString("[raw %1B %2] %3  @  byte %4")
+                    .arg(byte_cnt).arg(big_end?"BE":"LE").arg(name).arg(byte_off);
+            case HammingWeight:
+                return QString("[HW %1B] %2  @  byte %3").arg(byte_cnt).arg(name).arg(byte_off);
+            case Bit:
+                return QString("[bit%1] %2  @  byte %3").arg(bit_lo).arg(name).arg(byte_off);
+            case BitRange:
+                return QString("[bits %1:%2, %3B %4] %5  @  byte %6")
+                    .arg(bit_hi).arg(bit_lo).arg(byte_cnt)
+                    .arg(big_end?"BE":"LE").arg(name).arg(byte_off);
+        }
+        return name;
+    }
+};
+
+static bool runAddLabelDialog(QWidget* parent, int max_byte, LabelDef& def)
+{
+    QDialog d(parent);
+    d.setWindowTitle("Define Label");
+    d.setMinimumWidth(340);
+    auto* fl = new QFormLayout(&d);
+
+    auto* le_name  = new QLineEdit(def.name);
+    auto* cmb_type = new QComboBox;
+    cmb_type->addItems({
+        "Raw integer  (N bytes, LE/BE)",
+        "Hamming weight  (popcount of N bytes)",
+        "Single bit  (0 or 1)",
+        "Bit range  [hi:lo] extracted from N bytes",
+    });
+    cmb_type->setCurrentIndex(static_cast<int>(def.type));
+
+    auto* sp_off = new QSpinBox;
+    sp_off->setRange(0, std::max(0, max_byte - 1));
+    sp_off->setValue(def.byte_off);
+
+    // byte count (Raw / HW / BitRange)
+    auto* lbl_cnt = new QLabel("Byte count:");
+    auto* sp_cnt  = new QSpinBox; sp_cnt->setRange(1, 8); sp_cnt->setValue(std::max(1, def.byte_cnt));
+
+    // endianness (Raw / BitRange)
+    auto* lbl_end = new QLabel("Endianness:");
+    auto* cmb_end = new QComboBox; cmb_end->addItems({"little-endian", "big-endian"});
+    cmb_end->setCurrentIndex(def.big_end ? 1 : 0);
+
+    // Single bit
+    auto* lbl_bit = new QLabel("Bit index (0=LSB):");
+    auto* sp_bit  = new QSpinBox; sp_bit->setRange(0, 7); sp_bit->setValue(def.bit_lo);
+
+    // Bit range lo/hi
+    auto* lbl_blo = new QLabel("Low bit (0=LSB, inclusive):");
+    auto* sp_blo  = new QSpinBox; sp_blo->setRange(0, 63); sp_blo->setValue(def.bit_lo);
+    auto* lbl_bhi = new QLabel("High bit (inclusive):");
+    auto* sp_bhi  = new QSpinBox; sp_bhi->setRange(0, 63); sp_bhi->setValue(std::max(def.bit_hi, def.bit_lo));
+    auto* lbl_bw  = new QLabel;  // width preview
+
+    auto update_bw = [=]() {
+        int w = sp_bhi->value() - sp_blo->value() + 1;
+        if (w > 0)
+            lbl_bw->setText(QString("→ %1-bit value, 0–%2").arg(w).arg((1LL << std::min(w, 30)) - 1));
+        else
+            lbl_bw->setText("<font color='red'>hi must be ≥ lo</font>");
+        lbl_bw->setTextFormat(Qt::RichText);
+    };
+    update_bw();
+    QObject::connect(sp_blo, QOverload<int>::of(&QSpinBox::valueChanged), &d, [=](int){ update_bw(); });
+    QObject::connect(sp_bhi, QOverload<int>::of(&QSpinBox::valueChanged), &d, [=](int){ update_bw(); });
+
+    fl->addRow("Label name:", le_name);
+    fl->addRow("Type:", cmb_type);
+    fl->addRow("Byte offset:", sp_off);
+    fl->addRow(lbl_cnt, sp_cnt);
+    fl->addRow(lbl_end, cmb_end);
+    fl->addRow(lbl_bit, sp_bit);
+    fl->addRow(lbl_blo, sp_blo);
+    fl->addRow(lbl_bhi, sp_bhi);
+    fl->addRow(new QLabel(""), lbl_bw);
+
+    auto set_vis = [](QWidget* a, QWidget* b, bool v){ a->setVisible(v); b->setVisible(v); };
+    auto update_vis = [&](int idx) {
+        bool is_raw   = (idx == int(LabelDef::RawValue));
+        bool is_hw    = (idx == int(LabelDef::HammingWeight));
+        bool is_bit   = (idx == int(LabelDef::Bit));
+        bool is_range = (idx == int(LabelDef::BitRange));
+        set_vis(lbl_cnt, sp_cnt,  is_raw || is_hw || is_range);
+        set_vis(lbl_end, cmb_end, is_raw || is_range);
+        set_vis(lbl_bit, sp_bit,  is_bit);
+        set_vis(lbl_blo, sp_blo,  is_range);
+        set_vis(lbl_bhi, sp_bhi,  is_range);
+        lbl_bw->setVisible(is_range);
+        d.adjustSize();
+    };
+    update_vis(cmb_type->currentIndex());
+    QObject::connect(cmb_type, QOverload<int>::of(&QComboBox::currentIndexChanged), &d, update_vis);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    QObject::connect(bb, &QDialogButtonBox::accepted, &d, [&]() {
+        if (le_name->text().trimmed().isEmpty()) {
+            QMessageBox::warning(&d, "Label", "Please enter a label name."); return;
+        }
+        if (cmb_type->currentIndex() == int(LabelDef::BitRange) &&
+                sp_bhi->value() < sp_blo->value()) {
+            QMessageBox::warning(&d, "Label", "High bit must be ≥ low bit."); return;
+        }
+        d.accept();
+    });
+    QObject::connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    fl->addRow(bb);
+    d.adjustSize();
+
+    if (d.exec() != QDialog::Accepted) return false;
+
+    def.name     = le_name->text().trimmed();
+    def.type     = static_cast<LabelDef::Type>(cmb_type->currentIndex());
+    def.byte_off = sp_off->value();
+    def.byte_cnt = sp_cnt->value();
+    def.big_end  = (cmb_end->currentIndex() == 1);
+    def.bit_lo   = (def.type == LabelDef::Bit) ? sp_bit->value() : sp_blo->value();
+    def.bit_hi   = sp_bhi->value();
+    return true;
+}
+
+void MainWindow::onExportDataset() {
+    if (!trs_file_) {
+        QMessageBox::information(this, "Export Dataset", "No file loaded.");
+        return;
+    }
+    const TrsHeader& h = trs_file_->header();
+
+    // ── Configuration dialog ──────────────────────────────────────────────
+    QDialog cfg(this);
+    cfg.setWindowTitle("Export Dataset — configuration");
+    auto* vl_cfg = new QVBoxLayout(&cfg);
+
+    // Range
+    auto* grp_range  = new QGroupBox("Range");
+    auto* fl_range   = new QFormLayout(grp_range);
+    auto* sp_first   = new QSpinBox; sp_first->setRange(0, std::max(0, h.num_traces-1)); sp_first->setValue(0);
+    auto* sp_count   = new QSpinBox; sp_count->setRange(1, h.num_traces);                sp_count->setValue(h.num_traces);
+    auto* sp_s_first = new QSpinBox; sp_s_first->setRange(0, std::max(0,(int)h.num_samples-1)); sp_s_first->setValue(0);
+    auto* sp_s_count = new QSpinBox; sp_s_count->setRange(0, (int)h.num_samples);        sp_s_count->setValue(0);
+    sp_s_count->setSpecialValueText("All");
+    fl_range->addRow("First trace:",          sp_first);
+    fl_range->addRow("Trace count:",          sp_count);
+    fl_range->addRow("First sample:",         sp_s_first);
+    fl_range->addRow("Sample count (0=all):", sp_s_count);
+    vl_cfg->addWidget(grp_range);
+
+    // Label definitions
+    auto* grp_lbl = new QGroupBox("Labels  (each becomes a named array in the NPZ)");
+    auto* vl_lbl  = new QVBoxLayout(grp_lbl);
+    auto* lw      = new QListWidget;
+    lw->setToolTip("dtype is chosen automatically:\n"
+                   "  1 byte  →  uint8\n  2 bytes →  uint16\n"
+                   "  3-4 bytes → uint32\n  5-8 bytes → uint64\n"
+                   "  HW / Bit  → uint8");
+
+    QVector<LabelDef> labels;
+
+    // Pre-populate from the file's param_map
+    for (const auto& [pname, param] : h.param_map) {
+        LabelDef d;
+        d.name     = QString::fromStdString(pname);
+        d.type     = LabelDef::RawValue;
+        d.byte_off = param.offset;
+        d.byte_cnt = std::min<int>(param.length, 8);
+        labels.append(d);
+        new QListWidgetItem(d.summary(), lw);
+    }
+
+    auto* hl_btns    = new QHBoxLayout;
+    auto* btn_add    = new QPushButton("Add label…");
+    auto* btn_edit   = new QPushButton("Edit…");
+    auto* btn_remove = new QPushButton("Remove");
+    btn_edit->setEnabled(false);
+    btn_remove->setEnabled(false);
+    hl_btns->addWidget(btn_add);
+    hl_btns->addWidget(btn_edit);
+    hl_btns->addWidget(btn_remove);
+    hl_btns->addStretch();
+    vl_lbl->addWidget(lw);
+    vl_lbl->addLayout(hl_btns);
+    vl_cfg->addWidget(grp_lbl);
+
+    connect(lw, &QListWidget::currentRowChanged, &cfg, [&](int row) {
+        btn_edit->setEnabled(row >= 0);
+        btn_remove->setEnabled(row >= 0);
+    });
+    connect(btn_add, &QPushButton::clicked, &cfg, [&]() {
+        LabelDef def;
+        if (!runAddLabelDialog(&cfg, h.data_length, def)) return;
+        labels.append(def);
+        new QListWidgetItem(def.summary(), lw);
+    });
+    connect(btn_edit, &QPushButton::clicked, &cfg, [&]() {
+        int row = lw->currentRow();
+        if (row < 0 || row >= labels.size()) return;
+        LabelDef def = labels[row];
+        if (!runAddLabelDialog(&cfg, h.data_length, def)) return;
+        labels[row] = def;
+        lw->item(row)->setText(def.summary());
+    });
+    connect(btn_remove, &QPushButton::clicked, &cfg, [&]() {
+        int row = lw->currentRow();
+        if (row < 0 || row >= labels.size()) return;
+        labels.removeAt(row);
+        delete lw->takeItem(row);
+    });
+
+    auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, [&]() {
+        if (labels.isEmpty()) {
+            if (QMessageBox::question(&cfg, "No labels",
+                    "No labels defined. Export traces only?",
+                    QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+                return;
+        }
+        cfg.accept();
+    });
+    connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    vl_cfg->addWidget(cfg_bb);
+
+    if (cfg.exec() != QDialog::Accepted) return;
+
+    // ── Resolve parameters ────────────────────────────────────────────────
+    const int32_t first   = sp_first->value();
+    const int32_t count   = sp_count->value();
+    const int64_t s_first = sp_s_first->value();
+    const int64_t s_count = sp_s_count->value();
+    const int64_t raw_ns  = (s_count == 0)
+        ? (h.num_samples - s_first)
+        : std::min<int64_t>(s_count, h.num_samples - s_first);
+
+    int64_t eff_ns = raw_ns;
+    for (const auto& t : pipeline_)
+        eff_ns = t->transformedCount(eff_ns);
+
+    // Memory estimate
+    int64_t mem_est = static_cast<int64_t>(count) * eff_ns * sizeof(float);
+    if (mem_est > 4LL * 1024 * 1024 * 1024) {
+        if (QMessageBox::warning(this, "Memory warning",
+                QString("Trace matrix will require ~%1 GB.\nContinue?")
+                    .arg(double(mem_est)/(1024.0*1024*1024), 0,'f',1),
+                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+            return;
+    }
+
+    // ── Pick output path ──────────────────────────────────────────────────
+    QString out_path = QFileDialog::getSaveFileName(
+        this, "Export Dataset", {}, "NumPy archive (*.npz)");
+    if (out_path.isEmpty()) return;
+
+    // ── Accumulate ────────────────────────────────────────────────────────
+    std::vector<float> traces_flat(static_cast<size_t>(count) * static_cast<size_t>(eff_ns), 0.0f);
+    std::vector<std::vector<uint64_t>> label_vals(
+        labels.size(), std::vector<uint64_t>(static_cast<size_t>(count), 0));
+
+    QProgressDialog prog("Exporting traces…", "Cancel", 0, count, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(400);
+
+    std::vector<float> trace_buf(static_cast<size_t>(raw_ns));
+    int32_t written = 0;
+
+    for (int32_t ti = 0; ti < count; ti++) {
+        if (prog.wasCanceled()) break;
+        prog.setValue(ti);
+        QApplication::processEvents();
+
+        int32_t src_idx = first + ti;
+
+        // Labels
+        if (!labels.isEmpty()) {
+            auto data_bytes = trs_file_->readData(src_idx);
+            for (int li = 0; li < labels.size(); li++)
+                label_vals[li][ti] = labels[li].compute(data_bytes);
+        }
+
+        // Samples
+        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+        if (s_first < h.num_samples && s_first + raw_ns > 0) {
+            int64_t src_start = std::max<int64_t>(0, s_first);
+            int64_t src_end   = std::min<int64_t>(h.num_samples, s_first + raw_ns);
+            int64_t dst_off   = src_start - s_first;
+            trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+                                   trace_buf.data() + dst_off);
+        }
+        for (const auto& t : pipeline_) t->reset();
+        int64_t n_out = raw_ns;
+        for (const auto& t : pipeline_)
+            n_out = t->apply(trace_buf.data(), n_out, 0);
+
+        float* row = traces_flat.data() + static_cast<size_t>(ti) * static_cast<size_t>(eff_ns);
+        std::copy(trace_buf.begin(), trace_buf.begin() + n_out, row);
+        written++;
+    }
+    prog.setValue(count);
+    if (written == 0) return;
+
+    // ── Build NPZ ─────────────────────────────────────────────────────────
+    std::vector<std::pair<std::string, std::vector<uint8_t>>> entries;
+
+    entries.push_back({"traces.npy",
+        buildNpyBytes("<f4", written, static_cast<int32_t>(eff_ns),
+                      traces_flat.data(),
+                      static_cast<size_t>(written) * static_cast<size_t>(eff_ns) * sizeof(float))});
+
+    for (int li = 0; li < labels.size(); li++) {
+        const LabelDef& ld = labels[li];
+        size_t es = ld.elem_size();
+        std::vector<uint8_t> buf(static_cast<size_t>(written) * es);
+        for (int32_t ti = 0; ti < written; ti++) {
+            uint64_t v = label_vals[li][ti];
+            std::memcpy(buf.data() + static_cast<size_t>(ti) * es, &v, es);
+        }
+        entries.push_back({ld.name.toStdString() + ".npy",
+            buildNpy1DBytes(ld.dtype(), buf.data(), written, es)});
+    }
+
+    QString err;
+    if (!saveNpz(out_path, entries, err))
+        QMessageBox::critical(this, "Export failed", err);
+    else
+        QMessageBox::information(this, "Export complete",
+            QString("Saved %1 traces × %2 samples, %3 label(s)\n→ %4")
+                .arg(written).arg(eff_ns).arg(labels.size()).arg(out_path));
 }

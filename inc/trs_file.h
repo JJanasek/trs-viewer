@@ -58,6 +58,7 @@ public:
     bool isOpen() const { return mmap_ptr_ != nullptr || !mem_samples_.empty(); }
     const TrsHeader& header() const { return header_; }
     const std::string& path() const { return path_; }
+    void setParamMap(const std::map<std::string, TrsTraceParam>& pm) { header_.param_map = pm; }
 
     // Read `count` samples starting at `sample_offset` from trace `trace_idx`.
     // Converts to float32 regardless of on-disk format.
