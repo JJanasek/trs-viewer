@@ -220,6 +220,12 @@ private:
     float last_ymin_ = -1.0f;
     float last_ymax_ =  1.0f;
 
+    // Sticky auto-fit range: expands eagerly, never auto-shrinks.
+    // Prevents flicker when panning causes the visible min/max to fluctuate.
+    // Reset to "unset" (±inf) by resetYRange() and clearTraces().
+    float sticky_ymin_ =  std::numeric_limits<float>::infinity();
+    float sticky_ymax_ = -std::numeric_limits<float>::infinity();
+
     // Y-axis zoom: multiplier on the auto-fit half-range.
     // 1.0 = auto-fit, >1 = zoomed out (more space), <1 = zoomed in.
     // Ctrl+scroll adjusts this; resetView() restores it to 1.0.

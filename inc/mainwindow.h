@@ -49,6 +49,9 @@ private slots:
     void onExportNpy();
     void onExportNpz();
     void onRunCpa();
+    void onRunSNR();
+    void onRunStaticSNR();
+    void onExportDataset();
     void onDragAlignChanged();
 
 private:

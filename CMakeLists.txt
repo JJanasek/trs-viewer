@@ -21,6 +21,7 @@ endif()
 # OpenMP
 # ---------------------------------------------------------------------------
 find_package(OpenMP REQUIRED)
+find_package(ZLIB REQUIRED)
 message(STATUS "OpenMP version: ${OpenMP_CXX_VERSION}")
 
 # ---------------------------------------------------------------------------
@@ -67,10 +68,12 @@ set(SOURCES
     inc/heatmap_widget.h
     src/leakage_model.cpp
     src/cpa.cpp
+    src/snr.cpp
     src/leakage_model_dialog.cpp
     inc/leakage_model.h
     inc/leakage_model_dialog.h
     inc/cpa.h
+    inc/snr.h
 )
 
 add_executable(trs-viewer ${SOURCES})
@@ -81,6 +84,7 @@ target_link_libraries(trs-viewer PRIVATE
     Eigen3::Eigen
     Python3::Python
     Python3::NumPy
+    ZLIB::ZLIB
 )
 target_include_directories(trs-viewer PRIVATE src inc ${Python3_NumPy_INCLUDE_DIRS})
 
