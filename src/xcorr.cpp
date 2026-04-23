@@ -117,7 +117,7 @@ bool computeXCorr(
     // loadTrace: read raw samples for trace ti, apply pipeline, sub-sample
     //            at xcorr stride → M floats written to out_m[0..M-1].
     // -----------------------------------------------------------------------
-    std::vector<float> raw_full(static_cast<size_t>(num_samples));
+    std::vector<float> raw_full(static_cast<size_t>(std::max(num_samples, effective_n)));
     auto loadTrace = [&](int ti, float* out_m) {
         int32_t src   = first_trace + ti;
         int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
@@ -378,7 +378,7 @@ bool computeXCorrNaive(
     }
 
     // Reuse the same loadTrace lambda pattern (local raw buffer)
-    std::vector<float> raw_full(static_cast<size_t>(num_samples));
+    std::vector<float> raw_full(static_cast<size_t>(std::max(num_samples, effective_n)));
     std::vector<float> raw(static_cast<size_t>(M));
 
     auto loadTrace = [&](int ti, float* out_m) {
@@ -570,9 +570,9 @@ bool computeTwoWindowCorr(
         }
     }
 
-    // Per-trace work buffers
-    std::vector<float> work_r(static_cast<size_t>(ref_num_samples));
-    std::vector<float> work_s(static_cast<size_t>(search_num_samples));
+    // Per-trace work buffers (sized to max of raw and pipeline-expanded counts)
+    std::vector<float> work_r(static_cast<size_t>(std::max(ref_num_samples, ref_eff)));
+    std::vector<float> work_s(static_cast<size_t>(std::max(search_num_samples, search_eff)));
     std::vector<float> raw_r(static_cast<size_t>(M_ref));
     std::vector<float> raw_s(static_cast<size_t>(M_search));
 

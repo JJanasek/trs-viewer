@@ -127,7 +127,7 @@ bool computeCpa(
     std::vector<double> sum_T(NS, 0.0), sum_T2(NS, 0.0);
 
     std::vector<float>  raw_buf(static_cast<size_t>(raw_ns));
-    std::vector<float>  proc_buf(static_cast<size_t>(raw_ns) + 64);
+    std::vector<float>  proc_buf(static_cast<size_t>(std::max(raw_ns, eff_ns)) + 64);
 
     // -----------------------------------------------------------------------
     // Step 4: Process hypotheses in chunks.
