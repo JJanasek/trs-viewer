@@ -95,3 +95,13 @@ target_compile_options(trs-viewer PRIVATE
     -Wno-unused-parameter
     -march=native
 )
+
+# ---------------------------------------------------------------------------
+# Optional test suite (non-GUI; requires GoogleTest fetched at configure time)
+# Usage:  cmake -DBUILD_TESTS=ON ..  then  ctest --output-on-failure
+# ---------------------------------------------------------------------------
+option(BUILD_TESTS "Build the unit test suite" OFF)
+if(BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
