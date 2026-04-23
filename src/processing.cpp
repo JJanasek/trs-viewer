@@ -194,3 +194,117 @@ int64_t StrideResampleTransform::apply(float* buf, int64_t count, int64_t) {
     }
     return out;
 }
+
+// ---------------------------------------------------------------------------
+// Shared helper: fill a vector with window coefficients.
+// ---------------------------------------------------------------------------
+namespace {
+enum class WinType { Rectangular, Hann, Hamming, Blackman };
+
+static void buildWindowCoeffs(std::vector<float>& w, int N, WinType type) {
+    w.resize(static_cast<size_t>(N));
+    if (type == WinType::Rectangular) {
+        std::fill(w.begin(), w.end(), 1.0f);
+        return;
+    }
+    const double N1 = static_cast<double>(N - 1);
+    for (int i = 0; i < N; ++i) {
+        double phi = 2.0 * M_PI * i / N1;
+        double v   = 1.0;
+        switch (type) {
+            case WinType::Hann:     v = 0.5  * (1.0 - std::cos(phi)); break;
+            case WinType::Hamming:  v = 0.54 - 0.46 * std::cos(phi);  break;
+            case WinType::Blackman: v = 0.42 - 0.5  * std::cos(phi)
+                                          + 0.08 * std::cos(2.0 * phi); break;
+            default: break;
+        }
+        w[i] = static_cast<float>(v);
+    }
+}
+} // namespace
+
+// ---------------------------------------------------------------------------
+// FFTMagnitudeTransform
+// ---------------------------------------------------------------------------
+
+std::string FFTMagnitudeTransform::name() const {
+    const char* wnames[] = { "Rectangular", "Hann", "Hamming", "Blackman" };
+    return std::string("FFT Magnitude (") + wnames[static_cast<int>(window_)] + ")";
+}
+
+int64_t FFTMagnitudeTransform::apply(float* buf, int64_t count, int64_t) {
+    if (count < 2) return count;
+
+    const int64_t N     = count;
+    const int64_t out_n = N / 2 + 1;
+
+    std::vector<float> win;
+    buildWindowCoeffs(win, static_cast<int>(N), static_cast<WinType>(static_cast<int>(window_)));
+
+    std::vector<float> in_vec(N);
+    for (int64_t i = 0; i < N; ++i) in_vec[i] = buf[i] * win[i];
+
+    std::vector<std::complex<float>> freq_vec;
+    Eigen::FFT<float> fft;
+    fft.SetFlag(Eigen::FFT<float>::HalfSpectrum);
+    fft.fwd(freq_vec, in_vec);
+
+    const float norm = 1.0f / static_cast<float>(N);
+    for (int64_t k = 0; k < out_n; ++k) {
+        float mag = std::abs(freq_vec[k]) * norm;
+        if (k > 0 && k < out_n - 1) mag *= 2.0f;
+        buf[k] = mag;
+    }
+    return out_n;
+}
+
+// ---------------------------------------------------------------------------
+// STFTMagnitudeTransform
+// ---------------------------------------------------------------------------
+
+std::string STFTMagnitudeTransform::name() const {
+    const char* wnames[] = { "Rectangular", "Hann", "Hamming", "Blackman" };
+    return std::string("STFT Magnitude (W=") + std::to_string(window_size_)
+         + ", H=" + std::to_string(hop_size_)
+         + ", " + wnames[static_cast<int>(window_)] + ")";
+}
+
+int64_t STFTMagnitudeTransform::apply(float* buf, int64_t count, int64_t) {
+    if (count < window_size_) return 0;
+
+    const int64_t W           = window_size_;
+    const int64_t bins        = W / 2 + 1;
+    const int64_t num_windows = (count - W) / hop_size_ + 1;
+    const int64_t out_n       = num_windows * bins;
+
+    std::vector<float> win;
+    buildWindowCoeffs(win, static_cast<int>(W), static_cast<WinType>(static_cast<int>(window_)));
+
+    // Write results to a separate buffer to avoid aliasing the input.
+    std::vector<float> out(static_cast<size_t>(out_n));
+
+    Eigen::FFT<float> fft;
+    fft.SetFlag(Eigen::FFT<float>::HalfSpectrum);
+    std::vector<float>               in_vec(static_cast<size_t>(W));
+    std::vector<std::complex<float>> freq_vec;
+
+    const float norm = 1.0f / static_cast<float>(W);
+
+    for (int64_t wi = 0; wi < num_windows; ++wi) {
+        const int64_t pos = wi * hop_size_;
+        for (int64_t i = 0; i < W; ++i)
+            in_vec[i] = buf[pos + i] * win[i];
+
+        fft.fwd(freq_vec, in_vec);
+
+        float* dst = out.data() + wi * bins;
+        for (int64_t k = 0; k < bins; ++k) {
+            float mag = std::abs(freq_vec[k]) * norm;
+            if (k > 0 && k < bins - 1) mag *= 2.0f;
+            dst[k] = mag;
+        }
+    }
+
+    std::copy(out.begin(), out.end(), buf);
+    return out_n;
+}
