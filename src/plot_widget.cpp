@@ -216,6 +216,12 @@ void PlotWidget::setAxisLabels(const QString& x_label, const QString& y_label) {
     update();
 }
 
+void PlotWidget::setXScale(double scale, double offset) {
+    x_label_scale_  = (scale != 0.0) ? scale : 1.0;
+    x_label_offset_ = offset;
+    update();
+}
+
 void PlotWidget::addTrace(TrsFile* file, int32_t trace_idx,
                            QColor color, const QString& label)
 {
@@ -445,7 +451,9 @@ void PlotWidget::buildTraceCache(TraceEntry& te, int W)
     if (expected_out <= W) {
         te.cache.pix_min.clear();
         te.cache.pix_max.clear();
-        te.cache.samples.resize(static_cast<size_t>(view_len));
+        // Size the buffer for both the raw read AND the post-pipeline output —
+        // expanding transforms (e.g. STFT) can produce more samples than view_len.
+        te.cache.samples.resize(static_cast<size_t>(std::max(view_len, expected_out)));
         int64_t raw_read  = readTraceSamples(te, view_start_, view_len,
                                              te.cache.samples.data());
         if (raw_read <= 0) { te.cache.valid = false; return; }
@@ -471,14 +479,25 @@ void PlotWidget::buildTraceCache(TraceEntry& te, int W)
     te.cache.pix_min.assign(static_cast<size_t>(W),  std::numeric_limits<float>::max());
     te.cache.pix_max.assign(static_cast<size_t>(W),  std::numeric_limits<float>::lowest());
 
+    // Pre-compute the maximum buffer size needed for any chunk after transforms.
+    // Expanding transforms (e.g. STFT) can produce more output than input.
+    int64_t max_chunk_out = RENDER_CHUNK;
+    for (const auto& t : te.transforms)
+        max_chunk_out = t->transformedCount(max_chunk_out);
+    const size_t buf_capacity = static_cast<size_t>(std::max(RENDER_CHUNK, max_chunk_out));
+
     std::vector<float> buf;
-    buf.reserve(RENDER_CHUNK);
+    buf.reserve(buf_capacity);
 
     int64_t chunk_start = view_start_;
     while (chunk_start < view_end_) {
         int64_t chunk_end = std::min(chunk_start + RENDER_CHUNK, view_end_);
         int64_t chunk_len = chunk_end - chunk_start;
-        buf.resize(static_cast<size_t>(chunk_len));
+        // Size for both input read and worst-case transformed output.
+        int64_t chunk_out = chunk_len;
+        for (const auto& t : te.transforms)
+            chunk_out = t->transformedCount(chunk_out);
+        buf.resize(static_cast<size_t>(std::max(chunk_len, chunk_out)));
         int64_t raw_read  = readTraceSamples(te, chunk_start, chunk_len, buf.data());
         if (raw_read <= 0) break;
         int64_t out_count = raw_read;
@@ -830,10 +849,23 @@ void PlotWidget::paintEvent(QPaintEvent*) {
         int     x = pr.left() + pr.width() * i / 6;
         p.drawLine(x, pr.bottom(), x, pr.bottom() + 4);
 
+        double sv = static_cast<double>(s) * x_label_scale_ + x_label_offset_;
         QString lbl;
-        if      (s >= 1'000'000) lbl = QString("%1M").arg(s / 1'000'000.0, 0, 'f', 2);
-        else if (s >= 1'000)     lbl = QString("%1k").arg(s / 1'000.0,     0, 'f', 1);
-        else                     lbl = QString::number(s);
+        if (x_label_scale_ == 1.0 && x_label_offset_ == 0.0) {
+            // Raw sample/bin index — use integer formatting with k/M suffixes.
+            if      (s >= 1'000'000) lbl = QString("%1M").arg(s / 1'000'000.0, 0, 'f', 2);
+            else if (s >= 1'000)     lbl = QString("%1k").arg(s / 1'000.0,     0, 'f', 1);
+            else                     lbl = QString::number(s);
+        } else {
+            // Scaled axis (e.g. Hz) — use SI prefixes.
+            double av = std::abs(sv);
+            if      (av >= 1e9)  lbl = QString("%1G").arg(sv / 1e9,  0, 'f', 2);
+            else if (av >= 1e6)  lbl = QString("%1M").arg(sv / 1e6,  0, 'f', 2);
+            else if (av >= 1e3)  lbl = QString("%1k").arg(sv / 1e3,  0, 'f', 1);
+            else if (av >= 1.0)  lbl = QString("%1").arg(sv,          0, 'f', 1);
+            else if (av >= 1e-3) lbl = QString("%1m").arg(sv * 1e3,  0, 'f', 1);
+            else                 lbl = QString("%1µ").arg(sv * 1e6,  0, 'f', 1);
+        }
         p.drawText(x - 28, pr.bottom() + 6, 56, 20, Qt::AlignCenter, lbl);
     }
 

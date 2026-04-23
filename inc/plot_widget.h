@@ -118,6 +118,11 @@ public:
     // Axis labels drawn outside the plot area (empty = none).
     void setAxisLabels(const QString& x_label, const QString& y_label);
 
+    // Scale applied to x-axis tick labels: displayed_value = bin_index * scale + offset.
+    // Default scale=1, offset=0 (shows raw bin/sample indices).
+    // Use e.g. scale=df (Hz/bin) to display frequency in Hz.
+    void setXScale(double scale, double offset = 0.0);
+
     // View accessors
     int64_t viewStart()     const { return view_start_; }
     int64_t viewEnd()       const { return view_end_;   }
@@ -241,6 +246,10 @@ private:
     QString axis_label_x_;
     QString axis_label_y_;
     float   trace_width_ = 1.5f;
+
+    // X-axis label scale: tick_label = bin_index * x_label_scale_ + x_label_offset_
+    double  x_label_scale_  = 1.0;
+    double  x_label_offset_ = 0.0;
 
     // Plot area margins (pixels)
     static constexpr int ML       = 65;
