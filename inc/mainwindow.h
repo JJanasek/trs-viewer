@@ -12,9 +12,29 @@
 #include <QMainWindow>
 #include <QPushButton>
 #include <QSpinBox>
+#include <QTabBar>
 
 #include <memory>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// Per-file state bundle.  MainWindow keeps a vector of these.
+// ---------------------------------------------------------------------------
+struct Dataset {
+    std::unique_ptr<TrsFile>                  file;
+    std::vector<std::shared_ptr<ITransform>>  pipeline;
+    QString                                   display_name;
+
+    // Alignment state (populated by "Apply to Main View" or drag-align)
+    std::vector<int32_t> align_shifts;
+    int32_t              align_first_trace  = 0;
+    int64_t              align_first_sample = 0;
+    int64_t              align_n_samples    = 0;
+
+    // Plot state
+    int32_t              plot_first_trace   = 0;
+    bool                 plot_file_backed   = false;
+};
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -26,6 +46,8 @@ public:
 
 private slots:
     void onOpenFile();
+    void onCloseDataset();
+    void onSwitchDataset(int idx);
     void onApplyTraces();
     void onAddTransform();
     void onRemoveTransform();
@@ -62,24 +84,17 @@ private:
     void rebuildTransformList();
     std::shared_ptr<ITransform> createTransform(int combo_index);
 
-    // Data
-    std::unique_ptr<TrsFile> trs_file_;
-    std::vector<std::shared_ptr<ITransform>> pipeline_;
+    // Multi-dataset state
+    std::vector<Dataset> datasets_;
+    int                  active_idx_ = -1;
 
-    // Last-applied alignment state — populated by "Apply to Main View" or
-    // by drag-align on file-backed traces.  Consumed by CPA.
-    std::vector<int32_t> align_shifts_;        // raw per-trace shifts
-    int32_t              align_first_trace_  = 0;
-    int64_t              align_first_sample_ = 0; // crop offset (0 for drag-align)
-    int64_t              align_n_samples_    = 0; // 0 = nothing stored
-
-    // Track whether the main plot holds file-backed traces (true) or
-    // in-memory baked-in traces from "Apply to Main View" (false).
-    int32_t              plot_first_trace_   = 0;
-    bool                 plot_file_backed_   = false;
+    bool     hasActiveDs() const { return active_idx_ >= 0; }
+    Dataset& activeDs()          { return datasets_[static_cast<size_t>(active_idx_)]; }
+    const Dataset& activeDs() const { return datasets_[static_cast<size_t>(active_idx_)]; }
 
     // Widgets
     PlotWidget*  plot_widget_     = nullptr;
+    QTabBar*     tab_bar_         = nullptr;
 
     // Side panel
     QLabel*      lbl_file_        = nullptr;
@@ -90,7 +105,7 @@ private:
     QSpinBox*    spin_count_      = nullptr;
     QPushButton* btn_apply_       = nullptr;
     QLabel*      lbl_view_        = nullptr;
-    QLabel*      lbl_measure_     = nullptr;  // measurement readout
+    QLabel*      lbl_measure_     = nullptr;
     QComboBox*   combo_transform_ = nullptr;
     QListWidget* list_transforms_ = nullptr;
     QPushButton* btn_add_tx_      = nullptr;

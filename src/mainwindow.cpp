@@ -330,6 +330,31 @@ MainWindow::MainWindow(QWidget* parent)
     toolbar_l->addWidget(combo_theme_);
     toolbar_l->addStretch();
 
+    // Dataset tab bar
+    tab_bar_ = new QTabBar;
+    tab_bar_->setTabsClosable(true);
+    tab_bar_->setMovable(false);
+    tab_bar_->setExpanding(false);
+    connect(tab_bar_, &QTabBar::currentChanged, this, &MainWindow::onSwitchDataset);
+    connect(tab_bar_, &QTabBar::tabCloseRequested, this, [this](int idx) {
+        // Select a neighbour before removing so onSwitchDataset fires cleanly.
+        if (tab_bar_->count() > 1) {
+            int next = (idx > 0) ? idx - 1 : 1;
+            tab_bar_->setCurrentIndex(next);
+        }
+        datasets_.erase(datasets_.begin() + idx);
+        tab_bar_->removeTab(idx);
+        // Recompute active_idx_ after removal.
+        active_idx_ = tab_bar_->currentIndex();
+        if (active_idx_ < 0) {
+            // No datasets left
+            active_idx_ = -1;
+            plot_widget_->clearTraces();
+            updateFileInfo();
+            rebuildTransformList();
+        }
+    });
+
     // Plot widget
     plot_widget_ = new PlotWidget;
     connect(plot_widget_, &PlotWidget::viewChanged,
@@ -339,6 +364,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(plot_widget_, &PlotWidget::traceShiftsChanged,
             this, &MainWindow::onDragAlignChanged);
 
+    right_l->addWidget(tab_bar_);
     right_l->addWidget(toolbar);
     right_l->addWidget(plot_widget_, 1);
 
@@ -379,6 +405,45 @@ MainWindow::MainWindow(QWidget* parent)
 MainWindow::~MainWindow() = default;
 
 // ---------------------------------------------------------------------------
+// Dataset switching
+// ---------------------------------------------------------------------------
+
+void MainWindow::onSwitchDataset(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(datasets_.size())) return;
+    if (idx == active_idx_) return;
+    active_idx_ = idx;
+
+    plot_widget_->clearTraces();
+    plot_widget_->setTransforms(activeDs().pipeline);
+    rebuildTransformList();
+
+    int n = activeDs().file ? activeDs().file->header().num_traces : 0;
+    spin_first_->setMaximum(std::max(0, n - 1));
+    spin_count_->setMaximum(std::max(1, n));
+
+    updateFileInfo();
+    onApplyTraces();
+}
+
+void MainWindow::onCloseDataset() {
+    if (!hasActiveDs()) return;
+    int idx = active_idx_;
+    if (tab_bar_->count() > 1) {
+        int next = (idx > 0) ? idx - 1 : 1;
+        tab_bar_->setCurrentIndex(next);
+    }
+    datasets_.erase(datasets_.begin() + idx);
+    tab_bar_->removeTab(idx);
+    active_idx_ = tab_bar_->currentIndex();
+    if (active_idx_ < 0 || datasets_.empty()) {
+        active_idx_ = -1;
+        plot_widget_->clearTraces();
+        updateFileInfo();
+        rebuildTransformList();
+    }
+}
+
+// ---------------------------------------------------------------------------
 
 void MainWindow::setupMenuBar() {
     QMenu* file_menu = menuBar()->addMenu("&File");
@@ -391,6 +456,11 @@ void MainWindow::setupMenuBar() {
     auto* act_open_npy = new QAction("Open NPY/NPZ as &traces…", this);
     connect(act_open_npy, &QAction::triggered, this, &MainWindow::onOpenNpyTraces);
     file_menu->addAction(act_open_npy);
+
+    auto* act_close = new QAction("&Close Dataset", this);
+    act_close->setShortcut(QKeySequence("Ctrl+W"));
+    connect(act_close, &QAction::triggered, this, &MainWindow::onCloseDataset);
+    file_menu->addAction(act_close);
 
     file_menu->addSeparator();
 
@@ -487,19 +557,22 @@ void MainWindow::openFile(const QString& path) {
                               QString::fromStdString(err));
         return;
     }
-    trs_file_ = std::move(f);
 
-    // Clear pipeline and alignment state whenever a new file is opened.
-    align_shifts_.clear();
-    align_first_trace_ = 0;
-    align_first_sample_ = 0;
-    align_n_samples_ = 0;
-    pipeline_.clear();
+    Dataset ds;
+    ds.file         = std::move(f);
+    ds.display_name = QFileInfo(path).fileName();
+    datasets_.push_back(std::move(ds));
+    active_idx_ = static_cast<int>(datasets_.size()) - 1;
+
+    tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
+    tab_bar_->setCurrentIndex(active_idx_);
+
     rebuildTransformList();
-    plot_widget_->setTransforms(pipeline_);
+    plot_widget_->setTransforms(activeDs().pipeline);
 
-    int n = trs_file_->header().num_traces;
+    int n = activeDs().file->header().num_traces;
     spin_first_->setMaximum(std::max(0, n - 1));
+    spin_first_->setValue(0);
     spin_count_->setMaximum(n);
     spin_count_->setValue(1);
 
@@ -517,11 +590,11 @@ static QString hexBytes(const uint8_t* p, size_t n, int group = 0) {
 }
 
 void MainWindow::updateFileInfo() {
-    if (!trs_file_) { lbl_file_->setText("No file"); lbl_info_->clear();
+    if (!hasActiveDs()) { lbl_file_->setText("No file"); lbl_info_->clear();
                       lbl_trace_data_->setText("–"); return; }
 
-    const auto& h = trs_file_->header();
-    lbl_file_->setText(QString::fromStdString(trs_file_->path()).section('/', -1));
+    const auto& h = activeDs().file->header();
+    lbl_file_->setText(QString::fromStdString(activeDs().file->path()).section('/', -1));
 
     const char* type_str = "?";
     switch (h.sample_type) {
@@ -532,7 +605,7 @@ void MainWindow::updateFileInfo() {
     }
 
     int64_t effective_samples = h.num_samples;
-    for (const auto& t : pipeline_)
+    for (const auto& t : activeDs().pipeline)
         effective_samples = t->transformedCount(effective_samples);
 
     QString info = QString("Traces:  %1\nSamples: %2\nType:    %3\nData:    %4 B/trace")
@@ -549,14 +622,14 @@ void MainWindow::updateFileInfo() {
 }
 
 void MainWindow::updateTraceDataDisplay() {
-    if (!trs_file_) { lbl_trace_data_->setText("–"); return; }
-    const auto& h = trs_file_->header();
+    if (!hasActiveDs()) { lbl_trace_data_->setText("–"); return; }
+    const auto& h = activeDs().file->header();
     if (h.data_length <= 0) { lbl_trace_data_->setText("(no data)"); return; }
 
     int ti = spin_data_idx_->value();
     if (ti >= h.num_traces) { lbl_trace_data_->setText("(out of range)"); return; }
 
-    auto raw = trs_file_->readData(ti);
+    auto raw = activeDs().file->readData(ti);
     if (raw.empty()) { lbl_trace_data_->setText("(empty)"); return; }
 
     QString text = QString("Trace %1 / %2\n").arg(ti).arg(h.num_traces - 1);
@@ -603,86 +676,86 @@ void MainWindow::updateTraceDataDisplay() {
 }
 
 void MainWindow::onApplyTraces() {
-    if (!trs_file_) return;
+    if (!hasActiveDs()) return;
 
     plot_widget_->clearTraces();
 
     int first = spin_first_->value();
     int count = spin_count_->value();
-    int max   = trs_file_->header().num_traces;
+    int max   = activeDs().file->header().num_traces;
 
     for (int i = 0; i < count && (first + i) < max; i++) {
         QColor  col   = TRACE_COLORS[(first + i) % NUM_COLORS];
         QString label = QString("Trace %1").arg(first + i);
-        plot_widget_->addTrace(trs_file_.get(), first + i, col, label);
+        plot_widget_->addTrace(activeDs().file.get(), first + i, col, label);
     }
-    plot_widget_->setTransforms(pipeline_);
+    plot_widget_->setTransforms(activeDs().pipeline);
     plot_widget_->resetView();
 
     // Clear alignment state — new trace set makes old shifts stale.
-    align_shifts_.clear();
-    align_first_trace_ = 0;
-    align_first_sample_ = 0;
-    align_n_samples_ = 0;
+    activeDs().align_shifts.clear();
+    activeDs().align_first_trace = 0;
+    activeDs().align_first_sample = 0;
+    activeDs().align_n_samples = 0;
 
     // Mark plot as file-backed so drag-align updates alignment state.
-    plot_first_trace_  = first;
-    plot_file_backed_  = true;
+    activeDs().plot_first_trace  = first;
+    activeDs().plot_file_backed  = true;
 }
 
 void MainWindow::onDragAlignChanged() {
     // Called whenever a trace is drag-shifted in the main plot.
     // Only update alignment state when the plot holds file-backed traces.
-    if (!trs_file_ || !plot_file_backed_) return;
+    if (!activeDs().file || !activeDs().plot_file_backed) return;
 
     auto shifts = plot_widget_->traceShifts();
     if (shifts.empty()) return;
 
-    align_first_trace_  = plot_first_trace_;
-    align_shifts_       = std::move(shifts);
-    align_first_sample_ = 0;
-    align_n_samples_    = trs_file_->header().num_samples;
+    activeDs().align_first_trace  = activeDs().plot_first_trace;
+    activeDs().align_shifts       = std::move(shifts);
+    activeDs().align_first_sample = 0;
+    activeDs().align_n_samples    = activeDs().file->header().num_samples;
 }
 
 void MainWindow::onAddTransform() {
     auto tx = createTransform(combo_transform_->currentIndex());
     if (!tx) return;
-    pipeline_.push_back(tx);
+    activeDs().pipeline.push_back(tx);
     rebuildTransformList();
     updateFileInfo();
-    plot_widget_->setTransforms(pipeline_);
+    plot_widget_->setTransforms(activeDs().pipeline);
     plot_widget_->update();
 }
 
 void MainWindow::onRemoveTransform() {
     int row = list_transforms_->currentRow();
-    if (row < 0 || row >= static_cast<int>(pipeline_.size())) return;
-    pipeline_.erase(pipeline_.begin() + row);
+    if (row < 0 || row >= static_cast<int>(activeDs().pipeline.size())) return;
+    activeDs().pipeline.erase(activeDs().pipeline.begin() + row);
     rebuildTransformList();
     updateFileInfo();
-    plot_widget_->setTransforms(pipeline_);
+    plot_widget_->setTransforms(activeDs().pipeline);
     plot_widget_->update();
 }
 
 void MainWindow::onMoveTransformUp() {
     int row = list_transforms_->currentRow();
-    if (row <= 0 || row >= static_cast<int>(pipeline_.size())) return;
-    std::swap(pipeline_[row], pipeline_[row - 1]);
+    if (row <= 0 || row >= static_cast<int>(activeDs().pipeline.size())) return;
+    std::swap(activeDs().pipeline[row], activeDs().pipeline[row - 1]);
     rebuildTransformList();
     list_transforms_->setCurrentRow(row - 1);
     updateFileInfo();
-    plot_widget_->setTransforms(pipeline_);
+    plot_widget_->setTransforms(activeDs().pipeline);
     plot_widget_->update();
 }
 
 void MainWindow::onMoveTransformDown() {
     int row = list_transforms_->currentRow();
-    if (row < 0 || row + 1 >= static_cast<int>(pipeline_.size())) return;
-    std::swap(pipeline_[row], pipeline_[row + 1]);
+    if (row < 0 || row + 1 >= static_cast<int>(activeDs().pipeline.size())) return;
+    std::swap(activeDs().pipeline[row], activeDs().pipeline[row + 1]);
     rebuildTransformList();
     list_transforms_->setCurrentRow(row + 1);
     updateFileInfo();
-    plot_widget_->setTransforms(pipeline_);
+    plot_widget_->setTransforms(activeDs().pipeline);
     plot_widget_->update();
 }
 
@@ -694,7 +767,7 @@ void MainWindow::onResetView() {
 void MainWindow::onViewChanged(int64_t start, int64_t end, int64_t /*total*/) {
     int64_t raw_span = end - start;
     int64_t eff_span = raw_span;
-    for (const auto& t : pipeline_)
+    for (const auto& t : activeDs().pipeline)
         eff_span = t->transformedCount(eff_span);
     if (eff_span != raw_span)
         lbl_view_->setText(
@@ -736,10 +809,10 @@ void MainWindow::onThemeChanged(int index) {
 
 void MainWindow::rebuildTransformList() {
     list_transforms_->clear();
-    for (int i = 0; i < static_cast<int>(pipeline_.size()); i++) {
+    for (int i = 0; i < static_cast<int>(activeDs().pipeline.size()); i++) {
         list_transforms_->addItem(
             QString("%1. %2").arg(i + 1)
-                             .arg(QString::fromStdString(pipeline_[i]->name())));
+                             .arg(QString::fromStdString(activeDs().pipeline[i]->name())));
     }
 }
 
@@ -838,13 +911,13 @@ static bool exportTracesToTrs(
 }
 
 void MainWindow::onExportTrs() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Export TRS", "No file loaded.");
         return;
     }
 
     // Ask which traces to export (default: all).
-    int n = trs_file_->header().num_traces;
+    int n = activeDs().file->header().num_traces;
 
     QDialog range_dlg(this);
     range_dlg.setWindowTitle("Export TRS — select range");
@@ -877,8 +950,8 @@ void MainWindow::onExportTrs() {
     progress.setMinimumDuration(500);
 
     QString err;
-    bool ok = exportTracesToTrs(path, trs_file_.get(), first, count,
-                                pipeline_, &progress, err);
+    bool ok = exportTracesToTrs(path, activeDs().file.get(), first, count,
+                                activeDs().pipeline, &progress, err);
     progress.setValue(count);
 
     if (!ok)
@@ -889,7 +962,7 @@ void MainWindow::onExportTrs() {
 }
 
 void MainWindow::onExportPng() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Export PNG", "No file loaded.");
         return;
     }
@@ -909,7 +982,7 @@ void MainWindow::onExportPng() {
 }
 
 void MainWindow::onExportPdf() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Export PDF", "No file loaded.");
         return;
     }
@@ -2184,20 +2257,23 @@ void MainWindow::onOpenNpyTraces() {
     if (!param_map.empty())
         f->setParamMap(param_map);
 
-    trs_file_ = std::move(f);
-    align_shifts_.clear();
-    align_first_trace_ = 0;
-    align_first_sample_ = 0;
-    align_n_samples_ = 0;
-    pipeline_.clear();
-    rebuildTransformList();
-    plot_widget_->setTransforms(pipeline_);
+    Dataset ds;
+    ds.file         = std::move(f);
+    ds.display_name = QFileInfo(path).fileName();
+    datasets_.push_back(std::move(ds));
+    active_idx_ = static_cast<int>(datasets_.size()) - 1;
 
-    int n = trs_file_->header().num_traces;
+    tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
+    tab_bar_->setCurrentIndex(active_idx_);
+
+    rebuildTransformList();
+    plot_widget_->setTransforms(activeDs().pipeline);
+
+    int n = activeDs().file->header().num_traces;
     spin_first_->setMaximum(std::max(0, n - 1));
+    spin_first_->setValue(0);
     spin_count_->setMaximum(n);
     spin_count_->setValue(1);
-    setWindowTitle(QString("TRS Viewer — %1").arg(QFileInfo(path).fileName()));
 
     updateFileInfo();
     onApplyTraces();
@@ -2207,10 +2283,10 @@ void MainWindow::onOpenNpyTraces() {
 // Export traces → 2-D NPY (n_traces × n_samples, pipeline applied)
 // ---------------------------------------------------------------------------
 void MainWindow::onExportNpy() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Export NPY", "No file loaded."); return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
 
     // Config dialog: same range picker as TRS export
     QDialog cfg(this);
@@ -2231,7 +2307,7 @@ void MainWindow::onExportNpy() {
     count = std::min(count, h.num_traces - first);
 
     int64_t out_samples = h.num_samples;
-    for (const auto& t : pipeline_) out_samples = t->transformedCount(out_samples);
+    for (const auto& t : activeDs().pipeline) out_samples = t->transformedCount(out_samples);
 
     QString path = QFileDialog::getSaveFileName(
         this, "Export traces as NPY", {}, "NumPy files (*.npy)");
@@ -2261,13 +2337,13 @@ void MainWindow::onExportNpy() {
         QApplication::processEvents();
 
         int32_t src = first + ti;
-        int64_t got = trs_file_->readSamples(src, 0, h.num_samples, buf.data());
+        int64_t got = activeDs().file->readSamples(src, 0, h.num_samples, buf.data());
         if (got < h.num_samples)
             std::fill(buf.begin() + static_cast<size_t>(got),
                       buf.begin() + static_cast<size_t>(h.num_samples), 0.0f);
-        for (const auto& t : pipeline_) t->reset();
+        for (const auto& t : activeDs().pipeline) t->reset();
         int64_t n_out = got;
-        for (const auto& t : pipeline_) n_out = t->apply(buf.data(), n_out, 0);
+        for (const auto& t : activeDs().pipeline) n_out = t->apply(buf.data(), n_out, 0);
         std::copy(buf.begin(), buf.begin() + static_cast<size_t>(n_out),
                   matrix.begin() + static_cast<ptrdiff_t>(ti) * static_cast<ptrdiff_t>(out_samples));
     }
@@ -2285,10 +2361,10 @@ void MainWindow::onExportNpy() {
 // Export traces → NPZ (traces.npy + data.npy if TRS has data bytes)
 // ---------------------------------------------------------------------------
 void MainWindow::onExportNpz() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Export NPZ", "No file loaded."); return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
 
     QDialog cfg(this);
     cfg.setWindowTitle("Export as NPZ — configuration");
@@ -2311,7 +2387,7 @@ void MainWindow::onExportNpz() {
     count = std::min(count, h.num_traces - first);
 
     int64_t out_samples = h.num_samples;
-    for (const auto& t : pipeline_) out_samples = t->transformedCount(out_samples);
+    for (const auto& t : activeDs().pipeline) out_samples = t->transformedCount(out_samples);
 
     QString path = QFileDialog::getSaveFileName(
         this, "Export traces as NPZ", {}, "NumPy archives (*.npz)");
@@ -2332,13 +2408,13 @@ void MainWindow::onExportNpz() {
         prog.setValue(ti);
         QApplication::processEvents();
         int32_t src = first + ti;
-        int64_t got = trs_file_->readSamples(src, 0, h.num_samples, buf.data());
+        int64_t got = activeDs().file->readSamples(src, 0, h.num_samples, buf.data());
         if (got < h.num_samples)
             std::fill(buf.begin() + static_cast<size_t>(got),
                       buf.begin() + static_cast<size_t>(h.num_samples), 0.0f);
-        for (const auto& t : pipeline_) t->reset();
+        for (const auto& t : activeDs().pipeline) t->reset();
         int64_t n_out = got;
-        for (const auto& t : pipeline_) n_out = t->apply(buf.data(), n_out, 0);
+        for (const auto& t : activeDs().pipeline) n_out = t->apply(buf.data(), n_out, 0);
         std::copy(buf.begin(), buf.begin() + static_cast<size_t>(n_out),
                   traces.begin() + static_cast<ptrdiff_t>(ti) * static_cast<ptrdiff_t>(out_samples));
     }
@@ -2353,7 +2429,7 @@ void MainWindow::onExportNpz() {
         // Build data matrix (n_traces × data_length, uint8)
         std::vector<uint8_t> data_mat(static_cast<size_t>(count) * static_cast<size_t>(h.data_length));
         for (int32_t ti = 0; ti < count; ti++) {
-            auto db = trs_file_->readData(first + ti);
+            auto db = activeDs().file->readData(first + ti);
             size_t copy_n = std::min(static_cast<size_t>(h.data_length), db.size());
             std::copy(db.begin(), db.begin() + static_cast<ptrdiff_t>(copy_n),
                       data_mat.begin() + static_cast<ptrdiff_t>(ti) * h.data_length);
@@ -2374,11 +2450,11 @@ void MainWindow::onExportNpz() {
 }
 
 void MainWindow::onRunTTest() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "T-test", "No file loaded.");
         return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
     if (h.data_length <= 0) {
         QMessageBox::critical(this, "T-test",
             "This TRS file has no per-trace data bytes.\n"
@@ -2408,7 +2484,7 @@ void MainWindow::onRunTTest() {
     fl->addRow("Sample count (0=all):", sp_s_count);
 
     // Alignment group
-    const bool has_alignment = (align_n_samples_ > 0);
+    const bool has_alignment = (activeDs().align_n_samples > 0);
     auto* grp_align  = new QGroupBox("Alignment");
     auto* fl_align   = new QFormLayout(grp_align);
     auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
@@ -2416,15 +2492,15 @@ void MainWindow::onRunTTest() {
     chk_shifts->setEnabled(has_alignment);
     chk_shifts->setToolTip(has_alignment
         ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3).")
-              .arg(align_shifts_.size()).arg(align_first_sample_).arg(align_n_samples_)
+              .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
         : "No alignment has been applied to the main view yet.");
     fl_align->addRow(chk_shifts);
     auto applyAlignmentToSpinboxes = [&](bool on) {
         if (on) {
-            sp_first->setValue(align_first_trace_);
-            sp_count->setValue(static_cast<int>(align_shifts_.size()));
-            sp_s_first->setValue(static_cast<int>(align_first_sample_));
-            sp_s_count->setValue(static_cast<int>(align_n_samples_));
+            sp_first->setValue(activeDs().align_first_trace);
+            sp_count->setValue(static_cast<int>(activeDs().align_shifts.size()));
+            sp_s_first->setValue(static_cast<int>(activeDs().align_first_sample));
+            sp_s_count->setValue(static_cast<int>(activeDs().align_n_samples));
         }
         sp_first->setEnabled(!on);
         sp_count->setEnabled(!on);
@@ -2463,11 +2539,11 @@ void MainWindow::onRunTTest() {
                                         : static_cast<int32_t>(sp_byte->value());
 
     const bool use_alignment = chk_shifts->isChecked();
-    const int32_t eff_first  = use_alignment ? align_first_trace_ : first;
-    const int32_t eff_count  = use_alignment ? static_cast<int32_t>(align_shifts_.size()) : count;
+    const int32_t eff_first  = use_alignment ? activeDs().align_first_trace : first;
+    const int32_t eff_count  = use_alignment ? static_cast<int32_t>(activeDs().align_shifts.size()) : count;
     const int64_t eff_first_sample = static_cast<int64_t>(sp_s_first->value());
     const int64_t eff_n_samples    = static_cast<int64_t>(sp_s_count->value()); // 0 = all
-    const std::vector<int32_t> use_shifts = use_alignment ? align_shifts_ : std::vector<int32_t>{};
+    const std::vector<int32_t> use_shifts = use_alignment ? activeDs().align_shifts : std::vector<int32_t>{};
 
     // Effective raw sample count for the window
     const int64_t raw_ns = (eff_n_samples == 0)
@@ -2476,7 +2552,7 @@ void MainWindow::onRunTTest() {
 
     // Effective sample count after pipeline
     int64_t effective_samples = raw_ns;
-    for (const auto& t : pipeline_)
+    for (const auto& t : activeDs().pipeline)
         effective_samples = t->transformedCount(effective_samples);
 
     // Memory estimate warning
@@ -2507,7 +2583,7 @@ void MainWindow::onRunTTest() {
         QApplication::processEvents();
 
         int32_t src_idx = eff_first + ti;
-        auto data_bytes = trs_file_->readData(src_idx);
+        auto data_bytes = activeDs().file->readData(src_idx);
         if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { skipped++; continue; }
         int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
 
@@ -2519,13 +2595,13 @@ void MainWindow::onRunTTest() {
             int64_t src_start = std::max<int64_t>(0, adj_start);
             int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
             int64_t dst_off   = src_start - adj_start;
-            int64_t got = trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+            int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
                                                   trace_buf.data() + dst_off);
             if (got <= 0) { skipped++; continue; }
         }
-        for (const auto& t : pipeline_) t->reset();
+        for (const auto& t : activeDs().pipeline) t->reset();
         int64_t n_out = raw_ns;
-        for (const auto& t : pipeline_)
+        for (const auto& t : activeDs().pipeline)
             n_out = t->apply(trace_buf.data(), n_out, 0);
         acc.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
     }
@@ -2806,7 +2882,7 @@ void MainWindow::onRunTTest() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onCropEdit() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Crop & Merge", "No file loaded.");
         return;
     }
@@ -2917,7 +2993,7 @@ void MainWindow::onCropEdit() {
         for (const auto& r : ranges) total_samples += r.second - r.first;
         if (total_samples <= 0) return;
 
-        const TrsHeader& h = trs_file_->header();
+        const TrsHeader& h = activeDs().file->header();
 
         QString path = QFileDialog::getSaveFileName(
             dlg, "Export cropped TRS", {}, "TRS files (*.trs)");
@@ -2968,7 +3044,7 @@ void MainWindow::onCropEdit() {
 
             // Auxiliary data bytes
             if (h.data_length > 0) {
-                auto data = trs_file_->readData(ti);
+                auto data = activeDs().file->readData(ti);
                 std::fwrite(data.data(), 1, data.size(), fp);
             }
 
@@ -2978,7 +3054,7 @@ void MainWindow::onCropEdit() {
                 int64_t end = r.second;
                 while (s < end) {
                     int64_t chunk = std::min(CHUNK, end - s);
-                    int64_t read  = trs_file_->readSamples(ti, s, chunk, buf.data());
+                    int64_t read  = activeDs().file->readSamples(ti, s, chunk, buf.data());
                     if (read <= 0) {
                         // Fill remainder with zeros if read fails
                         int64_t remain = end - s;
@@ -3017,11 +3093,11 @@ void MainWindow::onCropEdit() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onRunXCorr() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Cross-Correlation", "No file loaded.");
         return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
     int n_total   = h.num_traces;
     int n_samples = h.num_samples;
 
@@ -3062,7 +3138,7 @@ void MainWindow::onRunXCorr() {
     // Update M / memory estimate labels (accounts for pipeline decimation)
     auto updateEstimate = [&]() {
         int64_t ns = sp_s_count->value() == 0 ? n_samples : sp_s_count->value();
-        for (const auto& t : pipeline_) ns = t->transformedCount(ns);
+        for (const auto& t : activeDs().pipeline) ns = t->transformedCount(ns);
         int     st = sp_stride->value();
         int64_t M  = (ns + st - 1) / st;
         lbl_M->setText(QString::number(M));
@@ -3102,7 +3178,7 @@ void MainWindow::onRunXCorr() {
     });
 
     // Alignment group
-    const bool has_alignment_xcorr = (align_n_samples_ > 0);
+    const bool has_alignment_xcorr = (activeDs().align_n_samples > 0);
     auto* grp_align_xcorr  = new QGroupBox("Alignment");
     auto* fl_align_xcorr   = new QFormLayout(grp_align_xcorr);
     auto* chk_shifts_xcorr = new QCheckBox("Apply last alignment shifts");
@@ -3110,15 +3186,15 @@ void MainWindow::onRunXCorr() {
     chk_shifts_xcorr->setEnabled(has_alignment_xcorr);
     chk_shifts_xcorr->setToolTip(has_alignment_xcorr
         ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3).")
-              .arg(align_shifts_.size()).arg(align_first_sample_).arg(align_n_samples_)
+              .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
         : "No alignment has been applied to the main view yet.");
     fl_align_xcorr->addRow(chk_shifts_xcorr);
     auto applyAlignmentToSpinboxesXCorr = [&](bool on) {
         if (on) {
-            sp_first->setValue(align_first_trace_);
-            sp_count->setValue(static_cast<int>(align_shifts_.size()));
-            sp_s_first->setValue(static_cast<int>(align_first_sample_));
-            sp_s_count->setValue(static_cast<int>(align_n_samples_));
+            sp_first->setValue(activeDs().align_first_trace);
+            sp_count->setValue(static_cast<int>(activeDs().align_shifts.size()));
+            sp_s_first->setValue(static_cast<int>(activeDs().align_first_sample));
+            sp_s_count->setValue(static_cast<int>(activeDs().align_n_samples));
         }
         sp_first->setEnabled(!on);
         sp_count->setEnabled(!on);
@@ -3165,17 +3241,17 @@ void MainWindow::onRunXCorr() {
 
     const bool use_alignment_xcorr = chk_shifts_xcorr->isChecked();
     if (use_alignment_xcorr) {
-        first_trace      = align_first_trace_;
-        num_traces       = static_cast<int32_t>(align_shifts_.size());
-        first_sample     = align_first_sample_;
-        num_samples_req  = align_n_samples_;
+        first_trace      = activeDs().align_first_trace;
+        num_traces       = static_cast<int32_t>(activeDs().align_shifts.size());
+        first_sample     = activeDs().align_first_sample;
+        num_samples_req  = activeDs().align_n_samples;
     }
-    std::vector<int32_t> use_shifts = use_alignment_xcorr ? align_shifts_ : std::vector<int32_t>{};
+    std::vector<int32_t> use_shifts = use_alignment_xcorr ? activeDs().align_shifts : std::vector<int32_t>{};
 
     // Memory warning for large matrices (effective M accounts for pipeline)
     {
         int64_t ns = num_samples_req == 0 ? (n_samples - first_sample) : num_samples_req;
-        for (const auto& t : pipeline_) ns = t->transformedCount(ns);
+        for (const auto& t : activeDs().pipeline) ns = t->transformedCount(ns);
         int64_t M  = (ns + stride - 1) / stride;
         double  mem_mb = static_cast<double>(M) * M * 4.0 / (1024.0 * 1024.0);
         if (mem_mb > 2048.0) {
@@ -3214,16 +3290,16 @@ void MainWindow::onRunXCorr() {
         int64_t ref_count = static_cast<int64_t>(sp_r_count->value());
         int64_t ns = (num_samples_req == 0) ? (h.num_samples - first_sample) : num_samples_req;
         ok = computeTwoWindowCorr(
-            trs_file_.get(), first_trace, num_traces,
+            activeDs().file.get(), first_trace, num_traces,
             ref_first, ref_count,
             first_sample, ns,
-            stride, pipeline_, use_shifts, result, progCb, err);
+            stride, activeDs().pipeline, use_shifts, result, progCb, err);
     } else {
         ok = computeXCorr(
-            trs_file_.get(),
+            activeDs().file.get(),
             first_trace, num_traces,
             first_sample, num_samples_req,
-            stride, method, pipeline_, use_shifts, result, progCb, err);
+            stride, method, activeDs().pipeline, use_shifts, result, progCb, err);
     }
 
     prog.setValue(prog.maximum());
@@ -3606,7 +3682,7 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
         // Show approximate output size as the user adjusts parameters.
         auto* lbl_out = new QLabel;
         fl->addRow("Output bins/trace:", lbl_out);
-        int n_samples = trs_file_ ? trs_file_->header().num_samples : 0;
+        int n_samples = activeDs().file ? activeDs().file->header().num_samples : 0;
         auto updateOut = [&]() {
             int W = sp_win->value(), H = sp_hop->value();
             if (n_samples >= W) {
@@ -3647,11 +3723,11 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
 // ---------------------------------------------------------------------------
 void MainWindow::onAlignTraces()
 {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Align Traces", "No file loaded.");
         return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
 
     auto* dlg = new QDialog(this);
     dlg->setWindowTitle("Align Traces");
@@ -3859,11 +3935,11 @@ void MainWindow::onAlignTraces()
         std::string err;
         bool ok;
         if (is_peak) {
-            ok = alignByPeak(trs_file_.get(), first_tr, num_tr, ref_off,
+            ok = alignByPeak(activeDs().file.get(), first_tr, num_tr, ref_off,
                              ref_first, ref_len, shalf, use_abs,
                              *result_ptr, progress_fn, err);
         } else {
-            ok = alignByXCorr(trs_file_.get(), first_tr, num_tr, ref_off,
+            ok = alignByXCorr(activeDs().file.get(), first_tr, num_tr, ref_off,
                               ref_first, ref_len, shalf,
                               *result_ptr, progress_fn, err);
         }
@@ -3936,7 +4012,7 @@ void MainWindow::onAlignTraces()
             int64_t dst_off   = src_start - raw_start;
 
             if (src_start < src_end)
-                trs_file_->readSamples(first_tr + i, src_start,
+                activeDs().file->readSamples(first_tr + i, src_start,
                                        src_end - src_start,
                                        data->data() + static_cast<size_t>(dst_off));
 
@@ -4006,10 +4082,10 @@ void MainWindow::onAlignTraces()
         }
 
         // Store alignment state for CPA
-        align_first_trace_  = first_tr;
-        align_first_sample_ = out_start;
-        align_n_samples_    = out_len;
-        align_shifts_.assign(raw_shifts.begin(), raw_shifts.end());
+        activeDs().align_first_trace  = first_tr;
+        activeDs().align_first_sample = out_start;
+        activeDs().align_n_samples    = out_len;
+        activeDs().align_shifts.assign(raw_shifts.begin(), raw_shifts.end());
 
         // Show only NUM_COLORS representative traces in the main plot.
         // These are in-memory baked-in traces — mark as not file-backed so
@@ -4018,7 +4094,7 @@ void MainWindow::onAlignTraces()
         if (!buildAligned(plot_widget_, NUM_COLORS)) return;
         plot_widget_->setTransforms({});
         plot_widget_->resetView();
-        plot_file_backed_ = false;
+        activeDs().plot_file_backed = false;
         dlg->accept();
     });
 
@@ -4030,11 +4106,11 @@ void MainWindow::onAlignTraces()
 // CPA / DPA
 // ---------------------------------------------------------------------------
 void MainWindow::onRunCpa() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "CPA", "No file loaded.");
         return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
     if (h.data_length <= 0) {
         QMessageBox::warning(this, "CPA",
             "This trace set has no per-trace data (data_length = 0).\n"
@@ -4074,7 +4150,7 @@ void MainWindow::onRunCpa() {
     fl_hyp->addRow("M:", sp_m);
 
     // Alignment shifts option — populated by the last "Apply to Main View" run
-    const bool has_alignment = (align_n_samples_ > 0);
+    const bool has_alignment = (activeDs().align_n_samples > 0);
     auto* grp_align  = new QGroupBox("Alignment");
     auto* fl_align   = new QFormLayout(grp_align);
     auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
@@ -4082,7 +4158,7 @@ void MainWindow::onRunCpa() {
     chk_shifts->setEnabled(has_alignment);
     chk_shifts->setToolTip(has_alignment
         ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3).")
-              .arg(align_shifts_.size()).arg(align_first_sample_).arg(align_n_samples_)
+              .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
         : "No alignment has been applied to the main view yet.");
     fl_align->addRow(chk_shifts);
 
@@ -4094,10 +4170,10 @@ void MainWindow::onRunCpa() {
         sp_s_first->setEnabled(!on);
         sp_s_count->setEnabled(!on);
         if (on) {
-            sp_first ->setValue(align_first_trace_);
-            sp_count ->setValue(static_cast<int>(align_shifts_.size()));
-            sp_s_first->setValue(static_cast<int>(align_first_sample_));
-            sp_s_count->setValue(static_cast<int>(align_n_samples_));
+            sp_first ->setValue(activeDs().align_first_trace);
+            sp_count ->setValue(static_cast<int>(activeDs().align_shifts.size()));
+            sp_s_first->setValue(static_cast<int>(activeDs().align_first_sample));
+            sp_s_count->setValue(static_cast<int>(activeDs().align_n_samples));
         }
     };
     connect(chk_shifts, &QCheckBox::toggled, [applyAlignmentToSpinboxes](bool on) {
@@ -4122,13 +4198,13 @@ void MainWindow::onRunCpa() {
     const int32_t n_hypotheses    = static_cast<int32_t>(sp_m->value());
     // When using stored alignment: override trace range and sample window
     const bool use_alignment = chk_shifts->isChecked();
-    const std::vector<int32_t> use_shifts = use_alignment ? align_shifts_ : std::vector<int32_t>{};
-    const int32_t eff_first_trace  = use_alignment ? align_first_trace_  : first_trace;
+    const std::vector<int32_t> use_shifts = use_alignment ? activeDs().align_shifts : std::vector<int32_t>{};
+    const int32_t eff_first_trace  = use_alignment ? activeDs().align_first_trace  : first_trace;
     const int32_t eff_num_traces   = use_alignment
-                                     ? static_cast<int32_t>(align_shifts_.size())
+                                     ? static_cast<int32_t>(activeDs().align_shifts.size())
                                      : num_traces;
-    const int64_t eff_first_sample = use_alignment ? align_first_sample_ : first_sample;
-    const int64_t eff_n_samples    = use_alignment ? align_n_samples_    : num_samples_req;
+    const int64_t eff_first_sample = use_alignment ? activeDs().align_first_sample : first_sample;
+    const int64_t eff_n_samples    = use_alignment ? activeDs().align_n_samples    : num_samples_req;
 
     // ---- Step 2: Initialise Python (once) ----
     {
@@ -4141,7 +4217,7 @@ void MainWindow::onRunCpa() {
     }
 
     // ---- Step 3: Leakage model editor dialog ----
-    LeakageModelDialog model_dlg(trs_file_.get(), first_trace,
+    LeakageModelDialog model_dlg(activeDs().file.get(), first_trace,
                                  std::min(5, num_traces), this);
     if (model_dlg.exec() != QDialog::Accepted) return;
 
@@ -4191,10 +4267,10 @@ void MainWindow::onRunCpa() {
         return true;
     };
 
-    bool ok = computeCpa(trs_file_.get(), eff_first_trace, eff_num_traces,
+    bool ok = computeCpa(activeDs().file.get(), eff_first_trace, eff_num_traces,
                          eff_first_sample, eff_n_samples,
                          n_hypotheses, use_shifts,
-                         pipeline_, leakage_fn, result, progCb, err);
+                         activeDs().pipeline, leakage_fn, result, progCb, err);
     prog.setValue(prog.maximum());
 
     if (!ok) {
@@ -4407,11 +4483,11 @@ void MainWindow::onRunCpa() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onRunSNR() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "SNR", "No file loaded.");
         return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
     if (h.data_length <= 0) {
         QMessageBox::critical(this, "SNR",
             "This TRS file has no per-trace data bytes.\n"
@@ -4445,7 +4521,20 @@ void MainWindow::onRunSNR() {
     auto* cmb_mode = new QComboBox;
     cmb_mode->addItem("Raw byte value  (256 classes, 0–255)");
     cmb_mode->addItem("Hamming weight  (9 classes, 0–8)");
+    cmb_mode->addItem("AES S-box output  (256 classes)");
+    cmb_mode->addItem("AES S-box output — Hamming weight  (9 classes)");
     fl->addRow("Class mode:", cmb_mode);
+
+    auto* sp_key = new QSpinBox;
+    sp_key->setRange(0, 255);
+    sp_key->setValue(0);
+    sp_key->setEnabled(false);
+    sp_key->setToolTip("Key byte hypothesis used as XOR input to the S-box.");
+    fl->addRow("Key byte hypothesis:", sp_key);
+
+    connect(cmb_mode, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int idx) {
+        sp_key->setEnabled(idx == 2 || idx == 3);
+    });
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     fl->addRow(cfg_bb);
@@ -4456,7 +4545,10 @@ void MainWindow::onRunSNR() {
     const int32_t first    = sp_first->value();
     const int32_t count    = sp_count->value();
     const int32_t byte_idx = sp_byte->value();
-    const bool    use_hw   = (cmb_mode->currentIndex() == 1);
+    const int     mode     = cmb_mode->currentIndex();
+    const uint8_t key_byte = static_cast<uint8_t>(sp_key->value());
+    const bool    use_hw   = (mode == 1 || mode == 3);
+    const bool    use_sbox = (mode == 2 || mode == 3);
     const int32_t n_classes = use_hw ? 9 : 256;
 
     const int64_t eff_first_sample = sp_s_first->value();
@@ -4466,7 +4558,7 @@ void MainWindow::onRunSNR() {
         : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
 
     int64_t effective_samples = raw_ns;
-    for (const auto& t : pipeline_)
+    for (const auto& t : activeDs().pipeline)
         effective_samples = t->transformedCount(effective_samples);
 
     // Memory warning: n_classes * 2 * effective_samples * sizeof(double)
@@ -4500,6 +4592,24 @@ void MainWindow::onRunSNR() {
         2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
         3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7, 4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8
     };
+    static const uint8_t AES_SBOX[256] = {
+        0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+        0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+        0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+        0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+        0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+        0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+        0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+        0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+        0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+        0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+        0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+        0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+        0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+        0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+        0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+        0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+    };
 
     for (int32_t ti = 0; ti < count; ti++) {
         if (prog.wasCanceled()) return;
@@ -4507,10 +4617,11 @@ void MainWindow::onRunSNR() {
         QApplication::processEvents();
 
         int32_t src_idx  = first + ti;
-        auto data_bytes  = trs_file_->readData(src_idx);
+        auto data_bytes  = activeDs().file->readData(src_idx);
         if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { skipped++; continue; }
 
         uint8_t  bval    = data_bytes[byte_idx];
+        if (use_sbox) bval = AES_SBOX[bval ^ key_byte];
         int32_t  label   = use_hw ? HW_TABLE[bval] : static_cast<int32_t>(bval);
 
         const int64_t adj_start = eff_first_sample;
@@ -4519,13 +4630,13 @@ void MainWindow::onRunSNR() {
             int64_t src_start = std::max<int64_t>(0, adj_start);
             int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
             int64_t dst_off   = src_start - adj_start;
-            int64_t got = trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+            int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
                                                   trace_buf.data() + dst_off);
             if (got <= 0) { skipped++; continue; }
         }
-        for (const auto& t : pipeline_) t->reset();
+        for (const auto& t : activeDs().pipeline) t->reset();
         int64_t n_out = raw_ns;
-        for (const auto& t : pipeline_)
+        for (const auto& t : activeDs().pipeline)
             n_out = t->apply(trace_buf.data(), n_out, 0);
         acc.addTrace(label, trace_buf.data(), static_cast<int32_t>(n_out));
     }
@@ -4548,9 +4659,14 @@ void MainWindow::onRunSNR() {
 
     auto* dlg = new QDialog(this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
+    QString mode_str;
+    if      (mode == 0) mode_str = "raw byte";
+    else if (mode == 1) mode_str = "HW(byte)";
+    else if (mode == 2) mode_str = QString("SBox(byte⊕0x%1)").arg(key_byte, 2, 16, QChar('0'));
+    else                mode_str = QString("HW(SBox(byte⊕0x%1))").arg(key_byte, 2, 16, QChar('0'));
     dlg->setWindowTitle(QString("SNR — %1 traces, %2 (%3 classes)")
                             .arg(acc.totalTraces())
-                            .arg(use_hw ? "Hamming weight" : "raw byte")
+                            .arg(mode_str)
                             .arg(n_classes));
     dlg->resize(1100, 520);
 
@@ -4607,11 +4723,11 @@ void MainWindow::onRunSNR() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onRunStaticSNR() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Static SNR", "No file loaded.");
         return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
 
     // --- Configuration dialog ---
     int n_total = h.num_traces;
@@ -4645,7 +4761,7 @@ void MainWindow::onRunStaticSNR() {
         : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
 
     int64_t effective_samples = raw_ns;
-    for (const auto& t : pipeline_)
+    for (const auto& t : activeDs().pipeline)
         effective_samples = t->transformedCount(effective_samples);
 
     // --- Accumulate sum and sum-of-squares ---
@@ -4671,13 +4787,13 @@ void MainWindow::onRunStaticSNR() {
             int64_t src_start = std::max<int64_t>(0, adj_start);
             int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
             int64_t dst_off   = src_start - adj_start;
-            int64_t got = trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+            int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
                                                   trace_buf.data() + dst_off);
             if (got <= 0) continue;
         }
-        for (const auto& t : pipeline_) t->reset();
+        for (const auto& t : activeDs().pipeline) t->reset();
         int64_t n_out = raw_ns;
-        for (const auto& t : pipeline_)
+        for (const auto& t : activeDs().pipeline)
             n_out = t->apply(trace_buf.data(), n_out, 0);
 
         for (int64_t s = 0; s < n_out; s++) {
@@ -4778,11 +4894,11 @@ void MainWindow::onRunStaticSNR() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onRunFFT() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "FFT", "No file loaded.");
         return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
 
     // --- Configuration dialog ---
     const int n_total = h.num_traces;
@@ -4838,7 +4954,7 @@ void MainWindow::onRunFFT() {
         : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
 
     int64_t effective_samples = raw_ns;
-    for (const auto& t : pipeline_)
+    for (const auto& t : activeDs().pipeline)
         effective_samples = t->transformedCount(effective_samples);
 
     if (effective_samples < 2) {
@@ -4890,14 +5006,14 @@ void MainWindow::onRunFFT() {
             int64_t src_start = std::max<int64_t>(0, eff_first_sample);
             int64_t src_end   = std::min<int64_t>(h.num_samples, eff_first_sample + raw_ns);
             int64_t dst_off   = src_start - eff_first_sample;
-            int64_t got = trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+            int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
                                                   trace_buf.data() + dst_off);
             if (got <= 0) continue;
         }
 
-        for (const auto& t : pipeline_) t->reset();
+        for (const auto& t : activeDs().pipeline) t->reset();
         int64_t n_out = raw_ns;
-        for (const auto& t : pipeline_)
+        for (const auto& t : activeDs().pipeline)
             n_out = t->apply(trace_buf.data(), n_out, 0);
 
         if (n_out < 2) continue;
@@ -5249,11 +5365,11 @@ static bool runAddLabelDialog(QWidget* parent, int max_byte, LabelDef& def)
 }
 
 void MainWindow::onExportDataset() {
-    if (!trs_file_) {
+    if (!hasActiveDs()) {
         QMessageBox::information(this, "Export Dataset", "No file loaded.");
         return;
     }
-    const TrsHeader& h = trs_file_->header();
+    const TrsHeader& h = activeDs().file->header();
 
     // ── Configuration dialog ──────────────────────────────────────────────
     QDialog cfg(this);
@@ -5360,7 +5476,7 @@ void MainWindow::onExportDataset() {
         : std::min<int64_t>(s_count, h.num_samples - s_first);
 
     int64_t eff_ns = raw_ns;
-    for (const auto& t : pipeline_)
+    for (const auto& t : activeDs().pipeline)
         eff_ns = t->transformedCount(eff_ns);
 
     // Memory estimate
@@ -5399,7 +5515,7 @@ void MainWindow::onExportDataset() {
 
         // Labels
         if (!labels.isEmpty()) {
-            auto data_bytes = trs_file_->readData(src_idx);
+            auto data_bytes = activeDs().file->readData(src_idx);
             for (int li = 0; li < labels.size(); li++)
                 label_vals[li][ti] = labels[li].compute(data_bytes);
         }
@@ -5410,12 +5526,12 @@ void MainWindow::onExportDataset() {
             int64_t src_start = std::max<int64_t>(0, s_first);
             int64_t src_end   = std::min<int64_t>(h.num_samples, s_first + raw_ns);
             int64_t dst_off   = src_start - s_first;
-            trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+            activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
                                    trace_buf.data() + dst_off);
         }
-        for (const auto& t : pipeline_) t->reset();
+        for (const auto& t : activeDs().pipeline) t->reset();
         int64_t n_out = raw_ns;
-        for (const auto& t : pipeline_)
+        for (const auto& t : activeDs().pipeline)
             n_out = t->apply(trace_buf.data(), n_out, 0);
 
         float* row = traces_flat.data() + static_cast<size_t>(ti) * static_cast<size_t>(eff_ns);

@@ -2,3 +2,12 @@
 *.png
 *.pdf
 build/
+build-tests/
+*.npy
+*.npz
+*.zip
+todo.txt
+q
+gen_trs.py
+npy_plot.py
+Jan/
