@@ -51,6 +51,7 @@ private slots:
     void onRunCpa();
     void onRunSNR();
     void onRunStaticSNR();
+    void onRunFFT();
     void onExportDataset();
     void onDragAlignChanged();
 

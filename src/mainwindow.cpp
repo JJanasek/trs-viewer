@@ -42,6 +42,8 @@
 #include <QTableWidget>
 #include <QVBoxLayout>
 
+#include <unsupported/Eigen/FFT>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -169,6 +171,8 @@ MainWindow::MainWindow(QWidget* parent)
         "Stride Resample (pick every Nth)",
         "Offset  (add constant)",
         "Scale   (multiply by constant)",
+        "FFT Magnitude",
+        "STFT Magnitude",
     });
 
     list_transforms_ = new QListWidget;
@@ -444,6 +448,10 @@ void MainWindow::setupMenuBar() {
     auto* act_static_snr = new QAction("Static SNR |μ/σ|…", this);
     connect(act_static_snr, &QAction::triggered, this, &MainWindow::onRunStaticSNR);
     sca_menu->addAction(act_static_snr);
+
+    auto* act_fft = new QAction("&FFT Spectrum…", this);
+    connect(act_fft, &QAction::triggered, this, &MainWindow::onRunFFT);
+    sca_menu->addAction(act_fft);
 
     auto* act_align = new QAction("&Align Traces…", this);
     connect(act_align, &QAction::triggered, this, &MainWindow::onAlignTraces);
@@ -1760,6 +1768,16 @@ void MainWindow::onLoadNpyTTest() {
         painter.end();
         QMessageBox::information(dlg, "Exported", "Saved: " + path);
     });
+    auto* btn_exp_png_npy = new QPushButton("Export PNG…");
+    connect(btn_exp_png_npy, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PNG", {}, "PNG images (*.png)");
+        if (path.isEmpty()) return;
+        QPixmap pix = pw->grab();
+        if (!pix.save(path, "PNG"))
+            QMessageBox::warning(dlg, "Export PNG", "Could not save:\n" + path);
+        else
+            QMessageBox::information(dlg, "Exported", "Saved: " + path);
+    });
 
     auto* ctrl   = new QWidget(dlg);
     auto* ctrl_l = new QHBoxLayout(ctrl);
@@ -1788,6 +1806,7 @@ void MainWindow::onLoadNpyTTest() {
     ctrl_l->addStretch();
     ctrl_l->addWidget(btn_exp_npy);
     ctrl_l->addWidget(btn_exp_pdf_npy);
+    ctrl_l->addWidget(btn_exp_png_npy);
 
     auto* vl = new QVBoxLayout(dlg);
     vl->setContentsMargins(4, 4, 4, 4); vl->setSpacing(4);
@@ -2228,7 +2247,9 @@ void MainWindow::onExportNpy() {
     }
 
     std::vector<float> matrix(total);
-    std::vector<float> buf(static_cast<size_t>(h.num_samples));
+    // buf must hold both the raw read (h.num_samples) AND the post-pipeline output
+    // (out_samples); expanding transforms like STFT can produce more samples than input.
+    std::vector<float> buf(static_cast<size_t>(std::max((int64_t)h.num_samples, out_samples)));
 
     QProgressDialog prog("Exporting…", "Cancel", 0, count, this);
     prog.setWindowModality(Qt::WindowModal);
@@ -2242,7 +2263,8 @@ void MainWindow::onExportNpy() {
         int32_t src = first + ti;
         int64_t got = trs_file_->readSamples(src, 0, h.num_samples, buf.data());
         if (got < h.num_samples)
-            std::fill(buf.begin() + static_cast<size_t>(got), buf.end(), 0.0f);
+            std::fill(buf.begin() + static_cast<size_t>(got),
+                      buf.begin() + static_cast<size_t>(h.num_samples), 0.0f);
         for (const auto& t : pipeline_) t->reset();
         int64_t n_out = got;
         for (const auto& t : pipeline_) n_out = t->apply(buf.data(), n_out, 0);
@@ -2297,7 +2319,9 @@ void MainWindow::onExportNpz() {
 
     // Build trace matrix
     std::vector<float> traces(static_cast<size_t>(count) * static_cast<size_t>(out_samples));
-    std::vector<float> buf(static_cast<size_t>(h.num_samples));
+    // buf must hold both the raw read (h.num_samples) AND the post-pipeline output
+    // (out_samples); expanding transforms like STFT can produce more samples than input.
+    std::vector<float> buf(static_cast<size_t>(std::max((int64_t)h.num_samples, out_samples)));
 
     QProgressDialog prog("Exporting…", "Cancel", 0, count, this);
     prog.setWindowModality(Qt::WindowModal);
@@ -2310,7 +2334,8 @@ void MainWindow::onExportNpz() {
         int32_t src = first + ti;
         int64_t got = trs_file_->readSamples(src, 0, h.num_samples, buf.data());
         if (got < h.num_samples)
-            std::fill(buf.begin() + static_cast<size_t>(got), buf.end(), 0.0f);
+            std::fill(buf.begin() + static_cast<size_t>(got),
+                      buf.begin() + static_cast<size_t>(h.num_samples), 0.0f);
         for (const auto& t : pipeline_) t->reset();
         int64_t n_out = got;
         for (const auto& t : pipeline_) n_out = t->apply(buf.data(), n_out, 0);
@@ -2472,8 +2497,7 @@ void MainWindow::onRunTTest() {
     prog.setWindowModality(Qt::WindowModal);
     prog.setMinimumDuration(400);
 
-    // Trace buffer sized for the sample window
-    std::vector<float> trace_buf(static_cast<size_t>(raw_ns));
+    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
     int32_t skipped = 0;
 
     for (int32_t ti = 0; ti < eff_count; ti++) {
@@ -2712,7 +2736,7 @@ void MainWindow::onRunTTest() {
         sd->show();
     });
 
-    // PDF export button
+    // PDF / PNG export buttons
     auto* btn_exp_pdf = new QPushButton("Export PDF…");
     connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PDF", {}, "PDF files (*.pdf)");
@@ -2729,6 +2753,16 @@ void MainWindow::onRunTTest() {
         pw->render(&painter);
         painter.end();
         QMessageBox::information(dlg, "Exported", "Saved: " + path);
+    });
+    auto* btn_exp_png = new QPushButton("Export PNG…");
+    connect(btn_exp_png, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PNG", {}, "PNG images (*.png)");
+        if (path.isEmpty()) return;
+        QPixmap pix = pw->grab();
+        if (!pix.save(path, "PNG"))
+            QMessageBox::warning(dlg, "Export PNG", "Could not save:\n" + path);
+        else
+            QMessageBox::information(dlg, "Exported", "Saved: " + path);
     });
 
     auto* ctrl = new QWidget(dlg);
@@ -2756,6 +2790,7 @@ void MainWindow::onRunTTest() {
     ctrl_l->addWidget(btn_exp_trs);
     ctrl_l->addWidget(btn_exp_npy);
     ctrl_l->addWidget(btn_exp_pdf);
+    ctrl_l->addWidget(btn_exp_png);
 
     auto* vl = new QVBoxLayout(dlg);
     vl->setContentsMargins(4, 4, 4, 4);
@@ -3537,6 +3572,71 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
                                            1.0, -1e9, 1e9, 6, &ok);
         if (!ok) return nullptr;
         return std::make_shared<ScaleTransform>(static_cast<float>(v));
+    }
+    case 7: {
+        QStringList wins = { "Rectangular", "Hann", "Hamming", "Blackman" };
+        bool ok;
+        QString choice = QInputDialog::getItem(this, "FFT Magnitude",
+                                               "Window function:", wins, 1, false, &ok);
+        if (!ok) return nullptr;
+        using W = FFTMagnitudeTransform::Window;
+        W win = W::Hann;
+        if      (choice == "Rectangular") win = W::Rectangular;
+        else if (choice == "Hamming")     win = W::Hamming;
+        else if (choice == "Blackman")    win = W::Blackman;
+        return std::make_shared<FFTMagnitudeTransform>(win);
+    }
+    case 8: {
+        QDialog d(this);
+        d.setWindowTitle("STFT Magnitude — parameters");
+        auto* fl = new QFormLayout(&d);
+
+        auto* sp_win = new QSpinBox; sp_win->setRange(4, 1<<20); sp_win->setValue(256);
+        sp_win->setToolTip("Samples per FFT window. Powers of 2 are fastest.");
+        auto* sp_hop = new QSpinBox; sp_hop->setRange(1, 1<<20); sp_hop->setValue(128);
+        sp_hop->setToolTip("Samples between consecutive windows (overlap = window − hop).");
+        auto* cmb = new QComboBox;
+        cmb->addItems({ "Rectangular", "Hann", "Hamming", "Blackman" });
+        cmb->setCurrentIndex(1);
+
+        fl->addRow("Window size (samples):", sp_win);
+        fl->addRow("Hop size (samples):",    sp_hop);
+        fl->addRow("Window function:",       cmb);
+
+        // Show approximate output size as the user adjusts parameters.
+        auto* lbl_out = new QLabel;
+        fl->addRow("Output bins/trace:", lbl_out);
+        int n_samples = trs_file_ ? trs_file_->header().num_samples : 0;
+        auto updateOut = [&]() {
+            int W = sp_win->value(), H = sp_hop->value();
+            if (n_samples >= W) {
+                int64_t nw = (n_samples - W) / H + 1;
+                int64_t nb = W / 2 + 1;
+                lbl_out->setText(QString("%1 windows × %2 bins = %3 total")
+                                     .arg(nw).arg(nb).arg(nw * nb));
+            } else {
+                lbl_out->setText("Window larger than trace — no output");
+            }
+        };
+        updateOut();
+        connect(sp_win, QOverload<int>::of(&QSpinBox::valueChanged), [&](int){ updateOut(); });
+        connect(sp_hop, QOverload<int>::of(&QSpinBox::valueChanged), [&](int){ updateOut(); });
+
+        auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        fl->addRow(bb);
+        connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+        connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+        if (d.exec() != QDialog::Accepted) return nullptr;
+
+        using W2 = STFTMagnitudeTransform::Window;
+        W2 win = W2::Hann;
+        switch (cmb->currentIndex()) {
+            case 0: win = W2::Rectangular; break;
+            case 2: win = W2::Hamming;     break;
+            case 3: win = W2::Blackman;    break;
+            default: break;
+        }
+        return std::make_shared<STFTMagnitudeTransform>(sp_win->value(), sp_hop->value(), win);
     }
     default: return nullptr;
     }
@@ -4387,7 +4487,7 @@ void MainWindow::onRunSNR() {
     prog.setWindowModality(Qt::WindowModal);
     prog.setMinimumDuration(400);
 
-    std::vector<float> trace_buf(static_cast<size_t>(raw_ns));
+    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
     int32_t skipped = 0;
 
     static const int32_t HW_TABLE[256] = {
@@ -4557,7 +4657,7 @@ void MainWindow::onRunStaticSNR() {
     prog.setWindowModality(Qt::WindowModal);
     prog.setMinimumDuration(400);
 
-    std::vector<float> trace_buf(static_cast<size_t>(raw_ns));
+    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
 
     for (int32_t ti = 0; ti < count; ti++) {
         if (prog.wasCanceled()) return;
@@ -4606,6 +4706,11 @@ void MainWindow::onRunStaticSNR() {
     }
 
     // --- Result window ---
+    float snr_min = *std::min_element(snr.begin(), snr.end());
+    float snr_max = *std::max_element(snr.begin(), snr.end());
+    double snr_sum = std::accumulate(snr.begin(), snr.end(), 0.0);
+    float snr_avg = snr.empty() ? 0.f : static_cast<float>(snr_sum / snr.size());
+
     auto snr_ptr = std::make_shared<std::vector<float>>(std::move(snr));
 
     auto* dlg = new QDialog(this);
@@ -4619,6 +4724,13 @@ void MainWindow::onRunStaticSNR() {
     pw->setAxisLabels("Sample Index", "|μ/σ|");
     pw->setThresholds(false, 0.0, 0.0);
     pw->resetView();
+
+    auto* lbl_stats = new QLabel(
+        QString("Min: <b>%1</b>  Max: <b>%2</b>  Avg: <b>%3</b>")
+            .arg(static_cast<double>(snr_min), 0, 'f', 4)
+            .arg(static_cast<double>(snr_max), 0, 'f', 4)
+            .arg(static_cast<double>(snr_avg), 0, 'f', 4));
+    lbl_stats->setTextFormat(Qt::RichText);
 
     auto* btn_exp_npy = new QPushButton("Export .npy…");
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, snr_ptr]() {
@@ -4635,6 +4747,267 @@ void MainWindow::onRunStaticSNR() {
     auto* btn_exp_pdf = new QPushButton("Export PDF…");
     connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export static SNR as PDF",
+                                                    {}, "PDF files (*.pdf)");
+        if (path.isEmpty()) return;
+        QPixmap px = pw->grab();
+        QPdfWriter writer(path);
+        writer.setResolution(150);
+        writer.setPageSize(QPageSize(QPageSize::A4));
+        writer.setPageOrientation(QPageLayout::Landscape);
+        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
+        QPainter painter(&writer);
+        if (painter.isActive())
+            painter.drawPixmap(painter.viewport(), px);
+    });
+
+    auto* hl = new QHBoxLayout;
+    hl->addWidget(lbl_stats);
+    hl->addStretch();
+    hl->addWidget(btn_exp_npy);
+    hl->addWidget(btn_exp_pdf);
+
+    auto* vl = new QVBoxLayout(dlg);
+    vl->addWidget(pw, 1);
+    vl->addLayout(hl);
+
+    dlg->show();
+}
+
+// ---------------------------------------------------------------------------
+// FFT Spectrum
+// ---------------------------------------------------------------------------
+
+void MainWindow::onRunFFT() {
+    if (!trs_file_) {
+        QMessageBox::information(this, "FFT", "No file loaded.");
+        return;
+    }
+    const TrsHeader& h = trs_file_->header();
+
+    // --- Configuration dialog ---
+    const int n_total = h.num_traces;
+    QDialog cfg(this);
+    cfg.setWindowTitle("FFT Spectrum — configuration");
+    auto* fl = new QFormLayout(&cfg);
+
+    auto* sp_first   = new QSpinBox; sp_first->setRange(0, std::max(0, n_total-1)); sp_first->setValue(0);
+    auto* sp_count   = new QSpinBox; sp_count->setRange(1, n_total);                sp_count->setValue(n_total);
+    auto* sp_s_first = new QSpinBox; sp_s_first->setRange(0, std::max(0,(int)h.num_samples-1)); sp_s_first->setValue(0);
+    auto* sp_s_count = new QSpinBox; sp_s_count->setRange(0, (int)h.num_samples);  sp_s_count->setValue(0);
+    sp_s_count->setSpecialValueText("All");
+
+    fl->addRow("First trace:",          sp_first);
+    fl->addRow("Count:",                sp_count);
+    fl->addRow("First sample:",         sp_s_first);
+    fl->addRow("Sample count (0=all):", sp_s_count);
+
+    auto* cmb_window = new QComboBox;
+    cmb_window->addItem("None (rectangular)");
+    cmb_window->addItem("Hann");
+    cmb_window->addItem("Hamming");
+    cmb_window->addItem("Blackman");
+    cmb_window->setCurrentIndex(1);  // default: Hann
+    fl->addRow("Window function:", cmb_window);
+
+    auto* cmb_output = new QComboBox;
+    cmb_output->addItem("Magnitude");
+    cmb_output->addItem("Magnitude (dB)");
+    cmb_output->addItem("Phase (rad)");
+    fl->addRow("Output:", cmb_output);
+
+    auto* chk_envelope = new QCheckBox("Show min/max envelope");
+    chk_envelope->setChecked(false);
+    fl->addRow("", chk_envelope);
+
+    auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow(cfg_bb);
+    connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
+    connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    if (cfg.exec() != QDialog::Accepted) return;
+
+    const int32_t first        = sp_first->value();
+    const int32_t count        = sp_count->value();
+    const int64_t eff_first_sample = sp_s_first->value();
+    const int64_t eff_n_samples    = sp_s_count->value();
+    const int      win_mode    = cmb_window->currentIndex();
+    const int      out_mode    = cmb_output->currentIndex();
+    const bool     show_env    = chk_envelope->isChecked();
+
+    const int64_t raw_ns = (eff_n_samples == 0)
+        ? (h.num_samples - eff_first_sample)
+        : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
+
+    int64_t effective_samples = raw_ns;
+    for (const auto& t : pipeline_)
+        effective_samples = t->transformedCount(effective_samples);
+
+    if (effective_samples < 2) {
+        QMessageBox::critical(this, "FFT", "Too few samples after pipeline.");
+        return;
+    }
+
+    // Number of FFT output bins (one-sided: N/2+1).
+    const int64_t fft_in_n  = effective_samples;
+    const int64_t fft_out_n = fft_in_n / 2 + 1;
+
+    // Build window coefficients.
+    std::vector<float> window(static_cast<size_t>(fft_in_n));
+    {
+        const double N1 = static_cast<double>(fft_in_n - 1);
+        for (int64_t i = 0; i < fft_in_n; ++i) {
+            double w = 1.0;
+            const double phi = 2.0 * M_PI * i / N1;
+            if (win_mode == 1)      w = 0.5 * (1.0 - std::cos(phi));           // Hann
+            else if (win_mode == 2) w = 0.54 - 0.46 * std::cos(phi);           // Hamming
+            else if (win_mode == 3) w = 0.42 - 0.5*std::cos(phi) + 0.08*std::cos(2.0*phi); // Blackman
+            window[i] = static_cast<float>(w);
+        }
+    }
+
+    // Accumulators for average, min, max.
+    std::vector<double> acc_sum(static_cast<size_t>(fft_out_n), 0.0);
+    std::vector<float>  acc_min(static_cast<size_t>(fft_out_n),  std::numeric_limits<float>::max());
+    std::vector<float>  acc_max(static_cast<size_t>(fft_out_n), -std::numeric_limits<float>::max());
+    int64_t n_ok = 0;
+
+    QProgressDialog prog("Computing FFT…", "Cancel", 0, count, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(400);
+
+    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
+    Eigen::FFT<float>  fft_engine;
+    fft_engine.SetFlag(Eigen::FFT<float>::HalfSpectrum);  // only positive freqs
+    std::vector<std::complex<float>> freq_buf;
+
+    for (int32_t ti = 0; ti < count; ++ti) {
+        if (prog.wasCanceled()) return;
+        prog.setValue(ti);
+        QApplication::processEvents();
+
+        int32_t src_idx = first + ti;
+        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+        if (eff_first_sample < h.num_samples && eff_first_sample + raw_ns > 0) {
+            int64_t src_start = std::max<int64_t>(0, eff_first_sample);
+            int64_t src_end   = std::min<int64_t>(h.num_samples, eff_first_sample + raw_ns);
+            int64_t dst_off   = src_start - eff_first_sample;
+            int64_t got = trs_file_->readSamples(src_idx, src_start, src_end - src_start,
+                                                  trace_buf.data() + dst_off);
+            if (got <= 0) continue;
+        }
+
+        for (const auto& t : pipeline_) t->reset();
+        int64_t n_out = raw_ns;
+        for (const auto& t : pipeline_)
+            n_out = t->apply(trace_buf.data(), n_out, 0);
+
+        if (n_out < 2) continue;
+
+        // Apply window (in-place).
+        for (int64_t s = 0; s < n_out; ++s)
+            trace_buf[s] *= window[s];
+
+        // FFT.
+        std::vector<float> in_vec(trace_buf.begin(), trace_buf.begin() + n_out);
+        fft_engine.fwd(freq_buf, in_vec);
+
+        // Accumulate magnitude / phase.
+        const float norm = 1.0f / static_cast<float>(n_out);
+        for (int64_t k = 0; k < fft_out_n; ++k) {
+            float val;
+            if (out_mode == 2) {
+                val = std::arg(freq_buf[k]);
+            } else {
+                float mag = std::abs(freq_buf[k]) * norm;
+                // Double all bins except DC and Nyquist to get one-sided amplitude.
+                if (k > 0 && k < fft_out_n - 1) mag *= 2.0f;
+                if (out_mode == 1) {
+                    val = (mag > 0.0f) ? 20.0f * std::log10(mag) : -200.0f;
+                } else {
+                    val = mag;
+                }
+            }
+            acc_sum[k] += static_cast<double>(val);
+            if (val < acc_min[k]) acc_min[k] = val;
+            if (val > acc_max[k]) acc_max[k] = val;
+        }
+        ++n_ok;
+    }
+    prog.setValue(count);
+
+    if (n_ok == 0) {
+        QMessageBox::critical(this, "FFT", "No traces could be processed.");
+        return;
+    }
+
+    // Build average spectrum.
+    auto avg_ptr = std::make_shared<std::vector<float>>(static_cast<size_t>(fft_out_n));
+    for (int64_t k = 0; k < fft_out_n; ++k)
+        (*avg_ptr)[k] = static_cast<float>(acc_sum[k] / static_cast<double>(n_ok));
+
+    // Build x-axis label and frequency axis (for display only via setAxisLabels).
+    // scale_x is seconds/sample in TRS files; if meaningful, show Hz.
+    const float scale_x = h.scale_x;
+    const bool  has_freq_axis = (scale_x > 0.0f && scale_x < 1.0f);  // typical oscilloscope range
+    QString x_label = has_freq_axis ? "Frequency (Hz)" : "Frequency Bin";
+    QString y_label;
+    if (out_mode == 0) y_label = "Amplitude";
+    else if (out_mode == 1) y_label = "Magnitude (dB)";
+    else y_label = "Phase (rad)";
+
+    // If we have a real frequency axis, scale the avg data x-range via a dummy
+    // transform is not needed — PlotWidget currently uses sample-index x-axis.
+    // We store the frequency values as a second shared_ptr and display them;
+    // the user can read the Hz ticks from the axis once we set the x-scale.
+    // PlotWidget supports setXScale(double scale, double offset) via resetView.
+    // For now, pass the frequency-per-bin scale to PlotWidget's x-axis.
+
+    // --- Result window ---
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle(QString("FFT Spectrum — %1 traces, %2")
+                            .arg(n_ok)
+                            .arg(cmb_window->currentText()));
+    dlg->resize(1200, 560);
+
+    auto* pw = new PlotWidget(dlg);
+
+    // Set x-axis scale so ticks show Hz instead of bin indices.
+    if (has_freq_axis) {
+        const double fs   = 1.0 / static_cast<double>(scale_x);   // sample rate Hz
+        const double df   = fs / static_cast<double>(fft_in_n);    // Hz per bin
+        pw->setXScale(df, 0.0);
+    }
+
+    if (show_env && n_ok > 1) {
+        auto min_ptr = std::make_shared<std::vector<float>>(acc_min);
+        auto max_ptr = std::make_shared<std::vector<float>>(acc_max);
+        pw->addTrace(min_ptr, QColor("#5c9bd6"), "Min");
+        pw->addTrace(max_ptr, QColor("#5c9bd6"), "Max");
+        pw->addTrace(avg_ptr, QColor("#f4a63a"), "Average");
+    } else {
+        pw->addTrace(avg_ptr, QColor("#f4a63a"), "Average");
+        pw->setTraceFilled(0, true);
+    }
+
+    pw->setAxisLabels(x_label, y_label);
+    pw->setThresholds(false, 0.0, 0.0);
+    pw->resetView();
+
+    auto* btn_exp_npy = new QPushButton("Export .npy…");
+    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, avg_ptr]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as NumPy",
+                                                    {}, "NumPy files (*.npy)");
+        if (path.isEmpty()) return;
+        QString e;
+        if (!saveNpy(path, avg_ptr->data(), static_cast<int64_t>(avg_ptr->size()), e))
+            QMessageBox::critical(dlg, "Export failed", e);
+        else
+            QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+    });
+
+    auto* btn_exp_pdf = new QPushButton("Export PDF…");
+    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as PDF",
                                                     {}, "PDF files (*.pdf)");
         if (path.isEmpty()) return;
         QPixmap px = pw->grab();
@@ -5014,7 +5387,7 @@ void MainWindow::onExportDataset() {
     prog.setWindowModality(Qt::WindowModal);
     prog.setMinimumDuration(400);
 
-    std::vector<float> trace_buf(static_cast<size_t>(raw_ns));
+    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, eff_ns)));
     int32_t written = 0;
 
     for (int32_t ti = 0; ti < count; ti++) {
