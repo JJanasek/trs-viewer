@@ -46,6 +46,12 @@ PlotWidget::PlotWidget(QWidget* parent)
     setMouseTracking(true);
     setMinimumSize(400, 200);
     setTheme(PlotTheme::dark());
+
+    wheel_debounce_ = new QTimer(this);
+    wheel_debounce_->setSingleShot(true);
+    wheel_debounce_->setInterval(400);
+    connect(wheel_debounce_, &QTimer::timeout,
+            this, [this]() { wheel_snap_done_ = false; });
 }
 
 // ---------------------------------------------------------------------------
@@ -79,6 +85,7 @@ void PlotWidget::addCropRange(int64_t start, int64_t end) {
     start = std::clamp(start, INT64_C(0), total_samples_);
     end   = std::clamp(end,   INT64_C(0), total_samples_);
     if (end <= start) return;
+    notifyBeforeViewChange();
     crop_ranges_.push_back({start, end});
     emit cropRangesChanged();
     update();
@@ -86,6 +93,7 @@ void PlotWidget::addCropRange(int64_t start, int64_t end) {
 
 void PlotWidget::removeCropRangeAt(int idx) {
     if (idx < 0 || idx >= static_cast<int>(crop_ranges_.size())) return;
+    notifyBeforeViewChange();
     crop_ranges_.erase(crop_ranges_.begin() + idx);
     emit cropRangesChanged();
     update();
@@ -93,6 +101,7 @@ void PlotWidget::removeCropRangeAt(int idx) {
 
 void PlotWidget::clearCropRanges() {
     if (crop_ranges_.empty()) return;
+    notifyBeforeViewChange();
     crop_ranges_.clear();
     emit cropRangesChanged();
     update();
@@ -130,6 +139,40 @@ void PlotWidget::clearTraceShifts() {
         if (te.shift != 0) { te.shift = 0; te.cache.valid = false; changed = true; }
     }
     if (changed) { emit traceShiftsChanged(); update(); }
+}
+
+// ---------------------------------------------------------------------------
+// View state snapshot helpers
+// ---------------------------------------------------------------------------
+void PlotWidget::notifyBeforeViewChange() {
+    if (restoring_view_) return;
+    emit beforeViewChange();
+}
+
+PlotViewState PlotWidget::captureViewState() const {
+    PlotViewState s;
+    s.view_start   = view_start_;
+    s.view_end     = view_end_;
+    s.y_scale      = y_scale_;
+    s.sticky_ymin  = sticky_ymin_;
+    s.sticky_ymax  = sticky_ymax_;
+    s.crop_ranges  = crop_ranges_;
+    return s;
+}
+
+void PlotWidget::restoreViewState(const PlotViewState& s) {
+    restoring_view_ = true;
+    view_start_   = s.view_start;
+    view_end_     = s.view_end;
+    y_scale_      = s.y_scale;
+    sticky_ymin_  = s.sticky_ymin;
+    sticky_ymax_  = s.sticky_ymax;
+    crop_ranges_  = s.crop_ranges;
+    for (auto& te : traces_) te.cache.valid = false;
+    emit viewChanged(view_start_, view_end_, total_samples_);
+    emit cropRangesChanged();
+    update();
+    restoring_view_ = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -299,6 +342,7 @@ void PlotWidget::clearMeasurement() {
 }
 
 void PlotWidget::zoomIn() {
+    notifyBeforeViewChange();
     int64_t c = (view_start_ + view_end_) / 2;
     int64_t h = std::max(INT64_C(5), (view_end_ - view_start_) / 4);
     view_start_ = std::max(INT64_C(0), c - h);
@@ -308,6 +352,7 @@ void PlotWidget::zoomIn() {
 }
 
 void PlotWidget::zoomOut() {
+    notifyBeforeViewChange();
     int64_t c = (view_start_ + view_end_) / 2;
     int64_t h = view_end_ - view_start_;
     view_start_ = std::max(INT64_C(0), c - h);
@@ -317,11 +362,13 @@ void PlotWidget::zoomOut() {
 }
 
 void PlotWidget::zoomInY() {
+    notifyBeforeViewChange();
     y_scale_ = std::clamp(y_scale_ * 0.75f, 0.05f, 200.0f);
     update();
 }
 
 void PlotWidget::zoomOutY() {
+    notifyBeforeViewChange();
     y_scale_ = std::clamp(y_scale_ / 0.75f, 0.05f, 200.0f);
     update();
 }
@@ -968,6 +1015,7 @@ void PlotWidget::mousePressEvent(QMouseEvent* e) {
     if (mode_ == InteractionMode::BoxZoom ||
         mode_ == InteractionMode::CropSelect) {
         if (!pr.contains(e->pos())) return;
+        notifyBeforeViewChange();
         rubber_band_active_  = true;
         rubber_band_start_   = e->pos();
         rubber_band_current_ = e->pos();
@@ -982,11 +1030,13 @@ void PlotWidget::mousePressEvent(QMouseEvent* e) {
         align_drag_idx_          = idx;
         align_drag_sample_origin_ = pixelToSample(e->pos().x(), pr);
         align_drag_shift_origin_  = traces_[static_cast<size_t>(idx)].shift;
+        emit alignDragStarted();
         setCursor(Qt::SizeHorCursor);
         return;
     }
 
-    // Pan mode
+    // Pan — snapshot before drag gesture begins
+    notifyBeforeViewChange();
     dragging_            = true;
     drag_origin_         = e->pos();
     drag_start_at_press_ = view_start_;
@@ -1009,7 +1059,7 @@ void PlotWidget::mouseMoveEvent(QMouseEvent* e) {
         int64_t cur_s   = pixelToSample(e->pos().x(), pr);
         int64_t delta   = cur_s - align_drag_sample_origin_;
         auto&   te      = traces_[static_cast<size_t>(align_drag_idx_)];
-        int32_t new_shift = align_drag_shift_origin_ + static_cast<int32_t>(delta);
+        int32_t new_shift = align_drag_shift_origin_ - static_cast<int32_t>(delta);
         if (te.shift != new_shift) {
             te.shift       = new_shift;
             te.cache.valid = false;
@@ -1087,6 +1137,13 @@ void PlotWidget::mouseReleaseEvent(QMouseEvent* e) {
 }
 
 void PlotWidget::wheelEvent(QWheelEvent* e) {
+    // One snapshot per scroll burst (debounced 400 ms)
+    if (!wheel_snap_done_) {
+        wheel_snap_done_ = true;
+        notifyBeforeViewChange();
+    }
+    wheel_debounce_->start();
+
     // Ctrl+scroll or Shift+scroll → Y-axis zoom (expand/contract amplitude range)
     if (e->modifiers() & (Qt::ControlModifier | Qt::ShiftModifier)) {
         float factor = (e->angleDelta().y() > 0) ? 0.75f : 1.0f / 0.75f;
