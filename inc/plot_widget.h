@@ -5,10 +5,25 @@
 
 #include <QColor>
 #include <QPoint>
+#include <QTimer>
 #include <QWidget>
+#include <limits>
 
 #include <memory>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// Snapshot of the plot's visual state (view window, Y zoom, crop ranges).
+// Stored inside DatasetSnapshot for global undo.
+// ---------------------------------------------------------------------------
+struct PlotViewState {
+    int64_t view_start = 0;
+    int64_t view_end   = 0;
+    float   y_scale    = 1.0f;
+    float   sticky_ymin =  std::numeric_limits<float>::infinity();
+    float   sticky_ymax = -std::numeric_limits<float>::infinity();
+    std::vector<std::pair<int64_t,int64_t>> crop_ranges;
+};
 
 // ---------------------------------------------------------------------------
 // Theme
@@ -140,6 +155,10 @@ public:
     void    setTraceShift(int idx, int32_t shift);
     void    clearTraceShifts();  // reset all shifts to 0
 
+    // View state snapshot (for undo)
+    PlotViewState captureViewState() const;
+    void          restoreViewState(const PlotViewState& s);
+
 signals:
     void viewChanged(int64_t view_start, int64_t view_end, int64_t total_samples);
     // Emitted whenever measurement points change.
@@ -150,6 +169,11 @@ signals:
     void cropRangesChanged();
     // Emitted when any trace shift changes (AlignDrag released or setTraceShift called)
     void traceShiftsChanged();
+    // Emitted once when the user starts a drag-align (mouse press, before any shift)
+    void alignDragStarted();
+    // Emitted once per view-change gesture (debounced for wheel scroll).
+    // Connect to saveSnapshot() for undo support.
+    void beforeViewChange();
 
 protected:
     void paintEvent(QPaintEvent*) override;
@@ -215,6 +239,12 @@ private:
 
     // Crop ranges
     std::vector<std::pair<int64_t,int64_t>> crop_ranges_;
+
+    // Debounce for beforeViewChange() signal (wheel scroll bursts)
+    QTimer* wheel_debounce_  = nullptr;
+    bool    wheel_snap_done_ = false;
+    bool    restoring_view_  = false;  // suppress beforeViewChange during restore
+    void    notifyBeforeViewChange();
 
     // Measurement state (up to 2 points)
     int     meas_count_ = 0;   // 0, 1, or 2

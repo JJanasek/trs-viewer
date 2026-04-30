@@ -14,8 +14,21 @@
 #include <QSpinBox>
 #include <QTabBar>
 
+#include <deque>
 #include <memory>
 #include <vector>
+
+// ---------------------------------------------------------------------------
+// Snapshot of mutable per-dataset state, used for undo.
+// ---------------------------------------------------------------------------
+struct DatasetSnapshot {
+    std::vector<std::shared_ptr<ITransform>> pipeline; // each is clone()'d
+    std::vector<int32_t> align_shifts;
+    int32_t align_first_trace  = 0;
+    int64_t align_first_sample = 0;
+    int64_t align_n_samples    = 0;
+    PlotViewState view;
+};
 
 // ---------------------------------------------------------------------------
 // Per-file state bundle.  MainWindow keeps a vector of these.
@@ -34,6 +47,10 @@ struct Dataset {
     // Plot state
     int32_t              plot_first_trace   = 0;
     bool                 plot_file_backed   = false;
+
+    // Undo stack (most-recent first); capped at kMaxUndo
+    std::deque<DatasetSnapshot> undo_stack;
+    static constexpr int kMaxUndo = 50;
 };
 
 class MainWindow : public QMainWindow {
@@ -76,6 +93,7 @@ private slots:
     void onRunFFT();
     void onExportDataset();
     void onDragAlignChanged();
+    void onUndoAction();
 
 private:
     void setupMenuBar();
@@ -83,6 +101,11 @@ private:
     void updateTraceDataDisplay();
     void rebuildTransformList();
     std::shared_ptr<ITransform> createTransform(int combo_index);
+    static QString recentDir(const QString& key);
+    static void    updateRecentDir(const QString& key, const QString& file_path);
+    void saveSnapshot();
+    void restoreSnapshot(DatasetSnapshot snap);
+    void updateUndoButton();
 
     // Multi-dataset state
     std::vector<Dataset> datasets_;
@@ -121,6 +144,7 @@ private:
     QPushButton*  btn_zoom_in_       = nullptr;
     QPushButton*  btn_zoom_out_     = nullptr;
     QPushButton*  btn_reset_        = nullptr;
+    QPushButton*  btn_undo_         = nullptr;
     QComboBox*    combo_theme_      = nullptr;
     QButtonGroup* mode_group_       = nullptr;
 

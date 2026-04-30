@@ -19,6 +19,7 @@
 #include <QDoubleSpinBox>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QSettings>
 #include <QFormLayout>
 #include <QFrame>
 #include <QGroupBox>
@@ -173,6 +174,7 @@ MainWindow::MainWindow(QWidget* parent)
         "Scale   (multiply by constant)",
         "FFT Magnitude",
         "STFT Magnitude",
+        "Gaussian Noise",
     });
 
     list_transforms_ = new QListWidget;
@@ -288,6 +290,7 @@ MainWindow::MainWindow(QWidget* parent)
     // Separator
     auto* sep1 = new QFrame; sep1->setFrameShape(QFrame::VLine);
     auto* sep2 = new QFrame; sep2->setFrameShape(QFrame::VLine);
+    auto* sep3 = new QFrame; sep3->setFrameShape(QFrame::VLine);
 
     // Zoom buttons
     btn_zoom_in_  = new QPushButton("＋ Zoom In");
@@ -309,6 +312,11 @@ MainWindow::MainWindow(QWidget* parent)
     connect(btn_yzoom_in,  &QPushButton::clicked, this, [this](){ plot_widget_->zoomInY(); });
     connect(btn_yzoom_out, &QPushButton::clicked, this, [this](){ plot_widget_->zoomOutY(); });
 
+    btn_undo_ = new QPushButton("↩ Undo");
+    btn_undo_->setToolTip("Undo last action [Ctrl+Z]");
+    btn_undo_->setEnabled(false);
+    connect(btn_undo_, &QPushButton::clicked, this, &MainWindow::onUndoAction);
+
     // Theme selector
     combo_theme_ = new QComboBox;
     combo_theme_->addItems({"Dark", "Light"});
@@ -326,6 +334,8 @@ MainWindow::MainWindow(QWidget* parent)
     toolbar_l->addWidget(btn_yzoom_in);
     toolbar_l->addWidget(btn_yzoom_out);
     toolbar_l->addWidget(sep2);
+    toolbar_l->addWidget(btn_undo_);
+    toolbar_l->addWidget(sep3);
     toolbar_l->addWidget(new QLabel("Theme:"));
     toolbar_l->addWidget(combo_theme_);
     toolbar_l->addStretch();
@@ -363,6 +373,10 @@ MainWindow::MainWindow(QWidget* parent)
             this, &MainWindow::onMeasurementUpdated);
     connect(plot_widget_, &PlotWidget::traceShiftsChanged,
             this, &MainWindow::onDragAlignChanged);
+    connect(plot_widget_, &PlotWidget::alignDragStarted,
+            this, &MainWindow::saveSnapshot);
+    connect(plot_widget_, &PlotWidget::beforeViewChange,
+            this, &MainWindow::saveSnapshot);
 
     right_l->addWidget(tab_bar_);
     right_l->addWidget(toolbar);
@@ -374,6 +388,8 @@ MainWindow::MainWindow(QWidget* parent)
     splitter->setStretchFactor(1, 1);
 
     // Keyboard shortcuts
+    auto* sc_undo = new QShortcut(QKeySequence::Undo, this);  // Ctrl+Z
+    connect(sc_undo, &QShortcut::activated, this, &MainWindow::onUndoAction);
     auto* sc_reset = new QShortcut(QKeySequence("R"), this);
     connect(sc_reset, &QShortcut::activated, this, &MainWindow::onResetView);
     auto* sc_plus  = new QShortcut(QKeySequence("+"), this);
@@ -422,6 +438,7 @@ void MainWindow::onSwitchDataset(int idx) {
     spin_count_->setMaximum(std::max(1, n));
 
     updateFileInfo();
+    updateUndoButton();
     onApplyTraces();
 }
 
@@ -543,10 +560,81 @@ void MainWindow::setupMenuBar() {
     crop_menu->addAction(act_crop);
 }
 
+// ---------------------------------------------------------------------------
+// Undo helpers
+// ---------------------------------------------------------------------------
+void MainWindow::saveSnapshot() {
+    if (!hasActiveDs()) return;
+    auto& ds = activeDs();
+    DatasetSnapshot snap;
+    for (const auto& t : ds.pipeline)
+        snap.pipeline.push_back(t->clone());
+    snap.align_shifts       = ds.align_shifts;
+    snap.align_first_trace  = ds.align_first_trace;
+    snap.align_first_sample = ds.align_first_sample;
+    snap.align_n_samples    = ds.align_n_samples;
+    snap.view               = plot_widget_->captureViewState();
+    ds.undo_stack.push_front(std::move(snap));
+    if (static_cast<int>(ds.undo_stack.size()) > Dataset::kMaxUndo)
+        ds.undo_stack.pop_back();
+    updateUndoButton();
+}
+
+void MainWindow::restoreSnapshot(DatasetSnapshot snap) {
+    auto& ds = activeDs();
+    ds.pipeline         = std::move(snap.pipeline);
+    ds.align_shifts     = std::move(snap.align_shifts);
+    ds.align_first_trace  = snap.align_first_trace;
+    ds.align_first_sample = snap.align_first_sample;
+    ds.align_n_samples    = snap.align_n_samples;
+
+    rebuildTransformList();
+    plot_widget_->setTransforms(ds.pipeline);
+    plot_widget_->restoreViewState(snap.view);
+
+    // Re-apply shifts to currently visible traces.
+    plot_widget_->clearTraceShifts();
+    if (!ds.align_shifts.empty() && ds.plot_file_backed) {
+        int n = static_cast<int>(plot_widget_->traceShifts().size());
+        for (int i = 0; i < n; i++) {
+            int shift_idx = ds.plot_first_trace + i - ds.align_first_trace;
+            if (shift_idx >= 0 && shift_idx < static_cast<int>(ds.align_shifts.size()))
+                plot_widget_->setTraceShift(i, ds.align_shifts[static_cast<size_t>(shift_idx)]);
+        }
+    }
+
+    updateFileInfo();
+    updateUndoButton();
+}
+
+void MainWindow::onUndoAction() {
+    if (!hasActiveDs() || activeDs().undo_stack.empty()) return;
+    auto snap = std::move(activeDs().undo_stack.front());
+    activeDs().undo_stack.pop_front();
+    restoreSnapshot(std::move(snap));
+}
+
+void MainWindow::updateUndoButton() {
+    if (btn_undo_)
+        btn_undo_->setEnabled(hasActiveDs() && !activeDs().undo_stack.empty());
+}
+
+// ---------------------------------------------------------------------------
+// Recent-directory helpers (persisted via QSettings)
+// ---------------------------------------------------------------------------
+QString MainWindow::recentDir(const QString& key) {
+    return QSettings("trs-viewer", "trs-viewer").value("recentDir/" + key).toString();
+}
+
+void MainWindow::updateRecentDir(const QString& key, const QString& file_path) {
+    QSettings("trs-viewer", "trs-viewer")
+        .setValue("recentDir/" + key, QFileInfo(file_path).absolutePath());
+}
+
 void MainWindow::onOpenFile() {
     QString path = QFileDialog::getOpenFileName(
-        this, "Open TRS file", {}, "TRS files (*.trs);;All files (*)");
-    if (!path.isEmpty()) openFile(path);
+        this, "Open TRS file", recentDir("trs"), "TRS files (*.trs);;All files (*)");
+    if (!path.isEmpty()) { updateRecentDir("trs", path); openFile(path); }
 }
 
 void MainWindow::openFile(const QString& path) {
@@ -720,6 +808,7 @@ void MainWindow::onDragAlignChanged() {
 void MainWindow::onAddTransform() {
     auto tx = createTransform(combo_transform_->currentIndex());
     if (!tx) return;
+    saveSnapshot();
     activeDs().pipeline.push_back(tx);
     rebuildTransformList();
     updateFileInfo();
@@ -730,6 +819,7 @@ void MainWindow::onAddTransform() {
 void MainWindow::onRemoveTransform() {
     int row = list_transforms_->currentRow();
     if (row < 0 || row >= static_cast<int>(activeDs().pipeline.size())) return;
+    saveSnapshot();
     activeDs().pipeline.erase(activeDs().pipeline.begin() + row);
     rebuildTransformList();
     updateFileInfo();
@@ -740,6 +830,7 @@ void MainWindow::onRemoveTransform() {
 void MainWindow::onMoveTransformUp() {
     int row = list_transforms_->currentRow();
     if (row <= 0 || row >= static_cast<int>(activeDs().pipeline.size())) return;
+    saveSnapshot();
     std::swap(activeDs().pipeline[row], activeDs().pipeline[row - 1]);
     rebuildTransformList();
     list_transforms_->setCurrentRow(row - 1);
@@ -751,6 +842,7 @@ void MainWindow::onMoveTransformUp() {
 void MainWindow::onMoveTransformDown() {
     int row = list_transforms_->currentRow();
     if (row < 0 || row + 1 >= static_cast<int>(activeDs().pipeline.size())) return;
+    saveSnapshot();
     std::swap(activeDs().pipeline[row], activeDs().pipeline[row + 1]);
     rebuildTransformList();
     list_transforms_->setCurrentRow(row + 1);
@@ -760,6 +852,14 @@ void MainWindow::onMoveTransformDown() {
 }
 
 void MainWindow::onResetView() {
+    if (hasActiveDs()) {
+        saveSnapshot();
+        activeDs().align_shifts.clear();
+        activeDs().align_first_trace  = 0;
+        activeDs().align_first_sample = 0;
+        activeDs().align_n_samples    = 0;
+    }
+    plot_widget_->clearTraceShifts();
     plot_widget_->resetView();
     plot_widget_->clearCropRanges();
 }
@@ -941,8 +1041,9 @@ void MainWindow::onExportTrs() {
     int32_t count = static_cast<int32_t>(sp_count->value());
 
     QString path = QFileDialog::getSaveFileName(
-        this, "Export processed TRS", {}, "TRS files (*.trs)");
+        this, "Export processed TRS", recentDir("trs"), "TRS files (*.trs)");
     if (path.isEmpty()) return;
+    updateRecentDir("trs", path);
 
     QProgressDialog progress("Exporting traces…", "Cancel",
                              0, count, this);
@@ -968,8 +1069,9 @@ void MainWindow::onExportPng() {
     }
 
     QString path = QFileDialog::getSaveFileName(
-        this, "Export PNG", {}, "PNG images (*.png)");
+        this, "Export PNG", recentDir("export"), "PNG images (*.png)");
     if (path.isEmpty()) return;
+    updateRecentDir("export", path);
 
     QPixmap px = plot_widget_->grab();
     QImage img = px.toImage();
@@ -988,8 +1090,9 @@ void MainWindow::onExportPdf() {
     }
 
     QString path = QFileDialog::getSaveFileName(
-        this, "Export PDF", {}, "PDF files (*.pdf)");
+        this, "Export PDF", recentDir("export"), "PDF files (*.pdf)");
     if (path.isEmpty()) return;
+    updateRecentDir("export", path);
 
     // Grab the plot at current widget resolution, then paint into PDF.
     QPixmap px = plot_widget_->grab();
@@ -1609,9 +1712,10 @@ static bool parseNpyRaw(const std::vector<uint8_t>& buf,
 
 void MainWindow::onLoadNpyTTest() {
     QString path = QFileDialog::getOpenFileName(
-        this, "Load t-test NPY/NPZ", {},
+        this, "Load t-test NPY/NPZ", recentDir("npy"),
         "NumPy files (*.npy *.npz);;All files (*)");
     if (path.isEmpty()) return;
+    updateRecentDir("npy", path);
 
     std::vector<float> data;
     std::vector<double> df_loaded;
@@ -1680,8 +1784,9 @@ void MainWindow::onLoadNpyTTest() {
     auto* btn_exp_npy = new QPushButton("Export .npy…");
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, tstat_ptr]() {
         QString p = QFileDialog::getSaveFileName(dlg, "Export t-test as NumPy",
-                                                 {}, "NumPy files (*.npy)");
+                                                 MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (p.isEmpty()) return;
+        MainWindow::updateRecentDir("npy", p);
         QString e;
         if (!saveNpy(p, tstat_ptr->data(), static_cast<int64_t>(tstat_ptr->size()), e))
             QMessageBox::critical(dlg, "Export failed", e);
@@ -1826,8 +1931,9 @@ void MainWindow::onLoadNpyTTest() {
 
     auto* btn_exp_pdf_npy = new QPushButton("Export PDF…");
     connect(btn_exp_pdf_npy, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PDF", {}, "PDF files (*.pdf)");
+        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PDF", MainWindow::recentDir("export"), "PDF files (*.pdf)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("export", path);
         QPdfWriter writer(path);
         writer.setPageSize(QPageSize(QPageSize::A4));
         writer.setPageOrientation(QPageLayout::Landscape);
@@ -1843,8 +1949,9 @@ void MainWindow::onLoadNpyTTest() {
     });
     auto* btn_exp_png_npy = new QPushButton("Export PNG…");
     connect(btn_exp_png_npy, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PNG", {}, "PNG images (*.png)");
+        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PNG", MainWindow::recentDir("export"), "PNG images (*.png)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("export", path);
         QPixmap pix = pw->grab();
         if (!pix.save(path, "PNG"))
             QMessageBox::warning(dlg, "Export PNG", "Could not save:\n" + path);
@@ -1890,8 +1997,9 @@ void MainWindow::onLoadNpyTTest() {
 
 void MainWindow::onLoadNpyHeatmap() {
     QString path = QFileDialog::getOpenFileName(
-        this, "Load heatmap NPY", {}, "NumPy files (*.npy);;All files (*)");
+        this, "Load heatmap NPY", recentDir("npy"), "NumPy files (*.npy);;All files (*)");
     if (path.isEmpty()) return;
+    updateRecentDir("npy", path);
 
     std::vector<float> data;
     std::vector<int64_t> shape;
@@ -2019,8 +2127,9 @@ void MainWindow::onLoadNpyHeatmap() {
 
     auto* btn_exp_png = new QPushButton("Export PNG…");
     connect(btn_exp_png, &QPushButton::clicked, dlg, [=]() {
-        QString p = QFileDialog::getSaveFileName(dlg, "Export as PNG", {}, "PNG images (*.png)");
+        QString p = QFileDialog::getSaveFileName(dlg, "Export as PNG", MainWindow::recentDir("export"), "PNG images (*.png)");
         if (p.isEmpty()) return;
+        MainWindow::updateRecentDir("export", p);
         if (!heatmap->exportPng(p))
             QMessageBox::critical(dlg, "Export failed", "Could not write:\n" + p);
         else
@@ -2029,8 +2138,9 @@ void MainWindow::onLoadNpyHeatmap() {
 
     auto* btn_exp_npy = new QPushButton("Export .npy…");
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [=]() {
-        QString p = QFileDialog::getSaveFileName(dlg, "Export as NumPy", {}, "NumPy files (*.npy)");
+        QString p = QFileDialog::getSaveFileName(dlg, "Export as NumPy", MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (p.isEmpty()) return;
+        MainWindow::updateRecentDir("npy", p);
         FILE* fp = std::fopen(p.toLocal8Bit().constData(), "wb");
         if (!fp) { QMessageBox::critical(dlg, "Export failed", "Cannot create:\n" + p); return; }
         const uint8_t magic[] = {0x93,'N','U','M','P','Y',0x01,0x00};
@@ -2095,8 +2205,9 @@ void MainWindow::onLoadNpyHeatmap() {
 void MainWindow::onOpenNpyTraces() {
     QString path = QFileDialog::getOpenFileName(
         this, "Open NPY/NPZ as traces",
-        {}, "NumPy files (*.npy *.npz);;All files (*)");
+        recentDir("npy"), "NumPy files (*.npy *.npz);;All files (*)");
     if (path.isEmpty()) return;
+    updateRecentDir("npy", path);
 
     std::vector<float> traces_flat;
     std::vector<float> data_flat;
@@ -2310,8 +2421,9 @@ void MainWindow::onExportNpy() {
     for (const auto& t : activeDs().pipeline) out_samples = t->transformedCount(out_samples);
 
     QString path = QFileDialog::getSaveFileName(
-        this, "Export traces as NPY", {}, "NumPy files (*.npy)");
+        this, "Export traces as NPY", recentDir("npy"), "NumPy files (*.npy)");
     if (path.isEmpty()) return;
+    updateRecentDir("npy", path);
 
     // Allocate full matrix (may be large)
     const size_t total = static_cast<size_t>(count) * static_cast<size_t>(out_samples);
@@ -2390,8 +2502,9 @@ void MainWindow::onExportNpz() {
     for (const auto& t : activeDs().pipeline) out_samples = t->transformedCount(out_samples);
 
     QString path = QFileDialog::getSaveFileName(
-        this, "Export traces as NPZ", {}, "NumPy archives (*.npz)");
+        this, "Export traces as NPZ", recentDir("npy"), "NumPy archives (*.npz)");
     if (path.isEmpty()) return;
+    updateRecentDir("npy", path);
 
     // Build trace matrix
     std::vector<float> traces(static_cast<size_t>(count) * static_cast<size_t>(out_samples));
@@ -2665,8 +2778,9 @@ void MainWindow::onRunTTest() {
 
     connect(btn_exp_trs, &QPushButton::clicked, dlg, [dlg, tstat_ptr]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as TRS",
-                                                    {}, "TRS files (*.trs)");
+                                                    MainWindow::recentDir("trs"), "TRS files (*.trs)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("trs", path);
         // Write single-trace float32 TRS
         FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
         if (!fp) { QMessageBox::critical(dlg, "Export failed", "Cannot create file."); return; }
@@ -2688,8 +2802,9 @@ void MainWindow::onRunTTest() {
 
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, tstat_ptr, acc_ptr]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as NumPy",
-                                                    {}, "NumPy archive (*.npz)");
+                                                    MainWindow::recentDir("npy"), "NumPy archive (*.npz)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("npy", path);
         std::vector<double> df_vec;
         acc_ptr->computeWelchDf(df_vec);
         std::vector<std::pair<std::string, std::vector<uint8_t>>> entries;
@@ -2815,8 +2930,9 @@ void MainWindow::onRunTTest() {
     // PDF / PNG export buttons
     auto* btn_exp_pdf = new QPushButton("Export PDF…");
     connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PDF", {}, "PDF files (*.pdf)");
+        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PDF", MainWindow::recentDir("export"), "PDF files (*.pdf)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("export", path);
         QPdfWriter writer(path);
         writer.setPageSize(QPageSize(QPageSize::A4));
         writer.setPageOrientation(QPageLayout::Landscape);
@@ -2832,8 +2948,9 @@ void MainWindow::onRunTTest() {
     });
     auto* btn_exp_png = new QPushButton("Export PNG…");
     connect(btn_exp_png, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PNG", {}, "PNG images (*.png)");
+        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PNG", MainWindow::recentDir("export"), "PNG images (*.png)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("export", path);
         QPixmap pix = pw->grab();
         if (!pix.save(path, "PNG"))
             QMessageBox::warning(dlg, "Export PNG", "Could not save:\n" + path);
@@ -2996,8 +3113,9 @@ void MainWindow::onCropEdit() {
         const TrsHeader& h = activeDs().file->header();
 
         QString path = QFileDialog::getSaveFileName(
-            dlg, "Export cropped TRS", {}, "TRS files (*.trs)");
+            dlg, "Export cropped TRS", MainWindow::recentDir("trs"), "TRS files (*.trs)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("trs", path);
 
         int n_traces = h.num_traces;
         QProgressDialog prog("Exporting traces…", "Cancel", 0, n_traces, dlg);
@@ -3450,8 +3568,9 @@ void MainWindow::onRunXCorr() {
 
     connect(btn_exp_png, &QPushButton::clicked, dlg, [=]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export heatmap as PNG",
-                                                    {}, "PNG images (*.png)");
+                                                    MainWindow::recentDir("export"), "PNG images (*.png)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("export", path);
         if (!heatmap->exportPng(path))
             QMessageBox::critical(dlg, "Export failed", "Could not write:\n" + path);
         else
@@ -3460,8 +3579,9 @@ void MainWindow::onRunXCorr() {
 
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [=]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export matrix as NumPy",
-                                                    {}, "NumPy files (*.npy)");
+                                                    MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("npy", path);
         // Write 2-D float32 .npy
         FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
         if (!fp) { QMessageBox::critical(dlg, "Export failed", "Cannot create:\n" + path); return; }
@@ -3519,8 +3639,9 @@ void MainWindow::onRunXCorr() {
         if (rows <= 0 || cols <= 0) return;
 
         QString path = QFileDialog::getSaveFileName(dlg, "Export correlation traces as TRS",
-                                                    {}, "TRS files (*.trs);;All files (*)");
+                                                    MainWindow::recentDir("trs"), "TRS files (*.trs);;All files (*)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("trs", path);
 
         FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
         if (!fp) {
@@ -3713,6 +3834,15 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
             default: break;
         }
         return std::make_shared<STFTMagnitudeTransform>(sp_win->value(), sp_hop->value(), win);
+    }
+    case 9: {
+        bool ok;
+        double ns = QInputDialog::getDouble(this, "Gaussian Noise",
+                                            "Noise level (fraction of per-trace std):\n"
+                                            "e.g. 0.1 adds noise with σ = 10 % of the trace's own std",
+                                            0.1, 0.0, 1e6, 4, &ok);
+        if (!ok) return nullptr;
+        return std::make_shared<GaussianNoiseTransform>(static_cast<float>(ns));
     }
     default: return nullptr;
     }
@@ -4082,6 +4212,7 @@ void MainWindow::onAlignTraces()
         }
 
         // Store alignment state for CPA
+        saveSnapshot();
         activeDs().align_first_trace  = first_tr;
         activeDs().align_first_sample = out_start;
         activeDs().align_n_samples    = out_len;
@@ -4418,8 +4549,9 @@ void MainWindow::onRunCpa() {
 
     // Export .npy
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [this, result_ptr, NS]() {
-        QString path = QFileDialog::getSaveFileName(this, "Export CPA result", {}, "NumPy (*.npy)");
+        QString path = QFileDialog::getSaveFileName(this, "Export CPA result", MainWindow::recentDir("npy"), "NumPy (*.npy)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("npy", path);
         QFile f(path);
         if (!f.open(QIODevice::WriteOnly)) return;
         // Write NPY v1.0 header for float32 array shape (M, NS)
@@ -4680,8 +4812,9 @@ void MainWindow::onRunSNR() {
     auto* btn_exp_npy = new QPushButton("Export .npy…");
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, snr_ptr]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export SNR as NumPy",
-                                                    {}, "NumPy files (*.npy)");
+                                                    MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("npy", path);
         QString e;
         if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
             QMessageBox::critical(dlg, "Export failed", e);
@@ -4692,8 +4825,9 @@ void MainWindow::onRunSNR() {
     auto* btn_exp_pdf = new QPushButton("Export PDF…");
     connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export SNR as PDF",
-                                                    {}, "PDF files (*.pdf)");
+                                                    MainWindow::recentDir("export"), "PDF files (*.pdf)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("export", path);
         QPixmap px = pw->grab();
         QPdfWriter writer(path);
         writer.setResolution(150);
@@ -4851,8 +4985,9 @@ void MainWindow::onRunStaticSNR() {
     auto* btn_exp_npy = new QPushButton("Export .npy…");
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, snr_ptr]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export static SNR as NumPy",
-                                                    {}, "NumPy files (*.npy)");
+                                                    MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("npy", path);
         QString e;
         if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
             QMessageBox::critical(dlg, "Export failed", e);
@@ -4863,8 +4998,9 @@ void MainWindow::onRunStaticSNR() {
     auto* btn_exp_pdf = new QPushButton("Export PDF…");
     connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export static SNR as PDF",
-                                                    {}, "PDF files (*.pdf)");
+                                                    MainWindow::recentDir("export"), "PDF files (*.pdf)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("export", path);
         QPixmap px = pw->grab();
         QPdfWriter writer(path);
         writer.setResolution(150);
@@ -5112,8 +5248,9 @@ void MainWindow::onRunFFT() {
     auto* btn_exp_npy = new QPushButton("Export .npy…");
     connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, avg_ptr]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as NumPy",
-                                                    {}, "NumPy files (*.npy)");
+                                                    MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("npy", path);
         QString e;
         if (!saveNpy(path, avg_ptr->data(), static_cast<int64_t>(avg_ptr->size()), e))
             QMessageBox::critical(dlg, "Export failed", e);
@@ -5124,8 +5261,9 @@ void MainWindow::onRunFFT() {
     auto* btn_exp_pdf = new QPushButton("Export PDF…");
     connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as PDF",
-                                                    {}, "PDF files (*.pdf)");
+                                                    MainWindow::recentDir("export"), "PDF files (*.pdf)");
         if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("export", path);
         QPixmap px = pw->grab();
         QPdfWriter writer(path);
         writer.setResolution(150);
@@ -5491,8 +5629,9 @@ void MainWindow::onExportDataset() {
 
     // ── Pick output path ──────────────────────────────────────────────────
     QString out_path = QFileDialog::getSaveFileName(
-        this, "Export Dataset", {}, "NumPy archive (*.npz)");
+        this, "Export Dataset", recentDir("npy"), "NumPy archive (*.npz)");
     if (out_path.isEmpty()) return;
+    updateRecentDir("npy", out_path);
 
     // ── Accumulate ────────────────────────────────────────────────────────
     std::vector<float> traces_flat(static_cast<size_t>(count) * static_cast<size_t>(eff_ns), 0.0f);

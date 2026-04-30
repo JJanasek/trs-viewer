@@ -97,6 +97,37 @@ int64_t MovingAverageTransform::apply(float* buf, int64_t count, int64_t) {
 }
 
 // ---------------------------------------------------------------------------
+// GaussianNoiseTransform
+// ---------------------------------------------------------------------------
+std::string GaussianNoiseTransform::name() const {
+    char buf[64];
+    std::snprintf(buf, sizeof(buf), "Gaussian Noise (%.4g × trace std)", noise_std_);
+    return buf;
+}
+
+int64_t GaussianNoiseTransform::apply(float* buf, int64_t count, int64_t) {
+    if (noise_std_ <= 0.f || count == 0) return count;
+
+    // Compute per-trace mean and std so noise is scale-independent.
+    double mean = 0.0;
+    for (int64_t i = 0; i < count; i++) mean += buf[i];
+    mean /= static_cast<double>(count);
+
+    double var = 0.0;
+    for (int64_t i = 0; i < count; i++) {
+        double d = static_cast<double>(buf[i]) - mean;
+        var += d * d;
+    }
+    float trace_std = static_cast<float>(std::sqrt(var / static_cast<double>(count)));
+    trace_std = std::max(trace_std, 1e-8f);
+
+    float effective_sigma = noise_std_ * trace_std;
+    for (int64_t i = 0; i < count; i++)
+        buf[i] += dist_(rng_) * effective_sigma;
+    return count;
+}
+
+// ---------------------------------------------------------------------------
 // WindowResampleTransform  (block decimation: floor(N/W) output samples)
 // ---------------------------------------------------------------------------
 WindowResampleTransform::WindowResampleTransform(int window_size)

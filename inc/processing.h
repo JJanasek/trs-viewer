@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -229,6 +230,34 @@ private:
 //
 // Output length = num_windows * (window_size/2 + 1)
 //   where  num_windows = max(0, (N - window_size) / hop_size + 1)
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Gaussian Noise: adds i.i.d. Gaussian noise N(0, σ²) to every sample.
+// Stateless between traces; σ is in the same units as the trace amplitude.
+// ---------------------------------------------------------------------------
+// noise_std is a relative factor: actual noise = N(0, (noise_std × trace_std)²)
+// so the effect is scale-independent across different trace amplitudes.
+class GaussianNoiseTransform : public ITransform {
+public:
+    explicit GaussianNoiseTransform(float noise_std = 0.1f)
+        : noise_std_(noise_std), rng_(std::random_device{}()), dist_(0.f, 1.f) {}
+
+    std::string name() const override;
+    int64_t apply(float* buf, int64_t count, int64_t) override;
+
+    void  setNoiseStd(float s) { noise_std_ = s; }
+    float noiseStd()     const { return noise_std_; }
+
+    std::shared_ptr<ITransform> clone() const override {
+        return std::make_shared<GaussianNoiseTransform>(*this);
+    }
+
+private:
+    float noise_std_;
+    mutable std::mt19937 rng_;
+    mutable std::normal_distribution<float> dist_;
+};
+
 // ---------------------------------------------------------------------------
 class STFTMagnitudeTransform : public ITransform {
 public:
