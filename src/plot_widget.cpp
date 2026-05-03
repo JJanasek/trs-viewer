@@ -1,5 +1,6 @@
 #include "plot_widget.h"
 
+#include <QKeyEvent>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QWheelEvent>
@@ -28,12 +29,12 @@ PlotTheme PlotTheme::dark() {
 
 PlotTheme PlotTheme::light() {
     return {
-        QColor(220, 220, 228),  // bg_outer
-        QColor(255, 255, 255),  // bg_plot
-        QColor(210, 210, 218),  // grid
-        QColor(140, 140, 160),  // border
-        QColor( 50,  50,  70),  // axis_text
-        QColor( 30,  30,  50),  // legend_text
+        QColor(255, 255, 255),  // bg_outer  – pure white (blends into paper)
+        QColor(255, 255, 255),  // bg_plot   – pure white
+        QColor(204, 204, 204),  // grid      – matplotlib light gray
+        QColor( 30,  30,  30),  // border    – near-black spines
+        QColor(  0,   0,   0),  // axis_text – black
+        QColor(  0,   0,   0),  // legend_text – black
     };
 }
 
@@ -45,6 +46,7 @@ PlotWidget::PlotWidget(QWidget* parent)
 {
     setMouseTracking(true);
     setMinimumSize(400, 200);
+    setFocusPolicy(Qt::StrongFocus);
     setTheme(PlotTheme::dark());
 
     wheel_debounce_ = new QTimer(this);
@@ -77,6 +79,8 @@ void PlotWidget::setMode(InteractionMode mode) {
         setCursor(Qt::ArrowCursor);
     dragging_           = false;
     rubber_band_active_ = false;
+    pending_cut_start_  = -1;
+    pending_cut_end_    = -1;
     update();
 }
 
@@ -173,6 +177,35 @@ void PlotWidget::restoreViewState(const PlotViewState& s) {
     emit cropRangesChanged();
     update();
     restoring_view_ = false;
+}
+
+void PlotWidget::setViewRange(int64_t start, int64_t end) {
+    if (end <= start || total_samples_ <= 0) return;
+    view_start_ = std::clamp(start, INT64_C(0), total_samples_);
+    view_end_   = std::clamp(end,   INT64_C(0), total_samples_);
+    if (view_end_ <= view_start_) view_end_ = std::min(view_start_ + 1, total_samples_);
+    emit viewChanged(view_start_, view_end_, total_samples_);
+    update();
+}
+
+void PlotWidget::setCropOverlayVisible(bool visible) {
+    crop_overlay_visible_ = visible;
+    update();
+}
+
+void PlotWidget::replaceMemTrace(int idx, std::shared_ptr<std::vector<float>> data) {
+    if (idx < 0 || idx >= static_cast<int>(traces_.size())) return;
+    auto& te = traces_[static_cast<size_t>(idx)];
+    if (!te.mem_data) return;
+    te.mem_data    = std::move(data);
+    te.cache.valid = false;
+    total_samples_ = 0;
+    for (const auto& t : traces_)
+        if (t.mem_data) total_samples_ = std::max(total_samples_, static_cast<int64_t>(t.mem_data->size()));
+    view_end_   = std::min(view_end_, total_samples_);
+    view_start_ = std::clamp(view_start_, INT64_C(0), std::max(INT64_C(0), view_end_ - 1));
+    emit viewChanged(view_start_, view_end_, total_samples_);
+    update();
 }
 
 // ---------------------------------------------------------------------------
@@ -511,8 +544,10 @@ void PlotWidget::buildTraceCache(TraceEntry& te, int W)
         te.cache.raw_read = raw_read;
 
         for (float v : te.cache.samples) {
-            te.cache.ymin = std::min(te.cache.ymin, v);
-            te.cache.ymax = std::max(te.cache.ymax, v);
+            if (!std::isnan(v)) {
+                te.cache.ymin = std::min(te.cache.ymin, v);
+                te.cache.ymax = std::max(te.cache.ymax, v);
+            }
         }
         return;
     }
@@ -629,18 +664,26 @@ void PlotWidget::renderTrace(const TraceEntry& te, QPainter& p,
         };
 
         {
+            // Split polyline at NaN gaps (used by the cut/exclude feature)
             std::vector<QPointF> pts;
             pts.reserve(static_cast<size_t>(out_count));
-            for (int64_t i = 0; i < out_count; i++)
-                pts.emplace_back(sxf(i), valueToPixel(buf[i], pr, ymin, ymax));
-            p.drawPolyline(pts.data(), static_cast<int>(pts.size()));
+            for (int64_t i = 0; i < out_count; i++) {
+                if (std::isnan(buf[i])) {
+                    if (pts.size() > 1) p.drawPolyline(pts.data(), static_cast<int>(pts.size()));
+                    pts.clear();
+                } else {
+                    pts.emplace_back(sxf(i), valueToPixel(buf[i], pr, ymin, ymax));
+                }
+            }
+            if (pts.size() > 1) p.drawPolyline(pts.data(), static_cast<int>(pts.size()));
         }
 
         if (out_count > 0 && W / out_count >= 4) {
             p.setBrush(te.color);
             p.setPen(Qt::NoPen);
             for (int64_t i = 0; i < out_count; i++)
-                p.drawEllipse(QPointF(sxf(i), valueToPixel(buf[i], pr, ymin, ymax)), 3.0, 3.0);
+                if (!std::isnan(buf[i]))
+                    p.drawEllipse(QPointF(sxf(i), valueToPixel(buf[i], pr, ymin, ymax)), 3.0, 3.0);
             p.setBrush(Qt::NoBrush);
         }
         p.setRenderHint(QPainter::Antialiasing, false);
@@ -822,7 +865,7 @@ void PlotWidget::paintEvent(QPaintEvent*) {
 
     // Threshold lines
     if (show_thresholds_) {
-        const QColor thr_color(220, 120, 0, 230);  // amber-orange
+        const QColor thr_color(214, 39, 40, 230);  // matplotlib red
         QPen thr_pen(thr_color, 1.2, Qt::DashLine);
         QFont tf = font(); tf.setPointSize(8); tf.setBold(true);
         auto drawThrLine = [&](double tv) {
@@ -840,7 +883,7 @@ void PlotWidget::paintEvent(QPaintEvent*) {
     }
 
     // Crop range overlays (drawn on top of traces)
-    if (!crop_ranges_.empty()) {
+    if (!crop_ranges_.empty() && crop_overlay_visible_) {
         // Two alternating green hues for adjacent ranges
         const QColor fill_colors[2] = { QColor(60, 200, 80, 45),  QColor(60, 200, 160, 45)  };
         const QColor line_colors[2] = { QColor(80, 220, 80, 200), QColor(80, 220, 160, 200) };
@@ -930,6 +973,18 @@ void PlotWidget::paintEvent(QPaintEvent*) {
         QFont lf = font(); lf.setPointSize(8); p.setFont(lf);
         int lx = pr.right() - 6;
         int ly = pr.top() + 8;
+
+        // Count entries so we can draw a matching background rect first
+        int n_legend = 0;
+        for (const auto& te : traces_) if (te.visible) n_legend++;
+        if (show_thresholds_) n_legend += threshold_one_sided_ ? 1 : 2;
+        if (n_legend > 0) {
+            QRect bg(lx - 168, ly - 6, 172, n_legend * 18 + 4);
+            p.fillRect(bg, theme_.bg_plot);
+            p.setPen(QPen(theme_.border, 1));
+            p.drawRect(bg);
+        }
+
         for (const auto& te : traces_) {
             if (!te.visible) continue;
             if (te.filled) {
@@ -951,15 +1006,26 @@ void PlotWidget::paintEvent(QPaintEvent*) {
             p.drawLine(lx - 18, ly, lx, ly);
             p.setPen(theme_.legend_text);
             p.drawText(lx - 150, ly - 8, 128, 16, Qt::AlignRight,
-                       QString("Threshold (+%1)").arg(threshold_pos_, 0, 'f', 1));
-            ly += 18;
-            if (!threshold_one_sided_) {
-                p.setPen(QPen(thr_color, 1, Qt::DashLine));
-                p.drawLine(lx - 18, ly, lx, ly);
-                p.setPen(theme_.legend_text);
-                p.drawText(lx - 150, ly - 8, 128, 16, Qt::AlignRight,
-                           QString("Threshold (-%1)").arg(threshold_pos_, 0, 'f', 1));
-            }
+                       threshold_one_sided_
+                           ? QString("Threshold (%1)").arg(threshold_pos_, 0, 'f', 1)
+                           : QString("Threshold (±%1)").arg(threshold_pos_, 0, 'f', 1));
+            if (!threshold_one_sided_) ly += 18;  // no second line needed
+        }
+    }
+
+    // Pending cut overlay (CropSelect mode: drag done, waiting for Enter)
+    if (pending_cut_start_ >= 0) {
+        int x1 = std::clamp(sampleToPixel(pending_cut_start_, pr), pr.left(), pr.right());
+        int x2 = std::clamp(sampleToPixel(pending_cut_end_,   pr), pr.left(), pr.right());
+        if (x1 > x2) std::swap(x1, x2);
+        if (x2 > x1) {
+            p.fillRect(QRect(x1, pr.top(), x2-x1, pr.height()), QColor(255, 140, 0, 60));
+            p.setPen(QPen(QColor(255, 160, 0, 220), 1, Qt::DashLine));
+            p.drawLine(x1, pr.top(), x1, pr.bottom());
+            p.drawLine(x2, pr.top(), x2, pr.bottom());
+            QFont cf = font(); cf.setPointSize(8); cf.setBold(true); p.setFont(cf);
+            p.setPen(QColor(255, 160, 0, 220));
+            p.drawText(x1 + 4, pr.top() + 14, "Cut? [↵ confirm  Esc cancel]");
         }
     }
 
@@ -1113,9 +1179,9 @@ void PlotWidget::mouseReleaseEvent(QMouseEvent* e) {
                     view_end_   = s2;
                     emit viewChanged(view_start_, view_end_, total_samples_);
                 } else {
-                    // CropSelect: append to crop list
-                    crop_ranges_.push_back({s1, s2});
-                    emit cropRangesChanged();
+                    // CropSelect: stage as pending — user presses Enter to confirm, Escape to cancel
+                    pending_cut_start_ = s1;
+                    pending_cut_end_   = s2;
                 }
             }
         }
@@ -1183,4 +1249,24 @@ void PlotWidget::wheelEvent(QWheelEvent* e) {
 
 void PlotWidget::resizeEvent(QResizeEvent*) {
     update();
+}
+
+void PlotWidget::keyPressEvent(QKeyEvent* ev) {
+    if (mode_ == InteractionMode::CropSelect && pending_cut_start_ >= 0) {
+        if (ev->key() == Qt::Key_Return || ev->key() == Qt::Key_Enter) {
+            crop_ranges_.push_back({pending_cut_start_, pending_cut_end_});
+            pending_cut_start_ = pending_cut_end_ = -1;
+            emit cropRangesChanged();
+            update();
+            ev->accept();
+            return;
+        }
+        if (ev->key() == Qt::Key_Escape) {
+            pending_cut_start_ = pending_cut_end_ = -1;
+            update();
+            ev->accept();
+            return;
+        }
+    }
+    QWidget::keyPressEvent(ev);
 }
