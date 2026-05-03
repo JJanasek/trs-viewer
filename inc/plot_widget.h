@@ -142,6 +142,10 @@ public:
     int64_t viewStart()     const { return view_start_; }
     int64_t viewEnd()       const { return view_end_;   }
     int64_t totalSamples()  const { return total_samples_; }
+    // Programmatically set the visible window (clamped to [0, total_samples]).
+    void    setViewRange(int64_t start, int64_t end);
+    // When false the crop-range green overlays are not drawn (but ranges are still tracked).
+    void    setCropOverlayVisible(bool visible);
 
     // Crop ranges (used by CropSelect mode and crop dialog)
     void    addCropRange(int64_t start, int64_t end);
@@ -158,6 +162,9 @@ public:
     // View state snapshot (for undo)
     PlotViewState captureViewState() const;
     void          restoreViewState(const PlotViewState& s);
+
+    // Replace the data of an existing in-memory trace without resetting the view.
+    void replaceMemTrace(int idx, std::shared_ptr<std::vector<float>> data);
 
 signals:
     void viewChanged(int64_t view_start, int64_t view_end, int64_t total_samples);
@@ -182,6 +189,7 @@ protected:
     void mouseReleaseEvent(QMouseEvent*) override;
     void wheelEvent(QWheelEvent*) override;
     void resizeEvent(QResizeEvent*) override;
+    void keyPressEvent(QKeyEvent*) override;
 
 private:
     QRect   plotRect() const;
@@ -239,6 +247,11 @@ private:
 
     // Crop ranges
     std::vector<std::pair<int64_t,int64_t>> crop_ranges_;
+    bool crop_overlay_visible_ = true;
+
+    // Pending cut selection (CropSelect mode: drag sets this, Enter confirms it)
+    int64_t pending_cut_start_ = -1;
+    int64_t pending_cut_end_   = -1;
 
     // Debounce for beforeViewChange() signal (wheel scroll bursts)
     QTimer* wheel_debounce_  = nullptr;

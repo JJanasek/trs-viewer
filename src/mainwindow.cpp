@@ -867,6 +867,7 @@ void MainWindow::onResetView() {
 void MainWindow::onViewChanged(int64_t start, int64_t end, int64_t /*total*/) {
     int64_t raw_span = end - start;
     int64_t eff_span = raw_span;
+    if (!hasActiveDs()) { lbl_view_->setText(QString("View: [%1 – %2]").arg(start).arg(end)); return; }
     for (const auto& t : activeDs().pipeline)
         eff_span = t->transformedCount(eff_span);
     if (eff_span != raw_span)
@@ -1750,8 +1751,9 @@ void MainWindow::onLoadNpyTTest() {
         }
     }
 
-    auto tstat_ptr = std::make_shared<std::vector<float>>(std::move(data));
-    auto df_ptr    = std::make_shared<std::vector<double>>(std::move(df_loaded));
+    auto tstat_ptr   = std::make_shared<std::vector<float>>(std::move(data));
+    auto df_ptr      = std::make_shared<std::vector<double>>(std::move(df_loaded));
+    auto current_ptr = std::make_shared<std::vector<float>>(*tstat_ptr);
 
     auto* dlg = new QDialog(this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -1761,7 +1763,8 @@ void MainWindow::onLoadNpyTTest() {
     dlg->resize(1100, 520);
 
     auto* pw = new PlotWidget(dlg);
-    pw->addTrace(tstat_ptr, QColor("#4488ff"), "t-stat range");
+    pw->setTheme(PlotTheme::light());
+    pw->addTrace(current_ptr, QColor("#1f77b4"), "t-value");
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", "t-value");
     pw->setThresholds(true, 4.5, -4.5);
@@ -1782,13 +1785,13 @@ void MainWindow::onLoadNpyTTest() {
     });
 
     auto* btn_exp_npy = new QPushButton("Export .npy…");
-    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, tstat_ptr]() {
+    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, current_ptr]() {
         QString p = QFileDialog::getSaveFileName(dlg, "Export t-test as NumPy",
                                                  MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (p.isEmpty()) return;
         MainWindow::updateRecentDir("npy", p);
         QString e;
-        if (!saveNpy(p, tstat_ptr->data(), static_cast<int64_t>(tstat_ptr->size()), e))
+        if (!saveNpy(p, current_ptr->data(), static_cast<int64_t>(current_ptr->size()), e))
             QMessageBox::critical(dlg, "Export failed", e);
         else
             QMessageBox::information(dlg, "Saved", "Saved: " + p);
@@ -1962,10 +1965,48 @@ void MainWindow::onLoadNpyTTest() {
     auto* ctrl   = new QWidget(dlg);
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
-    ctrl_l->addWidget(new QLabel(QString("Samples: <b>%1</b>").arg(tstat_ptr->size())));
     ctrl_l->setSpacing(6);
-    auto* lbl_f = qobject_cast<QLabel*>(ctrl_l->itemAt(0)->widget());
-    if (lbl_f) lbl_f->setTextFormat(Qt::RichText);
+
+    // Mode buttons
+    auto* btn_pan_npy  = new QPushButton("Pan");
+    auto* btn_meas_npy = new QPushButton("Measure");
+    auto* btn_bz_npy   = new QPushButton("⬚ Zoom");
+    auto* btn_crop_npy = new QPushButton("✂ Cut");
+    auto* btn_rst_npy  = new QPushButton("Reset");
+    btn_pan_npy->setCheckable(true);  btn_pan_npy->setChecked(true);
+    btn_meas_npy->setCheckable(true);
+    btn_bz_npy->setCheckable(true);
+    btn_crop_npy->setCheckable(true);
+    btn_pan_npy->setToolTip("Drag to pan, scroll to zoom");
+    btn_meas_npy->setToolTip("Click two points to measure distance");
+    btn_bz_npy->setToolTip("Drag to rubber-band zoom");
+    btn_crop_npy->setToolTip("Drag to select a region to cut (exclude from export)");
+    btn_rst_npy->setToolTip("Reset view");
+    auto* mg_npy = new QButtonGroup(dlg);
+    mg_npy->addButton(btn_pan_npy,  0);
+    mg_npy->addButton(btn_meas_npy, 1);
+    mg_npy->addButton(btn_bz_npy,   2);
+    mg_npy->addButton(btn_crop_npy, 3);
+    connect(mg_npy, QOverload<int>::of(&QButtonGroup::idClicked), dlg, [pw](int id) {
+        InteractionMode m = id == 0 ? InteractionMode::Pan
+                          : id == 1 ? InteractionMode::Measure
+                          : id == 2 ? InteractionMode::BoxZoom
+                                    : InteractionMode::CropSelect;
+        pw->setMode(m);
+    });
+    connect(btn_rst_npy, &QPushButton::clicked, dlg, [pw]() { pw->resetView(); });
+
+    ctrl_l->addWidget(btn_pan_npy);
+    ctrl_l->addWidget(btn_meas_npy);
+    ctrl_l->addWidget(btn_bz_npy);
+    ctrl_l->addWidget(btn_crop_npy);
+    ctrl_l->addWidget(btn_rst_npy);
+    ctrl_l->addSpacing(8);
+    ctrl_l->addWidget(new QLabel(QString("Samples: <b>%1</b>").arg(tstat_ptr->size())));
+    {
+        auto* lbl_f = qobject_cast<QLabel*>(ctrl_l->itemAt(ctrl_l->count()-1)->widget());
+        if (lbl_f) lbl_f->setTextFormat(Qt::RichText);
+    }
     ctrl_l->addStretch();
     auto* btn_yzi_npy = new QPushButton("↑ Amp");
     auto* btn_yzo_npy = new QPushButton("↓ Amp");
@@ -1988,9 +2029,65 @@ void MainWindow::onLoadNpyTTest() {
     ctrl_l->addWidget(btn_exp_pdf_npy);
     ctrl_l->addWidget(btn_exp_png_npy);
 
+    // Trim row
+    int64_t n_full_npy = static_cast<int64_t>(tstat_ptr->size());
+    auto* trim_row_npy = new QWidget(dlg);
+    auto* trim_l_npy   = new QHBoxLayout(trim_row_npy);
+    trim_l_npy->setContentsMargins(4, 0, 4, 0);
+    auto* sp_excl_start_npy = new QSpinBox; sp_excl_start_npy->setRange(0, static_cast<int>(n_full_npy / 2));
+    auto* sp_excl_end_npy   = new QSpinBox; sp_excl_end_npy->setRange(0, static_cast<int>(n_full_npy / 2));
+    sp_excl_start_npy->setToolTip("Samples to exclude from the start");
+    sp_excl_end_npy->setToolTip("Samples to exclude from the end");
+    auto* lbl_vis_npy = new QLabel; lbl_vis_npy->setTextFormat(Qt::RichText);
+
+    auto upd_lbl_npy = [=]() {
+        lbl_vis_npy->setText(QString("Exporting <b>%1</b> / %2 samples")
+            .arg(current_ptr->size()).arg(n_full_npy));
+    };
+    // Spinbox trim: rebuild current_ptr from original
+    auto skip_npy = std::make_shared<bool>(false);
+    auto do_trim_npy = [=]() {
+        int ts = sp_excl_start_npy->value(), te = sp_excl_end_npy->value();
+        int64_t s = ts, e = std::max<int64_t>(ts + 1, n_full_npy - te);
+        *current_ptr = std::vector<float>(tstat_ptr->begin() + s, tstat_ptr->begin() + e);
+        *skip_npy = true; pw->clearCropRanges(); *skip_npy = false;
+        pw->replaceMemTrace(0, current_ptr);
+        upd_lbl_npy();
+    };
+    // Cut confirmed: physically splice the selected range out of current_ptr
+    connect(pw, &PlotWidget::cropRangesChanged, dlg, [=]() {
+        if (*skip_npy) return;
+        const auto& cr = pw->cropRanges();
+        if (cr.empty()) return;
+        std::vector<std::pair<int64_t,int64_t>> cuts(cr.begin(), cr.end());
+        std::sort(cuts.begin(), cuts.end(),
+                  [](const auto& a, const auto& b){ return a.first > b.first; });
+        for (const auto& r : cuts) {
+            auto s = std::max<int64_t>(0, r.first);
+            auto e = std::min<int64_t>((int64_t)current_ptr->size(), r.second);
+            if (s < e) current_ptr->erase(current_ptr->begin() + s, current_ptr->begin() + e);
+        }
+        *skip_npy = true; pw->clearCropRanges(); *skip_npy = false;
+        pw->replaceMemTrace(0, current_ptr);
+        upd_lbl_npy();
+    });
+    connect(sp_excl_start_npy, QOverload<int>::of(&QSpinBox::valueChanged), dlg, [=](int){ do_trim_npy(); });
+    connect(sp_excl_end_npy,   QOverload<int>::of(&QSpinBox::valueChanged), dlg, [=](int){ do_trim_npy(); });
+    upd_lbl_npy();
+
+    trim_l_npy->addWidget(new QLabel("Exclude:"));
+    trim_l_npy->addWidget(new QLabel("start"));
+    trim_l_npy->addWidget(sp_excl_start_npy);
+    trim_l_npy->addWidget(new QLabel("end"));
+    trim_l_npy->addWidget(sp_excl_end_npy);
+    trim_l_npy->addWidget(new QLabel("samples  —"));
+    trim_l_npy->addWidget(lbl_vis_npy);
+    trim_l_npy->addStretch();
+
     auto* vl = new QVBoxLayout(dlg);
     vl->setContentsMargins(4, 4, 4, 4); vl->setSpacing(4);
     vl->addWidget(ctrl);
+    vl->addWidget(trim_row_npy);
     vl->addWidget(pw, 1);
     dlg->show();
 }
@@ -2735,7 +2832,11 @@ void MainWindow::onRunTTest() {
     int64_t n0 = acc.countGroup(0), n1 = acc.countGroup(1);
 
     // --- Result window ---
-    auto tstat_ptr = std::make_shared<std::vector<float>>(std::move(tstat));
+    auto tstat_ptr  = std::make_shared<std::vector<float>>(std::move(tstat));
+    auto current_ptr = std::make_shared<std::vector<float>>(*tstat_ptr);
+    auto df_orig    = std::make_shared<std::vector<double>>();
+    acc_ptr->computeWelchDf(*df_orig);
+    auto current_df = std::make_shared<std::vector<double>>(*df_orig);
 
     auto* dlg = new QDialog(this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -2744,7 +2845,8 @@ void MainWindow::onRunTTest() {
     dlg->resize(1100, 520);
 
     auto* pw = new PlotWidget(dlg);
-    pw->addTrace(tstat_ptr, QColor("#4488ff"), "t-stat range");
+    pw->setTheme(PlotTheme::light());
+    pw->addTrace(current_ptr, QColor("#1f77b4"), "t-value");
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", "t-value");
     pw->setThresholds(true, 4.5, -4.5);
@@ -2776,43 +2878,39 @@ void MainWindow::onRunTTest() {
     connect(spin_thr, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             [pw](double v) { pw->setThresholds(true, v, -v); });
 
-    connect(btn_exp_trs, &QPushButton::clicked, dlg, [dlg, tstat_ptr]() {
+    connect(btn_exp_trs, &QPushButton::clicked, dlg, [dlg, current_ptr]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as TRS",
                                                     MainWindow::recentDir("trs"), "TRS files (*.trs)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("trs", path);
-        // Write single-trace float32 TRS
         FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
         if (!fp) { QMessageBox::critical(dlg, "Export failed", "Cannot create file."); return; }
-        int32_t ns = static_cast<int32_t>(tstat_ptr->size());
-        // Header TLVs
+        int32_t ns = static_cast<int32_t>(current_ptr->size());
         auto wle32 = [&](int32_t v) {
             uint8_t b[4] = {uint8_t(v),uint8_t(v>>8),uint8_t(v>>16),uint8_t(v>>24)};
             std::fwrite(b, 1, 4, fp);
         };
         auto wtlv = [&](uint8_t tag, uint8_t len) { std::fputc(tag,fp); std::fputc(len,fp); };
-        wtlv(0x41, 4); wle32(1);     // NUMBER_TRACES = 1
-        wtlv(0x42, 4); wle32(ns);    // NUMBER_SAMPLES
-        wtlv(0x43, 1); std::fputc(0x14, fp);  // SAMPLE_CODING: float32
-        std::fputc(0x5F, fp); std::fputc(0x00, fp); // TRACE_BLOCK
-        std::fwrite(tstat_ptr->data(), sizeof(float), static_cast<size_t>(ns), fp);
+        wtlv(0x41, 4); wle32(1);
+        wtlv(0x42, 4); wle32(ns);
+        wtlv(0x43, 1); std::fputc(0x14, fp);
+        std::fputc(0x5F, fp); std::fputc(0x00, fp);
+        std::fwrite(current_ptr->data(), sizeof(float), static_cast<size_t>(ns), fp);
         std::fclose(fp);
         QMessageBox::information(dlg, "Export complete", "Saved: " + path);
     });
 
-    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, tstat_ptr, acc_ptr]() {
+    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, current_ptr, current_df]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as NumPy",
                                                     MainWindow::recentDir("npy"), "NumPy archive (*.npz)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("npy", path);
-        std::vector<double> df_vec;
-        acc_ptr->computeWelchDf(df_vec);
         std::vector<std::pair<std::string, std::vector<uint8_t>>> entries;
-        entries.push_back({"tstat.npy", buildNpy1DBytes("<f4", tstat_ptr->data(),
-                                                         static_cast<int64_t>(tstat_ptr->size()),
+        entries.push_back({"tstat.npy", buildNpy1DBytes("<f4", current_ptr->data(),
+                                                         static_cast<int64_t>(current_ptr->size()),
                                                          sizeof(float))});
-        entries.push_back({"df.npy", buildNpy1DBytes("<f8", df_vec.data(),
-                                                      static_cast<int64_t>(df_vec.size()),
+        entries.push_back({"df.npy", buildNpy1DBytes("<f8", current_df->data(),
+                                                      static_cast<int64_t>(current_df->size()),
                                                       sizeof(double))});
         QString err;
         if (!saveNpz(path, entries, err))
@@ -2961,6 +3059,43 @@ void MainWindow::onRunTTest() {
     auto* ctrl = new QWidget(dlg);
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
+    ctrl_l->setSpacing(6);
+
+    // Mode buttons
+    auto* btn_pan_tt  = new QPushButton("Pan");
+    auto* btn_meas_tt = new QPushButton("Measure");
+    auto* btn_bz_tt   = new QPushButton("⬚ Zoom");
+    auto* btn_crop_tt = new QPushButton("✂ Cut");
+    auto* btn_rst_tt  = new QPushButton("Reset");
+    btn_pan_tt->setCheckable(true);  btn_pan_tt->setChecked(true);
+    btn_meas_tt->setCheckable(true);
+    btn_bz_tt->setCheckable(true);
+    btn_crop_tt->setCheckable(true);
+    btn_pan_tt->setToolTip("Drag to pan, scroll to zoom");
+    btn_meas_tt->setToolTip("Click two points to measure distance");
+    btn_bz_tt->setToolTip("Drag to rubber-band zoom");
+    btn_crop_tt->setToolTip("Drag to select a region to cut (exclude from export)");
+    btn_rst_tt->setToolTip("Reset view");
+    auto* mg_tt = new QButtonGroup(dlg);
+    mg_tt->addButton(btn_pan_tt,  0);
+    mg_tt->addButton(btn_meas_tt, 1);
+    mg_tt->addButton(btn_bz_tt,   2);
+    mg_tt->addButton(btn_crop_tt, 3);
+    connect(mg_tt, QOverload<int>::of(&QButtonGroup::idClicked), dlg, [pw](int id) {
+        InteractionMode m = id == 0 ? InteractionMode::Pan
+                          : id == 1 ? InteractionMode::Measure
+                          : id == 2 ? InteractionMode::BoxZoom
+                                    : InteractionMode::CropSelect;
+        pw->setMode(m);
+    });
+    connect(btn_rst_tt, &QPushButton::clicked, dlg, [pw]() { pw->resetView(); });
+
+    ctrl_l->addWidget(btn_pan_tt);
+    ctrl_l->addWidget(btn_meas_tt);
+    ctrl_l->addWidget(btn_bz_tt);
+    ctrl_l->addWidget(btn_crop_tt);
+    ctrl_l->addWidget(btn_rst_tt);
+    ctrl_l->addSpacing(8);
     ctrl_l->addWidget(lbl_groups);
     ctrl_l->addStretch();
     auto* btn_yzi = new QPushButton("↑ Amp");
@@ -2985,10 +3120,72 @@ void MainWindow::onRunTTest() {
     ctrl_l->addWidget(btn_exp_pdf);
     ctrl_l->addWidget(btn_exp_png);
 
+    // Trim row
+    int64_t n_full_tt = static_cast<int64_t>(tstat_ptr->size());
+    auto* trim_row = new QWidget(dlg);
+    auto* trim_l   = new QHBoxLayout(trim_row);
+    trim_l->setContentsMargins(4, 0, 4, 0);
+    auto* sp_excl_start = new QSpinBox; sp_excl_start->setRange(0, static_cast<int>(n_full_tt / 2));
+    auto* sp_excl_end   = new QSpinBox; sp_excl_end->setRange(0, static_cast<int>(n_full_tt / 2));
+    sp_excl_start->setToolTip("Samples to exclude from the start");
+    sp_excl_end->setToolTip("Samples to exclude from the end");
+    auto* lbl_vis_tt = new QLabel; lbl_vis_tt->setTextFormat(Qt::RichText);
+
+    auto upd_lbl_tt = [=]() {
+        lbl_vis_tt->setText(QString("Exporting <b>%1</b> / %2 samples")
+            .arg(current_ptr->size()).arg(n_full_tt));
+    };
+    auto skip_tt = std::make_shared<bool>(false);
+    auto do_trim_tt = [=]() {
+        int ts = sp_excl_start->value(), te = sp_excl_end->value();
+        int64_t s = ts, e = std::max<int64_t>(ts + 1, n_full_tt - te);
+        *current_ptr = std::vector<float>(tstat_ptr->begin() + s, tstat_ptr->begin() + e);
+        auto ds = std::min(s, (int64_t)df_orig->size());
+        auto de = std::min(e, (int64_t)df_orig->size());
+        *current_df = std::vector<double>(df_orig->begin() + ds, df_orig->begin() + de);
+        *skip_tt = true; pw->clearCropRanges(); *skip_tt = false;
+        pw->replaceMemTrace(0, current_ptr);
+        upd_lbl_tt();
+    };
+    connect(pw, &PlotWidget::cropRangesChanged, dlg, [=]() {
+        if (*skip_tt) return;
+        const auto& cr = pw->cropRanges();
+        if (cr.empty()) return;
+        std::vector<std::pair<int64_t,int64_t>> cuts(cr.begin(), cr.end());
+        std::sort(cuts.begin(), cuts.end(),
+                  [](const auto& a, const auto& b){ return a.first > b.first; });
+        for (const auto& r : cuts) {
+            auto s = std::max<int64_t>(0, r.first);
+            auto e = std::min<int64_t>((int64_t)current_ptr->size(), r.second);
+            if (s < e) {
+                current_ptr->erase(current_ptr->begin() + s, current_ptr->begin() + e);
+                auto ds = std::min(s,  (int64_t)current_df->size());
+                auto de = std::min(e,  (int64_t)current_df->size());
+                if (ds < de) current_df->erase(current_df->begin() + ds, current_df->begin() + de);
+            }
+        }
+        *skip_tt = true; pw->clearCropRanges(); *skip_tt = false;
+        pw->replaceMemTrace(0, current_ptr);
+        upd_lbl_tt();
+    });
+    connect(sp_excl_start, QOverload<int>::of(&QSpinBox::valueChanged), dlg, [=](int){ do_trim_tt(); });
+    connect(sp_excl_end,   QOverload<int>::of(&QSpinBox::valueChanged), dlg, [=](int){ do_trim_tt(); });
+    upd_lbl_tt();
+
+    trim_l->addWidget(new QLabel("Exclude:"));
+    trim_l->addWidget(new QLabel("start"));
+    trim_l->addWidget(sp_excl_start);
+    trim_l->addWidget(new QLabel("end"));
+    trim_l->addWidget(sp_excl_end);
+    trim_l->addWidget(new QLabel("samples  —"));
+    trim_l->addWidget(lbl_vis_tt);
+    trim_l->addStretch();
+
     auto* vl = new QVBoxLayout(dlg);
     vl->setContentsMargins(4, 4, 4, 4);
     vl->setSpacing(4);
     vl->addWidget(ctrl);
+    vl->addWidget(trim_row);
     vl->addWidget(pw, 1);
 
     dlg->show();
