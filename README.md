@@ -257,35 +257,32 @@ The `data` array feeds the CPA leakage model and the t-test group assignment, eq
 
 ---
 
-## Building
+## Installation
 
-### 1 · Install dependencies
+trs-viewer is built from source with CMake. Pick your platform below.
 
-**Arch Linux**
+### Linux
+
+**1 · Install dependencies**
+
+Arch Linux:
 ```bash
 sudo pacman -S base-devel cmake qt6-base eigen python python-numpy
 ```
 
-**Ubuntu / Debian (22.04+)**
+Ubuntu / Debian (22.04+):
 ```bash
 sudo apt install build-essential cmake qt6-base-dev libeigen3-dev \
                  python3-dev python3-numpy
 ```
 
-**Fedora**
+Fedora:
 ```bash
 sudo dnf install gcc-c++ cmake qt6-qtbase-devel eigen3-devel \
                  python3-devel python3-numpy
 ```
 
-**macOS (Homebrew)**
-```bash
-brew install cmake qt@6 eigen python numpy
-export CMAKE_PREFIX_PATH="$(brew --prefix qt@6)"
-```
-
-### 2 · Clone and build
-
+**2 · Clone and build**
 ```bash
 git clone <repo-url>
 cd trs-viewer
@@ -296,13 +293,69 @@ cmake --build build -j$(nproc)
 
 Binary is at `build/trs-viewer`.
 
-### 3 · Run
-
+**3 · Run**
 ```bash
 ./build/trs-viewer                    # file picker on startup
 ./build/trs-viewer path/to/file.trs   # open directly
 ./build/trs-viewer traces.npz         # open NPZ directly
 ```
+
+### Windows
+
+The project uses GCC-style compiler flags (`-Wall`, `-march=native`, …), so the
+easiest path on Windows is the **MSYS2 / MinGW-w64** toolchain rather than MSVC.
+
+**1 · Install MSYS2**
+
+Download and run the installer from [msys2.org](https://www.msys2.org/), then
+open the **"MSYS2 MINGW64"** shell from the Start menu (not the plain "MSYS2"
+shell — you need the MinGW64 environment).
+
+**2 · Install dependencies**
+```bash
+pacman -Syu   # if prompted to close the terminal, reopen MSYS2 MINGW64 and re-run
+pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
+                   mingw-w64-x86_64-qt6-base mingw-w64-x86_64-eigen3 \
+                   mingw-w64-x86_64-python mingw-w64-x86_64-python-numpy \
+                   mingw-w64-x86_64-ninja
+```
+
+**3 · Clone and build**
+
+Still inside the MSYS2 MINGW64 shell:
+```bash
+git clone <repo-url>
+cd trs-viewer
+
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
+
+Binary is at `build/trs-viewer.exe`.
+
+**4 · Run**
+```bash
+./build/trs-viewer.exe
+```
+
+To run the `.exe` outside the MSYS2 shell (e.g. by double-clicking it), the
+MinGW64 DLLs must be on `PATH` — either launch it from an MSYS2 MINGW64 shell,
+or add `C:\msys64\mingw64\bin` to your system `PATH`.
+
+### macOS
+
+```bash
+brew install cmake qt@6 eigen python numpy
+export CMAKE_PREFIX_PATH="$(brew --prefix qt@6)"
+
+git clone <repo-url>
+cd trs-viewer
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(sysctl -n hw.ncpu)
+```
+
+Binary is at `build/trs-viewer`.
 
 ---
 
