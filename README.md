@@ -300,47 +300,52 @@ Binary is at `build/trs-viewer`.
 ./build/trs-viewer traces.npz         # open NPZ directly
 ```
 
-### Windows
+### Windows (via WSL)
 
-The project uses GCC-style compiler flags (`-Wall`, `-march=native`, …), so the
-easiest path on Windows is the **MSYS2 / MinGW-w64** toolchain rather than MSVC.
+The project uses GCC-style compiler flags and is easiest to build on Windows
+through **WSL** (Windows Subsystem for Linux) — you get a real Linux userspace
+and can follow the Ubuntu instructions almost verbatim. GUI apps display on
+the Windows desktop automatically via **WSLg** (built into Windows 11 and
+recent Windows 10 updates).
 
-**1 · Install MSYS2**
+**1 · Install WSL**
 
-Download and run the installer from [msys2.org](https://www.msys2.org/), then
-open the **"MSYS2 MINGW64"** shell from the Start menu (not the plain "MSYS2"
-shell — you need the MinGW64 environment).
+In an elevated (Administrator) PowerShell:
+```powershell
+wsl --install -d Ubuntu
+```
+Reboot if prompted, then launch "Ubuntu" from the Start menu and finish the
+first-run setup (create a Unix username/password). If WSL is already
+installed but GUI apps don't appear, run `wsl --update` to make sure WSLg is
+current.
 
 **2 · Install dependencies**
+
+Inside the Ubuntu/WSL shell:
 ```bash
-pacman -Syu   # if prompted to close the terminal, reopen MSYS2 MINGW64 and re-run
-pacman -S --needed mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake \
-                   mingw-w64-x86_64-qt6-base mingw-w64-x86_64-eigen3 \
-                   mingw-w64-x86_64-python mingw-w64-x86_64-python-numpy \
-                   mingw-w64-x86_64-ninja
+sudo apt update
+sudo apt install build-essential cmake qt6-base-dev libeigen3-dev \
+                 python3-dev python3-numpy
 ```
 
 **3 · Clone and build**
-
-Still inside the MSYS2 MINGW64 shell:
 ```bash
 git clone <repo-url>
 cd trs-viewer
 
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 ```
 
-Binary is at `build/trs-viewer.exe`.
+Binary is at `build/trs-viewer`.
 
 **4 · Run**
 ```bash
-./build/trs-viewer.exe
+./build/trs-viewer
 ```
-
-To run the `.exe` outside the MSYS2 shell (e.g. by double-clicking it), the
-MinGW64 DLLs must be on `PATH` — either launch it from an MSYS2 MINGW64 shell,
-or add `C:\msys64\mingw64\bin` to your system `PATH`.
+The window opens on your Windows desktop via WSLg. Your Windows files are
+reachable from WSL under `/mnt/c/...` if you want to open `.trs` files stored
+outside the Linux filesystem.
 
 ### macOS
 
