@@ -250,6 +250,58 @@ int PlotWidget::nearestTrace(int px, int py, const QRect& pr) const {
     return best;
 }
 
+// ---------------------------------------------------------------------------
+// Stacked-mode layout
+// ---------------------------------------------------------------------------
+
+void PlotWidget::setStacked(bool on) {
+    if (stacked_ == on) return;
+    stacked_ = on;
+    update();
+}
+
+std::vector<PlotWidget::LaneInfo> PlotWidget::computeLanes(const QRect& pr) const {
+    std::vector<LaneInfo> lanes;
+    int n = 0;
+    for (const auto& te : traces_) if (te.visible) n++;
+    if (n == 0 || pr.height() <= 0) return lanes;
+    lanes.reserve(static_cast<size_t>(n));
+
+    constexpr int kGap = 2;
+    const int lane_h = pr.height() / n;
+    int lane_i = 0;
+    for (int i = 0; i < static_cast<int>(traces_.size()); i++) {
+        const auto& te = traces_[static_cast<size_t>(i)];
+        if (!te.visible) continue;
+
+        int top = pr.top() + lane_i * lane_h;
+        // Last lane absorbs the rounding remainder so it reaches pr.bottom().
+        int bottom = (lane_i == n - 1) ? pr.bottom() : (top + lane_h - 1);
+        QRect rect(pr.left(), top, pr.width(),
+                   std::max(1, bottom - top + 1 - kGap));
+
+        float ymin = te.cache.valid ? te.cache.ymin : -1.0f;
+        float ymax = te.cache.valid ? te.cache.ymax :  1.0f;
+        if (!(ymax > ymin)) { ymin -= 1.0f; ymax += 1.0f; }
+        else {
+            float pad = (ymax - ymin) * 0.1f;
+            ymin -= pad;
+            ymax += pad;
+        }
+
+        lanes.push_back({i, rect, ymin, ymax});
+        lane_i++;
+    }
+    return lanes;
+}
+
+int PlotWidget::laneIndexAt(int py, const QRect& pr) const {
+    for (const auto& lane : computeLanes(pr))
+        if (py >= lane.rect.top() && py <= lane.rect.bottom())
+            return lane.trace_idx;
+    return -1;
+}
+
 void PlotWidget::setThresholds(bool show, double pos, double neg) {
     show_thresholds_ = show;
     threshold_pos_   = pos;
@@ -830,41 +882,96 @@ void PlotWidget::paintEvent(QPaintEvent*) {
     for (auto& te : traces_)
         buildTraceCache(te, W);
 
-    float ymin, ymax;
-    computeYRange(ymin, ymax);
-    // Sticky range: expand eagerly, never auto-shrink (prevents flicker while panning).
-    // Reset by resetView(), resetYZoom(), or clearTraces().
-    if (ymin < sticky_ymin_) sticky_ymin_ = ymin;
-    if (ymax > sticky_ymax_) sticky_ymax_ = ymax;
-    ymin = sticky_ymin_;
-    ymax = sticky_ymax_;
-    // Apply Y-axis zoom (Ctrl+scroll): expand/contract range around centre.
-    if (y_scale_ != 1.0f) {
-        float center = (ymin + ymax) * 0.5f;
-        float half   = (ymax - ymin) * 0.5f * y_scale_;
-        ymin = center - half;
-        ymax = center + half;
-    }
-    last_ymin_ = ymin;
-    last_ymax_ = ymax;
+    float ymin = -1.0f, ymax = 1.0f;
 
-    // Grid
-    p.setPen(QPen(theme_.grid, 1));
-    for (int i = 1; i < 5; i++) {
-        int y = pr.top() + pr.height() * i / 5;
-        p.drawLine(pr.left(), y, pr.right(), y);
-    }
-    for (int i = 1; i < 10; i++) {
-        int x = pr.left() + pr.width() * i / 10;
-        p.drawLine(x, pr.top(), x, pr.bottom());
+    if (stacked_) {
+        // Shared vertical grid (sample position reference lines span all lanes).
+        p.setPen(QPen(theme_.grid, 1));
+        for (int i = 1; i < 10; i++) {
+            int x = pr.left() + pr.width() * i / 10;
+            p.drawLine(x, pr.top(), x, pr.bottom());
+        }
+
+        QFont lane_f = font(); lane_f.setPointSize(8); p.setFont(lane_f);
+        auto lanes = computeLanes(pr);
+        for (size_t li = 0; li < lanes.size(); li++) {
+            const LaneInfo& lane = lanes[li];
+            const TraceEntry& te = traces_[static_cast<size_t>(lane.trace_idx)];
+
+            // Divider between lanes
+            if (li > 0) {
+                p.setPen(theme_.border);
+                p.drawLine(lane.rect.left(), lane.rect.top(), lane.rect.right(), lane.rect.top());
+            }
+
+            // Zero reference line within the lane
+            int mid_y = valueToPixel(0.0f, lane.rect, lane.ymin, lane.ymax);
+            if (mid_y >= lane.rect.top() && mid_y <= lane.rect.bottom()) {
+                p.setPen(QPen(theme_.grid, 1, Qt::DotLine));
+                p.drawLine(lane.rect.left(), mid_y, lane.rect.right(), mid_y);
+            }
+
+            renderTrace(te, p, lane.rect, lane.ymin, lane.ymax);
+
+            // Per-lane label (trace name) + its own min/max range — drawn on
+            // a translucent backing chip so they stay legible over dense
+            // traces whose color would otherwise blend into the label text.
+            QString range_lbl = QString("%1 / %2")
+                .arg(static_cast<double>(lane.ymax), 0, 'g', 3)
+                .arg(static_cast<double>(lane.ymin), 0, 'g', 3);
+            QFontMetrics fm(lane_f);
+            int name_w  = fm.horizontalAdvance(te.label);
+            int range_w = fm.horizontalAdvance(range_lbl);
+
+            QColor bg = theme_.bg_plot; bg.setAlpha(200);
+            p.fillRect(QRect(lane.rect.left(), lane.rect.top(), name_w + 8, 15), bg);
+            p.fillRect(QRect(lane.rect.right() - range_w - 7, lane.rect.top(), range_w + 7, 15), bg);
+
+            p.setPen(te.color);
+            p.drawText(QRect(lane.rect.left() + 4, lane.rect.top() + 1,
+                             lane.rect.width() - 8, 14),
+                       Qt::AlignLeft | Qt::AlignTop, te.label);
+            p.setPen(theme_.axis_text);
+            p.drawText(QRect(lane.rect.left() + 4, lane.rect.top() + 1,
+                             lane.rect.width() - 8, 14),
+                       Qt::AlignRight | Qt::AlignTop, range_lbl);
+        }
+    } else {
+        computeYRange(ymin, ymax);
+        // Sticky range: expand eagerly, never auto-shrink (prevents flicker while panning).
+        // Reset by resetView(), resetYZoom(), or clearTraces().
+        if (ymin < sticky_ymin_) sticky_ymin_ = ymin;
+        if (ymax > sticky_ymax_) sticky_ymax_ = ymax;
+        ymin = sticky_ymin_;
+        ymax = sticky_ymax_;
+        // Apply Y-axis zoom (Ctrl+scroll): expand/contract range around centre.
+        if (y_scale_ != 1.0f) {
+            float center = (ymin + ymax) * 0.5f;
+            float half   = (ymax - ymin) * 0.5f * y_scale_;
+            ymin = center - half;
+            ymax = center + half;
+        }
+        last_ymin_ = ymin;
+        last_ymax_ = ymax;
+
+        // Grid
+        p.setPen(QPen(theme_.grid, 1));
+        for (int i = 1; i < 5; i++) {
+            int y = pr.top() + pr.height() * i / 5;
+            p.drawLine(pr.left(), y, pr.right(), y);
+        }
+        for (int i = 1; i < 10; i++) {
+            int x = pr.left() + pr.width() * i / 10;
+            p.drawLine(x, pr.top(), x, pr.bottom());
+        }
+
+        // Traces
+        for (auto& te : traces_)
+            renderTrace(te, p, pr, ymin, ymax);
     }
 
-    // Traces
-    for (auto& te : traces_)
-        renderTrace(te, p, pr, ymin, ymax);
-
-    // Threshold lines
-    if (show_thresholds_) {
+    // Threshold lines (a single shared Y range — not meaningful per-lane)
+    if (show_thresholds_ && !stacked_) {
         const QColor thr_color(214, 39, 40, 230);  // matplotlib red
         QPen thr_pen(thr_color, 1.2, Qt::DashLine);
         QFont tf = font(); tf.setPointSize(8); tf.setBold(true);
@@ -906,8 +1013,9 @@ void PlotWidget::paintEvent(QPaintEvent*) {
         }
     }
 
-    // Measurement overlay (drawn on top of traces)
-    drawMeasurement(p, pr, ymin, ymax);
+    // Measurement overlay (drawn on top of traces) — a single shared Y range
+    // isn't meaningful per-lane, so skip it in stacked mode.
+    if (!stacked_) drawMeasurement(p, pr, ymin, ymax);
 
     // Border
     p.setPen(theme_.border);
@@ -959,17 +1067,20 @@ void PlotWidget::paintEvent(QPaintEvent*) {
         p.drawText(x - 28, pr.bottom() + 6, 56, 20, Qt::AlignCenter, lbl);
     }
 
-    // Y-axis labels
-    for (int i = 0; i <= 5; i++) {
-        float v  = ymin + (ymax - ymin) * i / 5;
-        int   py = pr.bottom() - pr.height() * i / 5;
-        p.drawLine(pr.left() - 4, py, pr.left(), py);
-        QString lbl = QString::number(static_cast<double>(v), 'g', 4);
-        p.drawText(0, py - 9, ML - 6, 18, Qt::AlignRight | Qt::AlignVCenter, lbl);
+    // Y-axis labels (a single shared Y range isn't meaningful per-lane —
+    // each lane already shows its own min/max next to its name)
+    if (!stacked_) {
+        for (int i = 0; i <= 5; i++) {
+            float v  = ymin + (ymax - ymin) * i / 5;
+            int   py = pr.bottom() - pr.height() * i / 5;
+            p.drawLine(pr.left() - 4, py, pr.left(), py);
+            QString lbl = QString::number(static_cast<double>(v), 'g', 4);
+            p.drawText(0, py - 9, ML - 6, 18, Qt::AlignRight | Qt::AlignVCenter, lbl);
+        }
     }
 
-    // Legend
-    {
+    // Legend (skipped in stacked mode — each lane already carries its own label)
+    if (!stacked_) {
         QFont lf = font(); lf.setPointSize(8); p.setFont(lf);
         int lx = pr.right() - 6;
         int ly = pr.top() + 8;
@@ -1061,7 +1172,20 @@ void PlotWidget::mousePressEvent(QMouseEvent* e) {
     if (mode_ == InteractionMode::Measure) {
         if (!pr.contains(e->pos())) return;
         int64_t s = pixelToSample(e->pos().x(), pr);
-        double  v = pixelToValue(e->pos().y(), pr, last_ymin_, last_ymax_);
+        double  v;
+        if (stacked_) {
+            // Read the value from whichever lane the cursor is over, using
+            // that trace's own (independently auto-scaled) range.
+            v = std::numeric_limits<double>::quiet_NaN();
+            for (const auto& lane : computeLanes(pr)) {
+                if (e->pos().y() >= lane.rect.top() && e->pos().y() <= lane.rect.bottom()) {
+                    v = pixelToValue(e->pos().y(), lane.rect, lane.ymin, lane.ymax);
+                    break;
+                }
+            }
+        } else {
+            v = pixelToValue(e->pos().y(), pr, last_ymin_, last_ymax_);
+        }
         s = std::clamp(s, view_start_, view_end_);
 
         if (meas_count_ < 2) {
@@ -1091,7 +1215,8 @@ void PlotWidget::mousePressEvent(QMouseEvent* e) {
 
     if (mode_ == InteractionMode::AlignDrag) {
         if (!pr.contains(e->pos())) return;
-        int idx = nearestTrace(e->pos().x(), e->pos().y(), pr);
+        int idx = stacked_ ? laneIndexAt(e->pos().y(), pr)
+                            : nearestTrace(e->pos().x(), e->pos().y(), pr);
         if (idx < 0) return;
         align_drag_idx_          = idx;
         align_drag_sample_origin_ = pixelToSample(e->pos().x(), pr);

@@ -202,3 +202,42 @@ TEST(TTestAccumulator, EstimatedBytes) {
     // 4 * 100 * sizeof(double) = 3200 bytes
     EXPECT_EQ(acc.estimatedBytes(), 4LL * 100 * static_cast<int64_t>(sizeof(double)));
 }
+
+// ---------------------------------------------------------------------------
+// mergeFrom: splitting traces across several accumulators and merging them
+// must give the exact same result as accumulating everything into one —
+// this is the correctness guarantee the parallel t-test loop relies on.
+// ---------------------------------------------------------------------------
+
+TEST(TTestAccumulator, MergeFromMatchesDirectAccumulation) {
+    const std::vector<float> g0 = {0.f, .2f, -.1f, .1f, .05f, -.05f};
+    const std::vector<float> g1 = {1.f, 1.2f, .8f, 1.1f, 0.9f, 1.05f};
+
+    TTestAccumulator direct(1);
+    for (float v : g0) direct.addTrace(0, &v, 1);
+    for (float v : g1) direct.addTrace(1, &v, 1);
+
+    // Split the same traces across three "worker" accumulators, interleaved,
+    // then merge them into a fresh accumulator — mirroring how the parallel
+    // t-test loop distributes traces across threads.
+    TTestAccumulator worker0(1), worker1(1), worker2(1);
+    TTestAccumulator* workers[3] = {&worker0, &worker1, &worker2};
+    for (size_t i = 0; i < g0.size(); i++) workers[i % 3]->addTrace(0, &g0[i], 1);
+    for (size_t i = 0; i < g1.size(); i++) workers[i % 3]->addTrace(1, &g1[i], 1);
+
+    TTestAccumulator merged(1);
+    merged.mergeFrom(worker0);
+    merged.mergeFrom(worker1);
+    merged.mergeFrom(worker2);
+
+    EXPECT_EQ(merged.countGroup(0), direct.countGroup(0));
+    EXPECT_EQ(merged.countGroup(1), direct.countGroup(1));
+
+    std::vector<float> direct_out, merged_out;
+    std::string err;
+    ASSERT_TRUE(direct.compute(direct_out, err)) << err;
+    ASSERT_TRUE(merged.compute(merged_out, err)) << err;
+    ASSERT_EQ(direct_out.size(), merged_out.size());
+    for (size_t i = 0; i < direct_out.size(); i++)
+        EXPECT_FLOAT_EQ(direct_out[i], merged_out[i]);
+}

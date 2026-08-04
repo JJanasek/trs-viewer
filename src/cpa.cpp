@@ -83,7 +83,21 @@ bool computeCpa(
     for (const auto& t : pipeline) eff_ns = t->transformedCount(eff_ns);
     if (eff_ns <= 0) { error = "No samples after pipeline"; return false; }
 
-    const int32_t N  = n_traces;
+    // Traces marked kAlignDiscardShift are excluded entirely — not just
+    // zero-shifted — so a bad alignment match doesn't pollute the leakage
+    // model or power statistics.
+    std::vector<int32_t> kept;
+    kept.reserve(static_cast<size_t>(n_traces));
+    for (int32_t i = 0; i < n_traces; i++) {
+        int32_t s = (i < static_cast<int32_t>(shifts.size())) ? shifts[i] : 0;
+        if (s != kAlignDiscardShift) kept.push_back(i);
+    }
+    if (static_cast<int32_t>(kept.size()) < 2) {
+        error = "Need at least 2 traces after excluding discarded ones.";
+        return false;
+    }
+
+    const int32_t N  = static_cast<int32_t>(kept.size());
     const int32_t NS = static_cast<int32_t>(eff_ns);
     const int32_t M  = n_hypotheses;
     const int32_t DL = h.data_length;
@@ -93,7 +107,7 @@ bool computeCpa(
     // -----------------------------------------------------------------------
     std::vector<uint8_t> data_flat(static_cast<size_t>(N) * std::max(DL, 0), 0);
     for (int32_t i = 0; i < N; i++) {
-        auto d = file->readData(first_trace + i);
+        auto d = file->readData(first_trace + kept[static_cast<size_t>(i)]);
         size_t copy_len = std::min<size_t>(d.size(), static_cast<size_t>(std::max(DL, 0)));
         if (copy_len > 0)
             memcpy(data_flat.data() + static_cast<size_t>(i) * DL, d.data(), copy_len);
@@ -167,8 +181,9 @@ bool computeCpa(
         std::vector<double> sum_LT(static_cast<size_t>(cur_m) * NS, 0.0);
 
         for (int32_t i = 0; i < N; i++) {
-            const int32_t shift = (i < static_cast<int32_t>(shifts.size())) ? shifts[i] : 0;
-            int64_t out_count = loadTrace(file, first_trace + i,
+            const int32_t ti    = kept[static_cast<size_t>(i)];
+            const int32_t shift = (ti < static_cast<int32_t>(shifts.size())) ? shifts[ti] : 0;
+            int64_t out_count = loadTrace(file, first_trace + ti,
                                           first_sample, raw_ns, shift,
                                           pipeline, raw_buf, proc_buf);
 
