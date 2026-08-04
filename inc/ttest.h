@@ -12,6 +12,11 @@ public:
     void reset();
     // group: 0 or 1.  Any other value is silently ignored.
     void addTrace(int group, const float* samples, int32_t count);
+    // Adds another accumulator's totals into this one (same num_samples).
+    // Used to combine per-thread partial accumulators after parallel
+    // accumulation, since addTrace() itself isn't safe to call concurrently
+    // on a shared instance.
+    void mergeFrom(const TTestAccumulator& other);
     // Compute Welch t-statistics into out (resized to num_samples).
     bool compute(std::vector<float>& out, std::string& error) const;
     // Compute per-sample Welch-Satterthwaite degrees of freedom.

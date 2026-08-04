@@ -49,6 +49,10 @@
 #include <cmath>
 #include <cstdio>
 
+#ifdef _OPENMP
+#  include <omp.h>
+#endif
+
 // ---------------------------------------------------------------------------
 // Statistical helpers for t-test threshold calculation
 // ---------------------------------------------------------------------------
@@ -287,6 +291,15 @@ MainWindow::MainWindow(QWidget* parent)
         if (id == 0 || id == 2 || id == 3) lbl_measure_->setText("–");
     });
 
+    // Stacked view: draw each trace in its own non-overlapping lane instead
+    // of overlaying them all. Independent of the interaction mode above.
+    btn_stack_ = new QPushButton("☰ Stack");
+    btn_stack_->setCheckable(true);
+    btn_stack_->setToolTip("Draw each trace in its own lane instead of overlapping it with the others");
+    connect(btn_stack_, &QPushButton::toggled, this, [this](bool on) {
+        plot_widget_->setStacked(on);
+    });
+
     // Separator
     auto* sep1 = new QFrame; sep1->setFrameShape(QFrame::VLine);
     auto* sep2 = new QFrame; sep2->setFrameShape(QFrame::VLine);
@@ -327,6 +340,7 @@ MainWindow::MainWindow(QWidget* parent)
     toolbar_l->addWidget(btn_mode_measure_);
     toolbar_l->addWidget(btn_mode_box_zoom_);
     toolbar_l->addWidget(btn_mode_align_);
+    toolbar_l->addWidget(btn_stack_);
     toolbar_l->addWidget(sep1);
     toolbar_l->addWidget(btn_zoom_in_);
     toolbar_l->addWidget(btn_zoom_out_);
@@ -598,8 +612,11 @@ void MainWindow::restoreSnapshot(DatasetSnapshot snap) {
         int n = static_cast<int>(plot_widget_->traceShifts().size());
         for (int i = 0; i < n; i++) {
             int shift_idx = ds.plot_first_trace + i - ds.align_first_trace;
-            if (shift_idx >= 0 && shift_idx < static_cast<int>(ds.align_shifts.size()))
-                plot_widget_->setTraceShift(i, ds.align_shifts[static_cast<size_t>(shift_idx)]);
+            if (shift_idx >= 0 && shift_idx < static_cast<int>(ds.align_shifts.size())) {
+                int32_t shift = ds.align_shifts[static_cast<size_t>(shift_idx)];
+                if (shift != kAlignDiscardShift)
+                    plot_widget_->setTraceShift(i, shift);
+            }
         }
     }
 
@@ -2714,14 +2731,20 @@ void MainWindow::onRunTTest() {
 
     // Alignment group
     const bool has_alignment = (activeDs().align_n_samples > 0);
+    const int  n_align_discarded = static_cast<int>(std::count(
+        activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
     auto* grp_align  = new QGroupBox("Alignment");
     auto* fl_align   = new QFormLayout(grp_align);
     auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
     chk_shifts->setChecked(has_alignment);
     chk_shifts->setEnabled(has_alignment);
     chk_shifts->setToolTip(has_alignment
-        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3).")
+        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3)."
+                   "%4")
               .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
+              .arg(n_align_discarded > 0
+                       ? QString(" %1 of those are marked discarded and will be skipped.").arg(n_align_discarded)
+                       : QString())
         : "No alignment has been applied to the main view yet.");
     fl_align->addRow(chk_shifts);
     auto applyAlignmentToSpinboxes = [&](bool on) {
@@ -2784,61 +2807,122 @@ void MainWindow::onRunTTest() {
     for (const auto& t : activeDs().pipeline)
         effective_samples = t->transformedCount(effective_samples);
 
-    // Memory estimate warning
-    int64_t mem_bytes = effective_samples * 4LL * static_cast<int64_t>(sizeof(double));
+    // Accumulation is parallelised across traces, one TTestAccumulator + one
+    // cloned pipeline per worker thread (merged together at the end) — the
+    // shared activeDs().pipeline transforms aren't safe to call apply() on
+    // concurrently since they may cache internal state (e.g. FFT plans).
+    // Capped at 8 threads since each accumulator costs 4×effective_samples
+    // doubles; see the memory estimate below.
+#ifdef _OPENMP
+    const int n_threads = std::clamp(omp_get_max_threads(), 1, 8);
+#else
+    const int n_threads = 1;
+#endif
+
+    // Memory estimate warning (one accumulator per worker thread)
+    int64_t mem_bytes = effective_samples * 4LL * static_cast<int64_t>(sizeof(double))
+                      * n_threads;
     if (mem_bytes > 2LL * 1024 * 1024 * 1024) {
         if (QMessageBox::warning(this, "Memory warning",
-                QString("Accumulators will require ~%1 GB.\nContinue?")
-                    .arg(double(mem_bytes) / (1024.0*1024*1024), 0, 'f', 1),
+                QString("Accumulators will require ~%1 GB across %2 worker thread(s).\nContinue?")
+                    .arg(double(mem_bytes) / (1024.0*1024*1024), 0, 'f', 1).arg(n_threads),
                 QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
             return;
     }
 
     // --- Accumulation ---
     auto acc_ptr = std::make_shared<TTestAccumulator>(static_cast<int32_t>(effective_samples));
-    TTestAccumulator& acc = *acc_ptr;
 
     QProgressDialog prog("Accumulating traces…", "Cancel", 0, eff_count, this);
     prog.setWindowModality(Qt::WindowModal);
     prog.setMinimumDuration(400);
 
-    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
-    int32_t skipped = 0;
+    std::vector<TTestAccumulator> thread_accs(
+        static_cast<size_t>(n_threads), TTestAccumulator(static_cast<int32_t>(effective_samples)));
+    std::vector<std::vector<std::shared_ptr<ITransform>>> thread_pipelines(
+        static_cast<size_t>(n_threads));
+    for (auto& tp : thread_pipelines)
+        for (const auto& t : activeDs().pipeline) tp.push_back(t->clone());
+    std::vector<std::vector<float>> thread_bufs(
+        static_cast<size_t>(n_threads),
+        std::vector<float>(static_cast<size_t>(std::max(raw_ns, effective_samples))));
+    std::vector<int32_t> thread_skipped(static_cast<size_t>(n_threads), 0);
+    std::vector<int32_t> thread_discarded(static_cast<size_t>(n_threads), 0);
 
-    for (int32_t ti = 0; ti < eff_count; ti++) {
-        if (prog.wasCanceled()) return;
-        prog.setLabelText(QString("Accumulating trace %1 / %2…").arg(ti + 1).arg(eff_count));
-        prog.setValue(ti);
-        QApplication::processEvents();
+    // Process in batches so the GUI thread can update the progress bar and
+    // check for cancellation between parallel regions (Qt calls are only
+    // ever made from the main thread, never from inside the omp for below).
+    // Capped at 256 for parallel efficiency, but also capped so there are at
+    // least ~20 progress updates regardless of trace count — otherwise a run
+    // with fewer traces than the batch size reports progress exactly once,
+    // at the very end, which looks indistinguishable from a hang.
+    const int32_t kBatchSize = std::clamp(eff_count / 20, 1, 256);
+    bool cancelled = false;
 
-        int32_t src_idx = eff_first + ti;
-        auto data_bytes = activeDs().file->readData(src_idx);
-        if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { skipped++; continue; }
-        int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
+    for (int32_t batch_start = 0; batch_start < eff_count && !cancelled; batch_start += kBatchSize) {
+        int32_t batch_end = std::min(batch_start + kBatchSize, eff_count);
 
-        // Read window with per-trace shift, zero-pad out of bounds
-        int32_t shift = (ti < static_cast<int32_t>(use_shifts.size())) ? use_shifts[ti] : 0;
-        const int64_t adj_start = eff_first_sample + shift;
-        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
-        if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
-            int64_t src_start = std::max<int64_t>(0, adj_start);
-            int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
-            int64_t dst_off   = src_start - adj_start;
-            int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
-                                                  trace_buf.data() + dst_off);
-            if (got <= 0) { skipped++; continue; }
+        #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
+        for (int32_t ti = batch_start; ti < batch_end; ti++) {
+#ifdef _OPENMP
+            const size_t tid = static_cast<size_t>(omp_get_thread_num());
+#else
+            const size_t tid = 0;
+#endif
+            TTestAccumulator&                        acc_local  = thread_accs[tid];
+            std::vector<std::shared_ptr<ITransform>>& pipeline_local = thread_pipelines[tid];
+            std::vector<float>&                      trace_buf  = thread_bufs[tid];
+
+            int32_t src_idx = eff_first + ti;
+            auto data_bytes = activeDs().file->readData(src_idx);
+            if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
+            int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
+
+            // Read window with per-trace shift, zero-pad out of bounds
+            int32_t shift = (ti < static_cast<int32_t>(use_shifts.size())) ? use_shifts[ti] : 0;
+            if (shift == kAlignDiscardShift) { thread_discarded[tid]++; continue; }
+            const int64_t adj_start = eff_first_sample + shift;
+            std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+            if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
+                int64_t src_start = std::max<int64_t>(0, adj_start);
+                int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
+                int64_t dst_off   = src_start - adj_start;
+                int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
+                                                      trace_buf.data() + dst_off);
+                if (got <= 0) { thread_skipped[tid]++; continue; }
+            }
+            for (const auto& t : pipeline_local) t->reset();
+            int64_t n_out = raw_ns;
+            for (const auto& t : pipeline_local)
+                n_out = t->apply(trace_buf.data(), n_out, 0);
+            acc_local.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
         }
-        for (const auto& t : activeDs().pipeline) t->reset();
-        int64_t n_out = raw_ns;
-        for (const auto& t : activeDs().pipeline)
-            n_out = t->apply(trace_buf.data(), n_out, 0);
-        acc.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
+
+        prog.setLabelText(QString("Accumulating trace %1 / %2…").arg(batch_end).arg(eff_count));
+        prog.setValue(batch_end);
+        QApplication::processEvents();
+        if (prog.wasCanceled()) cancelled = true;
+    }
+    if (cancelled) return;
+
+    TTestAccumulator& acc = *acc_ptr;
+    int32_t skipped = 0, discarded_by_align = 0;
+    for (int t = 0; t < n_threads; t++) {
+        acc.mergeFrom(thread_accs[static_cast<size_t>(t)]);
+        skipped            += thread_skipped[static_cast<size_t>(t)];
+        discarded_by_align += thread_discarded[static_cast<size_t>(t)];
     }
     prog.setValue(eff_count);
 
-    if (skipped > 0)
-        QMessageBox::warning(this, "T-test",
-            QString("%1 traces skipped (data byte out of range).").arg(skipped));
+    if (skipped > 0 || discarded_by_align > 0) {
+        QStringList msg;
+        if (skipped > 0)
+            msg << QString("%1 traces skipped (data byte out of range).").arg(skipped);
+        if (discarded_by_align > 0)
+            msg << QString("%1 traces excluded (below alignment correlation threshold).")
+                       .arg(discarded_by_align);
+        QMessageBox::warning(this, "T-test", msg.join("\n"));
+    }
 
     // --- Compute ---
     std::vector<float> tstat;
@@ -3513,14 +3597,20 @@ void MainWindow::onRunXCorr() {
 
     // Alignment group
     const bool has_alignment_xcorr = (activeDs().align_n_samples > 0);
+    const int  n_align_discarded_xcorr = static_cast<int>(std::count(
+        activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
     auto* grp_align_xcorr  = new QGroupBox("Alignment");
     auto* fl_align_xcorr   = new QFormLayout(grp_align_xcorr);
     auto* chk_shifts_xcorr = new QCheckBox("Apply last alignment shifts");
     chk_shifts_xcorr->setChecked(has_alignment_xcorr);
     chk_shifts_xcorr->setEnabled(has_alignment_xcorr);
     chk_shifts_xcorr->setToolTip(has_alignment_xcorr
-        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3).")
+        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3)."
+                   "%4")
               .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
+              .arg(n_align_discarded_xcorr > 0
+                       ? QString(" %1 of those are marked discarded and will be skipped.").arg(n_align_discarded_xcorr)
+                       : QString())
         : "No alignment has been applied to the main view yet.");
     fl_align_xcorr->addRow(chk_shifts_xcorr);
     auto applyAlignmentToSpinboxesXCorr = [&](bool on) {
@@ -4175,8 +4265,33 @@ void MainWindow::onAlignTraces()
     peak_hl->addWidget(combo_peak);
     peak_hl->addStretch();
 
+    // Discard-below-threshold row (Cross-correlation only)
+    auto* corr_row = new QWidget;
+    auto* corr_hl  = new QHBoxLayout(corr_row);
+    corr_hl->setContentsMargins(0, 0, 0, 0);
+    auto* chk_discard = new QCheckBox("Discard below correlation:");
+    auto* sp_min_corr = new QDoubleSpinBox;
+    sp_min_corr->setRange(-1.0, 1.0);
+    sp_min_corr->setSingleStep(0.05);
+    sp_min_corr->setDecimals(2);
+    sp_min_corr->setValue(0.5);
+    sp_min_corr->setEnabled(false);
+    chk_discard->setToolTip(
+        "Traces whose best normalised cross-correlation (NCC, -1..1) against "
+        "the reference falls below this value are excluded rather than "
+        "shifted — from this dialog's own output, and later from t-test/CPA/"
+        "cross-correlation if the stored alignment is reused.");
+    connect(chk_discard, &QCheckBox::toggled, sp_min_corr, &QDoubleSpinBox::setEnabled);
+    corr_hl->addWidget(chk_discard);
+    corr_hl->addWidget(sp_min_corr);
+    corr_hl->addStretch();
+
     connect(combo_method, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            dlg, [peak_row](int idx) { peak_row->setVisible(idx == 0); });
+            dlg, [peak_row, corr_row](int idx) {
+                peak_row->setVisible(idx == 0);
+                corr_row->setVisible(idx == 1);
+            });
+    corr_row->setVisible(false);
 
     // Traces to align
     auto* sp_tr_first = new QSpinBox;
@@ -4200,6 +4315,7 @@ void MainWindow::onAlignTraces()
     fl->addRow("Method:",            combo_method);
     fl->addRow("Search window ±:",   sp_search);
     fl->addRow(peak_row);
+    fl->addRow(corr_row);
     fl->addRow("Traces:",            tr_row);
     vl->addWidget(grp);
 
@@ -4207,13 +4323,18 @@ void MainWindow::onAlignTraces()
     vl->addWidget(btn_run);
 
     // ── Results (shown after a successful run) ────────────────────────────────
-    auto* tbl = new QTableWidget(0, 2);
-    tbl->setHorizontalHeaderLabels({"Trace", "Shift (samples)"});
+    auto* tbl = new QTableWidget(0, 3);
+    tbl->setHorizontalHeaderLabels({"Trace", "Shift (samples)", "Correlation"});
     tbl->setEditTriggers(QAbstractItemView::NoEditTriggers);
     tbl->horizontalHeader()->setStretchLastSection(true);
     tbl->setMaximumHeight(220);
     tbl->hide();
     vl->addWidget(tbl);
+
+    auto* lbl_discard_summary = new QLabel;
+    lbl_discard_summary->setWordWrap(true);
+    lbl_discard_summary->hide();
+    vl->addWidget(lbl_discard_summary);
 
     // Output mode selector + show button (hidden until run completes)
     auto* output_row = new QWidget;
@@ -4278,15 +4399,21 @@ void MainWindow::onAlignTraces()
             return !prog.wasCanceled();
         };
 
+        const bool  discard_enabled = !is_peak && chk_discard->isChecked();
+        const float min_corr        = discard_enabled
+            ? static_cast<float>(sp_min_corr->value()) : -2.0f;
+
         std::string err;
         bool ok;
         if (is_peak) {
-            ok = alignByPeak(activeDs().file.get(), first_tr, num_tr, ref_off,
+            ok = alignByPeak(activeDs().file.get(), activeDs().pipeline,
+                             first_tr, num_tr, ref_off,
                              ref_first, ref_len, shalf, use_abs,
                              *result_ptr, progress_fn, err);
         } else {
-            ok = alignByXCorr(activeDs().file.get(), first_tr, num_tr, ref_off,
-                              ref_first, ref_len, shalf,
+            ok = alignByXCorr(activeDs().file.get(), activeDs().pipeline,
+                              first_tr, num_tr, ref_off,
+                              ref_first, ref_len, shalf, min_corr,
                               *result_ptr, progress_fn, err);
         }
         prog.setValue(num_tr);
@@ -4299,17 +4426,44 @@ void MainWindow::onAlignTraces()
         }
 
         // Populate results table
+        const auto& scores = result_ptr->scores;
+        int n_discarded = 0;
         tbl->setRowCount(0);
         for (int i = 0; i < num_tr; i++) {
             int row = tbl->rowCount();
             tbl->insertRow(row);
-            tbl->setItem(row, 0,
-                new QTableWidgetItem(QString::number(first_tr + i)));
-            tbl->setItem(row, 1,
-                new QTableWidgetItem(
-                    QString::number(result_ptr->shifts[static_cast<size_t>(i)])));
+            const int32_t shift = result_ptr->shifts[static_cast<size_t>(i)];
+            const bool discarded = (shift == kAlignDiscardShift);
+            if (discarded) n_discarded++;
+
+            auto* item_trace = new QTableWidgetItem(QString::number(first_tr + i));
+            auto* item_shift = new QTableWidgetItem(
+                discarded ? QString("discarded") : QString::number(shift));
+            auto* item_score = new QTableWidgetItem(
+                (i < static_cast<int>(scores.size()))
+                    ? QString::number(scores[static_cast<size_t>(i)], 'f', 3)
+                    : QString());
+            if (discarded) {
+                for (auto* item : {item_trace, item_shift, item_score}) {
+                    item->setBackground(QColor(255, 200, 200));
+                    item->setForeground(QColor(150, 0, 0));
+                }
+            }
+            tbl->setItem(row, 0, item_trace);
+            tbl->setItem(row, 1, item_shift);
+            tbl->setItem(row, 2, item_score);
         }
         tbl->show();
+
+        if (discard_enabled) {
+            lbl_discard_summary->setText(
+                QString("%1 of %2 traces discarded (correlation below %3).")
+                    .arg(n_discarded).arg(num_tr).arg(min_corr, 0, 'f', 2));
+            lbl_discard_summary->show();
+        } else {
+            lbl_discard_summary->hide();
+        }
+
         output_row->show();
         dlg->adjustSize();
     });
@@ -4329,6 +4483,7 @@ void MainWindow::onAlignTraces()
             int64_t crop_end   = h.num_samples;
             for (int i = 0; i < num_tr; i++) {
                 int64_t s = shifts[static_cast<size_t>(i)];
+                if (s == kAlignDiscardShift) continue;   // excluded — ignore for crop range
                 crop_start = std::max(crop_start, -s);
                 crop_end   = std::min(crop_end, h.num_samples - s);
             }
@@ -4344,9 +4499,10 @@ void MainWindow::onAlignTraces()
             out_len   = h.num_samples;
         }
 
-        const int display_count = std::min(num_tr, max_display);
-        for (int i = 0; i < display_count; i++) {
+        int shown = 0;
+        for (int i = 0; i < num_tr && shown < max_display; i++) {
             int64_t shift = static_cast<int64_t>(shifts[static_cast<size_t>(i)]);
+            if (shift == kAlignDiscardShift) continue;   // below correlation threshold
 
             auto data = std::make_shared<std::vector<float>>(
                 static_cast<size_t>(out_len), 0.0f);
@@ -4380,18 +4536,21 @@ void MainWindow::onAlignTraces()
             }
 
             pw->addTrace(std::move(data),
-                         TRACE_COLORS[i % NUM_COLORS],
+                         TRACE_COLORS[shown % NUM_COLORS],
                          QString("T%1 (%2%3)")
                              .arg(first_tr + i)
                              .arg(shift >= 0 ? "+" : "")
                              .arg(shift));
+            shown++;
         }
         return true;
     };
 
     connect(btn_show, &QPushButton::clicked, dlg, [=]() {
         if (result_ptr->shifts.empty()) return;
-        int32_t num_tr = static_cast<int32_t>(result_ptr->shifts.size());
+        int32_t num_tr = static_cast<int32_t>(std::count_if(
+            result_ptr->shifts.begin(), result_ptr->shifts.end(),
+            [](int32_t s) { return s != kAlignDiscardShift; }));
 
         auto* vdlg = new QDialog(dlg);
         vdlg->setWindowTitle(QString("Aligned traces — %1 traces").arg(num_tr));
@@ -4420,14 +4579,17 @@ void MainWindow::onAlignTraces()
         if (mode == 2) {
             int64_t crop_start = 0, crop_end = h.num_samples;
             for (int i = 0; i < num_tr; i++) {
-                int64_t s = static_cast<int64_t>(raw_shifts[static_cast<size_t>(i)]);
+                int32_t sraw = raw_shifts[static_cast<size_t>(i)];
+                if (sraw == kAlignDiscardShift) continue;   // excluded — ignore for crop range
+                int64_t s = static_cast<int64_t>(sraw);
                 crop_start = std::max(crop_start, -s);
                 crop_end   = std::min(crop_end, h.num_samples - s);
             }
             if (crop_end > crop_start) { out_start = crop_start; out_len = crop_end - crop_start; }
         }
 
-        // Store alignment state for CPA
+        // Store alignment state (including any kAlignDiscardShift entries)
+        // for later reuse by t-test/CPA/cross-correlation.
         saveSnapshot();
         activeDs().align_first_trace  = first_tr;
         activeDs().align_first_sample = out_start;
@@ -4498,14 +4660,20 @@ void MainWindow::onRunCpa() {
 
     // Alignment shifts option — populated by the last "Apply to Main View" run
     const bool has_alignment = (activeDs().align_n_samples > 0);
+    const int  n_align_discarded = static_cast<int>(std::count(
+        activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
     auto* grp_align  = new QGroupBox("Alignment");
     auto* fl_align   = new QFormLayout(grp_align);
     auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
     chk_shifts->setChecked(has_alignment);
     chk_shifts->setEnabled(has_alignment);
     chk_shifts->setToolTip(has_alignment
-        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3).")
+        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3)."
+                   "%4")
               .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
+              .arg(n_align_discarded > 0
+                       ? QString(" %1 of those are marked discarded and will be skipped.").arg(n_align_discarded)
+                       : QString())
         : "No alignment has been applied to the main view yet.");
     fl_align->addRow(chk_shifts);
 

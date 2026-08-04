@@ -1,5 +1,6 @@
 #pragma once
 
+#include "align.h"
 #include "trs_file.h"
 #include "processing.h"
 
@@ -29,6 +30,10 @@ using LeakageFn = std::function<bool(
 // pipeline is applied per-trace (decimation supported).
 // shifts[i]: sample offset added when reading trace i (alignment compensation);
 //            positive = read from later samples (trace shifts left); empty = no shifts.
+//            shifts[i] == kAlignDiscardShift excludes trace i entirely (not
+//            just a zero shift) — e.g. traces the align dialog marked below
+//            its correlation threshold. out.n_traces reflects the count
+//            actually used.
 // progress(done, total) → return false to cancel.
 bool computeCpa(
     TrsFile*       file,

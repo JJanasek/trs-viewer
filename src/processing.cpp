@@ -269,16 +269,25 @@ int64_t FFTMagnitudeTransform::apply(float* buf, int64_t count, int64_t) {
     const int64_t N     = count;
     const int64_t out_n = N / 2 + 1;
 
-    std::vector<float> win;
-    buildWindowCoeffs(win, static_cast<int>(N), static_cast<WinType>(static_cast<int>(window_)));
+    if (window_cache_size_ != N || window_cache_type_ != window_) {
+        buildWindowCoeffs(window_cache_, static_cast<int>(N),
+                          static_cast<WinType>(static_cast<int>(window_)));
+        window_cache_size_ = N;
+        window_cache_type_ = window_;
+        // Eigen's (unsupported) FFT module corrupts its internal kissfft
+        // plan cache when the same instance is reused across a size change
+        // — rebuild it fresh whenever the size changes, matching the plan
+        // it would have built anyway had a new instance been used per call.
+        fft_ = Eigen::FFT<float>();
+    }
+    const std::vector<float>& win = window_cache_;
 
     std::vector<float> in_vec(N);
     for (int64_t i = 0; i < N; ++i) in_vec[i] = buf[i] * win[i];
 
     std::vector<std::complex<float>> freq_vec;
-    Eigen::FFT<float> fft;
-    fft.SetFlag(Eigen::FFT<float>::HalfSpectrum);
-    fft.fwd(freq_vec, in_vec);
+    fft_.SetFlag(Eigen::FFT<float>::HalfSpectrum);
+    fft_.fwd(freq_vec, in_vec);
 
     const float norm = 1.0f / static_cast<float>(N);
     for (int64_t k = 0; k < out_n; ++k) {
@@ -308,14 +317,23 @@ int64_t STFTMagnitudeTransform::apply(float* buf, int64_t count, int64_t) {
     const int64_t num_windows = (count - W) / hop_size_ + 1;
     const int64_t out_n       = num_windows * bins;
 
-    std::vector<float> win;
-    buildWindowCoeffs(win, static_cast<int>(W), static_cast<WinType>(static_cast<int>(window_)));
+    if (window_cache_size_ != W || window_cache_type_ != window_) {
+        buildWindowCoeffs(window_cache_, static_cast<int>(W),
+                          static_cast<WinType>(static_cast<int>(window_)));
+        window_cache_size_ = W;
+        window_cache_type_ = window_;
+        // Eigen's (unsupported) FFT module corrupts its internal kissfft
+        // plan cache when the same instance is reused across a size change
+        // — rebuild it fresh whenever the size changes, matching the plan
+        // it would have built anyway had a new instance been used per call.
+        fft_ = Eigen::FFT<float>();
+    }
+    const std::vector<float>& win = window_cache_;
 
     // Write results to a separate buffer to avoid aliasing the input.
     std::vector<float> out(static_cast<size_t>(out_n));
 
-    Eigen::FFT<float> fft;
-    fft.SetFlag(Eigen::FFT<float>::HalfSpectrum);
+    fft_.SetFlag(Eigen::FFT<float>::HalfSpectrum);
     std::vector<float>               in_vec(static_cast<size_t>(W));
     std::vector<std::complex<float>> freq_vec;
 
@@ -326,7 +344,7 @@ int64_t STFTMagnitudeTransform::apply(float* buf, int64_t count, int64_t) {
         for (int64_t i = 0; i < W; ++i)
             in_vec[i] = buf[pos + i] * win[i];
 
-        fft.fwd(freq_vec, in_vec);
+        fft_.fwd(freq_vec, in_vec);
 
         float* dst = out.data() + wi * bins;
         for (int64_t k = 0; k < bins; ++k) {

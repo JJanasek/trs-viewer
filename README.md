@@ -278,7 +278,7 @@ sudo apt install build-essential cmake qt6-base-dev libeigen3-dev \
 
 Fedora:
 ```bash
-sudo dnf install gcc-c++ cmake qt6-qtbase-devel eigen3-devel \
+sudo dnf install gcc-c++ cmake qt6-qtbase-devel qt6-qtsvg-devel eigen3-devel \
                  python3-devel python3-numpy
 ```
 

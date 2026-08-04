@@ -386,6 +386,70 @@ TEST(STFTMagnitudeTransform, RequiresSequential) {
 }
 
 // ---------------------------------------------------------------------------
+// The FFT plan / window envelope are cached across apply() calls (rebuilt
+// only when the effective window size or type changes) as a performance
+// optimisation — reusing the same instance for many same-shaped traces (as
+// the t-test/CPA accumulation loops do) must give bit-for-bit the same
+// result as a fresh instance per call.
+// ---------------------------------------------------------------------------
+
+TEST(STFTMagnitudeTransform, ReusedInstanceMatchesFreshInstancePerCall) {
+    const int W = 64, H = 32, K0 = 5, N = 512;
+
+    STFTMagnitudeTransform reused(W, H, STFTMagnitudeTransform::Window::Hann);
+    std::vector<float> ref_out;
+
+    for (int trial = 0; trial < 3; ++trial) {
+        std::vector<float> buf(N);
+        for (int i = 0; i < N; ++i)
+            buf[i] = std::sin(2.f * M_PI * (K0 + trial) * i / W);
+
+        // Fresh instance every trial — the "ground truth".
+        STFTMagnitudeTransform fresh(W, H, STFTMagnitudeTransform::Window::Hann);
+        std::vector<float> fresh_buf = buf;
+        int64_t n_fresh = fresh.apply(fresh_buf.data(), N, 0);
+
+        // Same `reused` instance across all trials.
+        int64_t n_reused = reused.apply(buf.data(), N, 0);
+
+        ASSERT_EQ(n_fresh, n_reused) << "trial " << trial;
+        for (int64_t k = 0; k < n_fresh; ++k)
+            EXPECT_FLOAT_EQ(fresh_buf[k], buf[k]) << "trial " << trial << " index " << k;
+    }
+}
+
+TEST(STFTMagnitudeTransform, CacheInvalidatedWhenWindowSizeChanges) {
+    const int N = 512, K0 = 6;
+    std::vector<float> sig(N);
+    for (int i = 0; i < N; ++i) sig[i] = std::sin(2.f * M_PI * K0 * i / 64);
+
+    // STFT can expand the sample count (more overlapping windows * bins than
+    // raw input) — callers must size buffers to transformedCount(), same
+    // contract as the real pipeline call sites (e.g. mainwindow.cpp).
+    STFTMagnitudeTransform tx(64, 32, STFTMagnitudeTransform::Window::Rectangular);
+    std::vector<float> buf1(static_cast<size_t>(std::max<int64_t>(N, tx.transformedCount(N))), 0.f);
+    std::copy(sig.begin(), sig.end(), buf1.begin());
+    int64_t n1 = tx.apply(buf1.data(), N, 0);
+
+    // Change window size on the same instance, then compare against a fresh
+    // instance built directly with the new size.
+    tx.setWindowSize(128);
+    std::vector<float> buf2(static_cast<size_t>(std::max<int64_t>(N, tx.transformedCount(N))), 0.f);
+    std::copy(sig.begin(), sig.end(), buf2.begin());
+    int64_t n2 = tx.apply(buf2.data(), N, 0);
+
+    STFTMagnitudeTransform fresh(128, 32, STFTMagnitudeTransform::Window::Rectangular);
+    std::vector<float> fresh_buf(static_cast<size_t>(std::max<int64_t>(N, fresh.transformedCount(N))), 0.f);
+    std::copy(sig.begin(), sig.end(), fresh_buf.begin());
+    int64_t n_fresh = fresh.apply(fresh_buf.data(), N, 0);
+
+    EXPECT_NE(n1, n2);   // different window size → different output length
+    ASSERT_EQ(n2, n_fresh);
+    for (int64_t k = 0; k < n2; ++k)
+        EXPECT_FLOAT_EQ(buf2[k], fresh_buf[k]) << "index " << k;
+}
+
+// ---------------------------------------------------------------------------
 // Clone independence
 // ---------------------------------------------------------------------------
 

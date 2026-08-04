@@ -133,6 +133,12 @@ public:
     // Axis labels drawn outside the plot area (empty = none).
     void setAxisLabels(const QString& x_label, const QString& y_label);
 
+    // Stacked mode: draw each visible trace in its own non-overlapping
+    // horizontal lane (independently auto-scaled) instead of overlaying them
+    // all on a shared Y range. Good for comparing many similar-looking traces.
+    void setStacked(bool on);
+    bool isStacked() const { return stacked_; }
+
     // Scale applied to x-axis tick labels: displayed_value = bin_index * scale + offset.
     // Default scale=1, offset=0 (shows raw bin/sample indices).
     // Use e.g. scale=df (Hz/bin) to display frequency in Hz.
@@ -245,6 +251,17 @@ private:
     // Helper: get cached data value for trace te at raw sample s.
     double  traceValueAt(const TraceEntry& te, int64_t s) const;
 
+    // ---- Stacked-mode layout -----------------------------------------------
+    struct LaneInfo {
+        int   trace_idx;   // index into traces_
+        QRect rect;        // this trace's non-overlapping sub-rect within the plot
+        float ymin, ymax;  // this trace's own auto-scaled (padded) range
+    };
+    // One lane per currently-visible trace, evenly dividing pr vertically.
+    std::vector<LaneInfo> computeLanes(const QRect& pr) const;
+    // Trace index (into traces_) whose lane contains py, or -1.
+    int     laneIndexAt(int py, const QRect& pr) const;
+
     // Crop ranges
     std::vector<std::pair<int64_t,int64_t>> crop_ranges_;
     bool crop_overlay_visible_ = true;
@@ -278,6 +295,8 @@ private:
     // 1.0 = auto-fit, >1 = zoomed out (more space), <1 = zoomed in.
     // Ctrl+scroll adjusts this; resetView() restores it to 1.0.
     float y_scale_ = 1.0f;
+
+    bool   stacked_              = false;
 
     bool   show_thresholds_      = false;
     bool   threshold_one_sided_  = false;
