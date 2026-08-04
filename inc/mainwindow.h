@@ -141,6 +141,7 @@ private:
     QPushButton*  btn_mode_measure_  = nullptr;
     QPushButton*  btn_mode_box_zoom_ = nullptr;
     QPushButton*  btn_mode_align_    = nullptr;
+    QPushButton*  btn_stack_        = nullptr;
     QPushButton*  btn_zoom_in_       = nullptr;
     QPushButton*  btn_zoom_out_     = nullptr;
     QPushButton*  btn_reset_        = nullptr;

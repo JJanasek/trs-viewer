@@ -74,7 +74,16 @@ bool computeXCorr(
     const int32_t M = static_cast<int32_t>((effective_n + stride - 1) / stride);
     if (M < 2) { error = "Stride too large, fewer than 2 output samples."; return false; }
 
-    const int n = num_traces;
+    // Traces marked kAlignDiscardShift are excluded entirely — not just
+    // zero-shifted — so a bad alignment match doesn't pollute the stats.
+    std::vector<int32_t> kept;
+    kept.reserve(static_cast<size_t>(num_traces));
+    for (int32_t ti = 0; ti < num_traces; ti++) {
+        int32_t s = (ti < static_cast<int32_t>(shifts.size())) ? shifts[ti] : 0;
+        if (s != kAlignDiscardShift) kept.push_back(ti);
+    }
+    const int n = static_cast<int>(kept.size());
+    if (n < 2) { error = "Need at least 2 traces after excluding discarded ones."; return false; }
 
     // Memory guard.
     // Baseline peak: C (M×M doubles) + output (M×M floats).
@@ -114,11 +123,12 @@ bool computeXCorr(
     }
 
     // -----------------------------------------------------------------------
-    // loadTrace: read raw samples for trace ti, apply pipeline, sub-sample
-    //            at xcorr stride → M floats written to out_m[0..M-1].
+    // loadTrace: read raw samples for the `pos`-th kept trace, apply
+    //            pipeline, sub-sample at xcorr stride → M floats in out_m.
     // -----------------------------------------------------------------------
     std::vector<float> raw_full(static_cast<size_t>(std::max(num_samples, effective_n)));
-    auto loadTrace = [&](int ti, float* out_m) {
+    auto loadTrace = [&](int pos, float* out_m) {
+        int32_t ti    = kept[static_cast<size_t>(pos)];
         int32_t src   = first_trace + ti;
         int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
         const int64_t total_samples = h.num_samples;
@@ -365,7 +375,16 @@ bool computeXCorrNaive(
     const int32_t M = static_cast<int32_t>((effective_n + stride - 1) / stride);
     if (M < 2) { error = "Stride too large, fewer than 2 output samples."; return false; }
 
-    const int n = num_traces;
+    // Traces marked kAlignDiscardShift are excluded entirely — not just
+    // zero-shifted — so a bad alignment match doesn't pollute the stats.
+    std::vector<int32_t> kept;
+    kept.reserve(static_cast<size_t>(num_traces));
+    for (int32_t ti = 0; ti < num_traces; ti++) {
+        int32_t s = (ti < static_cast<int32_t>(shifts.size())) ? shifts[ti] : 0;
+        if (s != kAlignDiscardShift) kept.push_back(ti);
+    }
+    const int n = static_cast<int>(kept.size());
+    if (n < 2) { error = "Need at least 2 traces after excluding discarded ones."; return false; }
 
     // Memory guard: A (M×n floats) + C (M×M doubles) + output (M×M floats)
     double mem_mb = (static_cast<double>(M) * n  * 4.0
@@ -381,7 +400,8 @@ bool computeXCorrNaive(
     std::vector<float> raw_full(static_cast<size_t>(std::max(num_samples, effective_n)));
     std::vector<float> raw(static_cast<size_t>(M));
 
-    auto loadTrace = [&](int ti, float* out_m) {
+    auto loadTrace = [&](int pos, float* out_m) {
+        int32_t ti    = kept[static_cast<size_t>(pos)];
         int32_t src   = first_trace + ti;
         int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
         const int64_t total_samples = h.num_samples;
@@ -553,7 +573,17 @@ bool computeTwoWindowCorr(
 
     const int32_t M_ref    = static_cast<int32_t>((ref_eff    + stride - 1) / stride);
     const int32_t M_search = static_cast<int32_t>((search_eff + stride - 1) / stride);
-    const int n = num_traces;
+
+    // Traces marked kAlignDiscardShift are excluded entirely — not just
+    // zero-shifted — so a bad alignment match doesn't pollute the stats.
+    std::vector<int32_t> kept;
+    kept.reserve(static_cast<size_t>(num_traces));
+    for (int32_t ti = 0; ti < num_traces; ti++) {
+        int32_t s = (ti < static_cast<int32_t>(shifts.size())) ? shifts[ti] : 0;
+        if (s != kAlignDiscardShift) kept.push_back(ti);
+    }
+    const int n = static_cast<int>(kept.size());
+    if (n < 2) { error = "Need at least 2 traces after excluding discarded ones."; return false; }
 
     // Memory check:
     //   A_ref (M_ref×n floats) + A_search (M_search×n floats)
@@ -582,9 +612,10 @@ bool computeTwoWindowCorr(
     std::vector<double> ref_wf_mean(M_ref,    0.0), ref_wf_M2(M_ref,    0.0);
     std::vector<double> sea_wf_mean(M_search, 0.0), sea_wf_M2(M_search, 0.0);
 
-    for (int ti = 0; ti < n; ti++) {
-        if (progress && !progress(ti, 3 * n)) { error = "Cancelled."; return false; }
+    for (int pos = 0; pos < n; pos++) {
+        if (progress && !progress(pos, 3 * n)) { error = "Cancelled."; return false; }
 
+        int32_t ti    = kept[static_cast<size_t>(pos)];
         int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
         loadWindow(file, first_trace, pipeline, ti,
                    ref_first_sample, ref_num_samples, stride, M_ref,
@@ -592,7 +623,7 @@ bool computeTwoWindowCorr(
         for (int j = 0; j < M_ref; j++) {
             double x     = static_cast<double>(raw_r[j]);
             double delta = x - ref_wf_mean[j];
-            ref_wf_mean[j] += delta / (ti + 1);
+            ref_wf_mean[j] += delta / (pos + 1);
             ref_wf_M2  [j] += delta * (x - ref_wf_mean[j]);
         }
 
@@ -602,7 +633,7 @@ bool computeTwoWindowCorr(
         for (int j = 0; j < M_search; j++) {
             double x     = static_cast<double>(raw_s[j]);
             double delta = x - sea_wf_mean[j];
-            sea_wf_mean[j] += delta / (ti + 1);
+            sea_wf_mean[j] += delta / (pos + 1);
             sea_wf_M2  [j] += delta * (x - sea_wf_mean[j]);
         }
     }
@@ -625,21 +656,22 @@ bool computeTwoWindowCorr(
     // -----------------------------------------------------------------------
     Eigen::MatrixXf A_ref(M_ref, n), A_search(M_search, n);
 
-    for (int ti = 0; ti < n; ti++) {
-        if (progress && !progress(n + ti, 3 * n)) { error = "Cancelled."; return false; }
+    for (int pos = 0; pos < n; pos++) {
+        if (progress && !progress(n + pos, 3 * n)) { error = "Cancelled."; return false; }
 
+        int32_t ti    = kept[static_cast<size_t>(pos)];
         int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
         loadWindow(file, first_trace, pipeline, ti,
                    ref_first_sample, ref_num_samples, stride, M_ref,
                    work_r.data(), raw_r.data(), shift);
         Eigen::Map<Eigen::VectorXf> vr(raw_r.data(), M_ref);
-        A_ref.col(ti) = ((vr.cast<double>() - ref_mean).cwiseProduct(ref_inv_std)).cast<float>();
+        A_ref.col(pos) = ((vr.cast<double>() - ref_mean).cwiseProduct(ref_inv_std)).cast<float>();
 
         loadWindow(file, first_trace, pipeline, ti,
                    search_first_sample, search_num_samples, stride, M_search,
                    work_s.data(), raw_s.data(), shift);
         Eigen::Map<Eigen::VectorXf> vs(raw_s.data(), M_search);
-        A_search.col(ti) = ((vs.cast<double>() - sea_mean).cwiseProduct(sea_inv_std)).cast<float>();
+        A_search.col(pos) = ((vs.cast<double>() - sea_mean).cwiseProduct(sea_inv_std)).cast<float>();
     }
 
     if (progress && !progress(2 * n, 3 * n)) { error = "Cancelled."; return false; }

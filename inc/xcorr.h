@@ -1,5 +1,6 @@
 #pragma once
 
+#include "align.h"
 #include "processing.h"
 #include "trs_file.h"
 
@@ -32,6 +33,9 @@ using XCorrProgress = std::function<bool(int32_t, int32_t)>;
 
 // Compute cross-correlation matrix.
 // stride controls downsampling after the pipeline: M = ceil(effective_n / stride).
+// shifts[i] == kAlignDiscardShift excludes trace i entirely (not just a
+// zero shift) — e.g. traces the align dialog marked below its correlation
+// threshold. n_traces in the output reflects the count actually used.
 // Returns false and sets error on failure or cancellation.
 bool computeXCorr(
     TrsFile*       file,
