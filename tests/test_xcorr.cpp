@@ -9,6 +9,7 @@
 #include <vector>
 #include <numeric>
 #include <algorithm>
+#include <random>
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -348,4 +349,113 @@ TEST(ComputeXCorr, PipelineSTFTExpandNoCrash) {
     const int64_t expected_m = stft->transformedCount(NS);
     EXPECT_EQ(res.rows, expected_m);
     EXPECT_EQ(res.cols, expected_m);
+}
+
+// ---------------------------------------------------------------------------
+// computeTemplateMatch
+// ---------------------------------------------------------------------------
+
+// Deterministic pseudo-random pattern (fixed seed) — unlike a periodic ramp,
+// this has no look-alike substrings at other offsets, so a self-match has a
+// unique, unambiguous peak.
+static void makeRampDataset(TrsFile& file, std::vector<float>& mem,
+                            int n_traces, int n_samples) {
+    mem.resize(static_cast<size_t>(n_traces) * n_samples);
+    std::mt19937 rng(12345);
+    std::uniform_real_distribution<float> dist(-1.0f, 1.0f);
+    std::vector<float> pattern(static_cast<size_t>(n_samples));
+    for (int s = 0; s < n_samples; ++s) pattern[static_cast<size_t>(s)] = dist(rng);
+    for (int t = 0; t < n_traces; ++t)
+        for (int s = 0; s < n_samples; ++s)
+            mem[static_cast<size_t>(t) * n_samples + s] = pattern[static_cast<size_t>(s)];
+    file.openFromArray(mem.data(), n_traces, n_samples);
+}
+
+TEST(ComputeTemplateMatch, OutputDimensions) {
+    const int NT = 5, NS = 100;
+    TrsFile f;
+    std::vector<float> mem;
+    makeRampDataset(f, mem, NT, NS);
+
+    XCorrResult res;
+    std::string err;
+    // Template length 10, search window covers the whole trace (100 samples)
+    // -> n_lags = 100 - 10 + 1 = 91.
+    bool ok = computeTemplateMatch(&f, 0, 0, 10, 0, NT, 0, NS, 1, {}, {}, res, noProgress(), err);
+    ASSERT_TRUE(ok) << err;
+
+    EXPECT_EQ(res.rows, NT);
+    EXPECT_EQ(res.cols, 91);
+    EXPECT_EQ(static_cast<int>(res.matrix.size()), NT * 91);
+    EXPECT_EQ(res.method, XCorrMethod::TemplateMatch);
+    EXPECT_EQ(res.tm_template_len, 10);
+}
+
+// The template is extracted at a known offset inside the search window of the
+// SAME trace it's later matched against -> NCC must be (near) 1.0 exactly at
+// that lag, since the window content is identical to the template there.
+TEST(ComputeTemplateMatch, SelfMatchPeaksAtKnownLag) {
+    const int NT = 1, NS = 200;
+    TrsFile f;
+    std::vector<float> mem;
+    makeRampDataset(f, mem, NT, NS);
+
+    const int64_t tmpl_first = 40, tmpl_len = 20;
+    XCorrResult res;
+    std::string err;
+    bool ok = computeTemplateMatch(&f, 0, tmpl_first, tmpl_len,
+                                   0, NT, 0, NS, 1, {}, {}, res, noProgress(), err);
+    ASSERT_TRUE(ok) << err;
+
+    // lag = tmpl_first (search window starts at sample 0, so lag == absolute offset)
+    int64_t best_lag = 0;
+    float   best_val = -2.0f;
+    for (int64_t lag = 0; lag < res.cols; lag++) {
+        float v = res.matrix[static_cast<size_t>(lag)];
+        if (v > best_val) { best_val = v; best_lag = lag; }
+    }
+    EXPECT_EQ(best_lag, tmpl_first);
+    EXPECT_NEAR(best_val, 1.0f, 1e-3f);
+}
+
+TEST(ComputeTemplateMatch, ConstantTemplateIsZeroVarianceError) {
+    const int NT = 3, NS = 50;
+    std::vector<float> mem(static_cast<size_t>(NT) * NS, 1.0f); // all-constant traces
+    TrsFile f;
+    f.openFromArray(mem.data(), NT, NS);
+
+    XCorrResult res;
+    std::string err;
+    bool ok = computeTemplateMatch(&f, 0, 0, 10, 0, NT, 0, NS, 1, {}, {}, res, noProgress(), err);
+    EXPECT_FALSE(ok);
+    EXPECT_FALSE(err.empty());
+}
+
+TEST(ComputeTemplateMatch, TemplateLongerThanSearchIsError) {
+    const int NT = 2, NS = 50;
+    TrsFile f;
+    std::vector<float> mem;
+    makeRampDataset(f, mem, NT, NS);
+
+    XCorrResult res;
+    std::string err;
+    // Template (40 samples) longer than search window (20 samples)
+    bool ok = computeTemplateMatch(&f, 0, 0, 40, 0, NT, 0, 20, 1, {}, {}, res, noProgress(), err);
+    EXPECT_FALSE(ok);
+    EXPECT_FALSE(err.empty());
+}
+
+TEST(ComputeTemplateMatch, LagStrideReducesColumnCount) {
+    const int NT = 3, NS = 100;
+    TrsFile f;
+    std::vector<float> mem;
+    makeRampDataset(f, mem, NT, NS);
+
+    XCorrResult res;
+    std::string err;
+    // n_lags = (100 - 10) / 5 + 1 = 19
+    bool ok = computeTemplateMatch(&f, 0, 0, 10, 0, NT, 0, NS, 5, {}, {}, res, noProgress(), err);
+    ASSERT_TRUE(ok) << err;
+    EXPECT_EQ(res.cols, 19);
+    EXPECT_EQ(res.tm_lag_stride, 5);
 }
