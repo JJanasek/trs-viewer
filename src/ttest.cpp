@@ -33,6 +33,16 @@ void TTestAccumulator::addTrace(int group, const float* samples, int32_t count) 
     N_[group]++;
 }
 
+void TTestAccumulator::mergeFrom(const TTestAccumulator& other) {
+    for (int g = 0; g < 2; g++) {
+        for (int32_t i = 0; i < num_samples_; i++) {
+            sum_[g][i]  += other.sum_[g][i];
+            sum2_[g][i] += other.sum2_[g][i];
+        }
+        N_[g] += other.N_[g];
+    }
+}
+
 void TTestAccumulator::computeWelchDf(std::vector<double>& df_out) const {
     df_out.resize(num_samples_);
     double n0 = static_cast<double>(N_[0]);

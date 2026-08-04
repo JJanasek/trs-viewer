@@ -213,6 +213,15 @@ public:
 
 private:
     Window window_;
+
+    // Cached across calls: rebuilding the window envelope and FFT plan is
+    // the dominant cost when the same instance is applied to many traces in
+    // a row (e.g. t-test/CPA accumulation), so only rebuild when the input
+    // size or window type actually changes.
+    std::vector<float> window_cache_;
+    int64_t            window_cache_size_ = -1;
+    Window             window_cache_type_ = Window::Rectangular;
+    Eigen::FFT<float>  fft_;
 };
 
 // ---------------------------------------------------------------------------
@@ -298,4 +307,10 @@ private:
     int    window_size_;
     int    hop_size_;
     Window window_;
+
+    // Cached across calls — see FFTMagnitudeTransform for rationale.
+    std::vector<float> window_cache_;
+    int                window_cache_size_ = -1;
+    Window             window_cache_type_ = Window::Rectangular;
+    Eigen::FFT<float>  fft_;
 };

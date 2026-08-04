@@ -197,6 +197,45 @@ TEST(ComputeXCorr, ZeroTracesReturnsError) {
 }
 
 // ---------------------------------------------------------------------------
+// kAlignDiscardShift: a discarded trace is excluded entirely, not zero-shifted
+// ---------------------------------------------------------------------------
+
+TEST(ComputeXCorr, DiscardedTraceExcludedFromStats) {
+    const int NT = 15, NS = 16;
+    std::vector<float> scales(NT);
+    for (int t = 0; t < NT; ++t) scales[static_cast<size_t>(t)] = 1.0f + 0.5f * t;
+    TrsFile f;
+    std::vector<float> mem;
+    makePropDataset(f, mem, NT, NS, scales);
+
+    // Append one extra, unrelated trace (constant ramp, not scaled) that
+    // would break the perfect-correlation property if it were included.
+    mem.resize(mem.size() + NS);
+    for (int s = 0; s < NS; ++s) mem[static_cast<size_t>(NT) * NS + s] = 42.0f - s;
+    f.openFromArray(mem.data(), NT + 1, NS);
+
+    std::vector<int32_t> shifts(NT + 1, 0);
+    shifts[NT] = kAlignDiscardShift;
+
+    XCorrResult res;
+    std::string err;
+    bool ok = computeXCorr(&f, 0, NT + 1, 0, 0, 1, XCorrMethod::Baseline,
+                           {}, shifts, res, noProgress(), err);
+    ASSERT_TRUE(ok) << err;
+
+    // n_traces reflects only the kept traces.
+    EXPECT_EQ(res.n_traces, NT);
+
+    // Stats match the no-outlier PerfectlyCorrelatedTraces case exactly —
+    // the discarded trace had zero influence.
+    const int M = res.rows;
+    for (int i = 0; i < M; ++i)
+        for (int j = 0; j < M; ++j)
+            EXPECT_NEAR(std::abs(res.matrix[static_cast<size_t>(i) * M + j]), 1.0f, 0.02f)
+                << " at (" << i << "," << j << ")";
+}
+
+// ---------------------------------------------------------------------------
 // Naive vs Baseline: results should match
 // ---------------------------------------------------------------------------
 

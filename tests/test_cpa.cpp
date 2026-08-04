@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include "align.h"
 #include "cpa.h"
 #include "trs_file.h"
 #include "processing.h"
@@ -281,4 +282,50 @@ TEST(ComputeCpa, SubsetOfTraces) {
     // HW symmetry: accept KEY or KEY^0xFF as both have equal |corr|
     EXPECT_TRUE(best_hyp == static_cast<int>(KEY) ||
                 best_hyp == static_cast<int>(static_cast<uint8_t>(KEY ^ 0xFF)));
+}
+
+// ---------------------------------------------------------------------------
+// kAlignDiscardShift: a discarded trace is excluded entirely, not zero-shifted
+// ---------------------------------------------------------------------------
+
+TEST(ComputeCpa, DiscardedTraceExcludedFromStats) {
+    const uint8_t KEY = 0xAB;
+    const int NT = 200, NT_BAD = 20, NS = 20, LS = 10;
+
+    TrsFile file;
+    std::vector<float> samples;
+    std::vector<uint8_t> data_bytes;
+    buildHWDataset(file, samples, data_bytes, NT, NS, LS, KEY, 2.0f);
+
+    // Reference: CPA over the NT clean traces alone.
+    CpaResult ref;
+    std::string err;
+    bool ok = computeCpa(&file, 0, NT, 0, 0, 256, {}, {}, hwLeakage,
+                         ref, noProgress(), err);
+    ASSERT_TRUE(ok) << err;
+
+    // Append NT_BAD traces with a huge, key-unrelated spike at the leak
+    // sample — if these leaked into the stats they'd swamp the real signal.
+    samples.resize(samples.size() + static_cast<size_t>(NT_BAD) * NS, 0.f);
+    data_bytes.resize(data_bytes.size() + static_cast<size_t>(NT_BAD), 0);
+    for (int t = 0; t < NT_BAD; ++t) {
+        samples[static_cast<size_t>(NT + t) * NS + LS] = 1e6f;
+        data_bytes[static_cast<size_t>(NT + t)] = static_cast<uint8_t>(t);
+    }
+    TrsFile file2;
+    file2.openFromArray(samples.data(), NT + NT_BAD, NS, "synthetic",
+                        data_bytes.data(), 1);
+
+    std::vector<int32_t> shifts(NT + NT_BAD, 0);
+    for (int t = 0; t < NT_BAD; ++t) shifts[static_cast<size_t>(NT + t)] = kAlignDiscardShift;
+
+    CpaResult res;
+    ok = computeCpa(&file2, 0, NT + NT_BAD, 0, 0, 256, shifts, {}, hwLeakage,
+                    res, noProgress(), err);
+    ASSERT_TRUE(ok) << err;
+
+    EXPECT_EQ(res.n_traces, NT);
+    ASSERT_EQ(res.corr.size(), ref.corr.size());
+    for (size_t i = 0; i < res.corr.size(); ++i)
+        EXPECT_NEAR(res.corr[i], ref.corr[i], 1e-5f) << "at index " << i;
 }
