@@ -2388,17 +2388,36 @@ void MainWindow::onOpenNpyTraces() {
             named_cols.push_back({colname, esz, std::move(cpayload)});
         }
     } else {
-        // Plain .npy
-        std::vector<int64_t> shape;
-        if (!loadNpy(path, traces_flat, shape, err)) {
-            QMessageBox::critical(this, "Load failed", err); return;
+        // Plain .npy: memory-map directly rather than reading the whole file into
+        // RAM (a copy here plus the copy TrsFile::openFromArray used to make meant
+        // multi-GB files needed ~2x their size in RAM and could get OOM-killed).
+        auto f = std::make_unique<TrsFile>();
+        std::string npy_err;
+        if (!f->openNpy(path.toStdString(), npy_err)) {
+            QMessageBox::critical(this, "Load failed", QString::fromStdString(npy_err)); return;
         }
-        if (shape.size() != 2) {
-            QMessageBox::critical(this, "Load failed",
-                QString("Expected a 2-D array (n_traces × n_samples), got %1-D.").arg(shape.size()));
-            return;
-        }
-        n_traces = shape[0]; n_samples = shape[1];
+
+        Dataset ds;
+        ds.file         = std::move(f);
+        ds.display_name = QFileInfo(path).fileName();
+        datasets_.push_back(std::move(ds));
+        active_idx_ = static_cast<int>(datasets_.size()) - 1;
+
+        tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
+        tab_bar_->setCurrentIndex(active_idx_);
+
+        rebuildTransformList();
+        plot_widget_->setTransforms(activeDs().pipeline);
+
+        int n = activeDs().file->header().num_traces;
+        spin_first_->setMaximum(std::max(0, n - 1));
+        spin_first_->setValue(0);
+        spin_count_->setMaximum(n);
+        spin_count_->setValue(1);
+
+        updateFileInfo();
+        onApplyTraces();
+        return;
     }
 
     if (n_traces < 1 || n_samples < 1) {

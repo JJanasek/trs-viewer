@@ -47,6 +47,9 @@ public:
     TrsFile& operator=(const TrsFile&) = delete;
 
     bool open(const std::string& path, std::string& error);
+    // Memory-maps a plain 2-D float32 (.npy) trace matrix directly — no full-file
+    // read and no in-RAM copy, so files far larger than available RAM work fine.
+    bool openNpy(const std::string& path, std::string& error);
     // Load an in-memory float32 trace matrix (row-major: samples[ti*n_samples+si]).
     // Optionally supply data_bytes[ti*data_length+bi] for per-trace auxiliary data.
     // After this call all SCA / xcorr code works on the in-memory data transparently.

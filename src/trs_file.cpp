@@ -6,6 +6,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 
 // Riscure TRS header tag IDs (single-byte, value range 0x41–0x5F)
@@ -110,6 +111,133 @@ bool TrsFile::open(const std::string& path, std::string& error) {
         madvise(mmap_ptr_, mmap_size_, MADV_RANDOM);
     }
     return ok;
+}
+
+bool TrsFile::openNpy(const std::string& path, std::string& error) {
+    close();
+    path_ = path;
+
+    fd_ = ::open(path.c_str(), O_RDONLY);
+    if (fd_ < 0) {
+        error = "Cannot open file: " + path;
+        return false;
+    }
+
+    struct stat st;
+    if (fstat(fd_, &st) != 0) {
+        error = "Cannot stat file";
+        ::close(fd_); fd_ = -1;
+        return false;
+    }
+
+    mmap_size_ = static_cast<size_t>(st.st_size);
+    if (mmap_size_ < 10) {
+        error = "File is too small to be a NumPy (.npy) file";
+        ::close(fd_); fd_ = -1;
+        return false;
+    }
+
+    mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd_, 0);
+    if (mmap_ptr_ == MAP_FAILED) {
+        mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (mmap_ptr_ == MAP_FAILED) {
+            error = "mmap failed";
+            mmap_ptr_ = nullptr;
+            ::close(fd_); fd_ = -1;
+            return false;
+        }
+    }
+
+    const auto* base = static_cast<const uint8_t*>(mmap_ptr_);
+    madvise(mmap_ptr_, mmap_size_, MADV_SEQUENTIAL);
+
+    if (base[0] != 0x93 || base[1] != 'N' || base[2] != 'U' ||
+        base[3] != 'M'  || base[4] != 'P' || base[5] != 'Y') {
+        error = "Not a NumPy (.npy) file.";
+        close();
+        return false;
+    }
+
+    uint8_t major = base[6];
+    size_t  data_start;
+    uint32_t header_len;
+    if (major == 1) {
+        if (mmap_size_ < 10) { error = "Truncated NPY header."; close(); return false; }
+        header_len = static_cast<uint32_t>(base[8]) | (static_cast<uint32_t>(base[9]) << 8);
+        data_start = 10;
+    } else {
+        if (mmap_size_ < 12) { error = "Truncated NPY header."; close(); return false; }
+        header_len = static_cast<uint32_t>(base[8])
+                   | (static_cast<uint32_t>(base[9])  <<  8)
+                   | (static_cast<uint32_t>(base[10]) << 16)
+                   | (static_cast<uint32_t>(base[11]) << 24);
+        data_start = 12;
+    }
+    if (data_start + header_len > mmap_size_) {
+        error = "Truncated NPY header."; close(); return false;
+    }
+
+    std::string hdr(reinterpret_cast<const char*>(base + data_start), header_len);
+    data_start += header_len;
+
+    if (hdr.find("'<f4'") == std::string::npos && hdr.find("\"<f4\"") == std::string::npos) {
+        error = "Only little-endian float32 ('<f4') arrays are supported.";
+        close();
+        return false;
+    }
+
+    auto sp = hdr.find("'shape'");
+    if (sp == std::string::npos) sp = hdr.find("\"shape\"");
+    auto lp = sp == std::string::npos ? std::string::npos : hdr.find('(', sp);
+    auto rp = lp == std::string::npos ? std::string::npos : hdr.find(')', lp);
+    if (sp == std::string::npos || lp == std::string::npos || rp == std::string::npos) {
+        error = "Cannot parse shape."; close(); return false;
+    }
+    std::string shape_str = hdr.substr(lp + 1, rp - lp - 1);
+    std::vector<int64_t> shape;
+    size_t pos = 0;
+    while (pos < shape_str.size()) {
+        while (pos < shape_str.size() &&
+               (shape_str[pos] == ' ' || shape_str[pos] == ',')) pos++;
+        if (pos >= shape_str.size()) break;
+        if (!std::isdigit(static_cast<unsigned char>(shape_str[pos]))) break;
+        size_t end = pos;
+        while (end < shape_str.size() &&
+               std::isdigit(static_cast<unsigned char>(shape_str[end]))) end++;
+        shape.push_back(static_cast<int64_t>(std::stoll(shape_str.substr(pos, end - pos))));
+        pos = end;
+    }
+    if (shape.size() != 2) {
+        error = "Expected a 2-D array (n_traces x n_samples), got " +
+                std::to_string(shape.size()) + "-D.";
+        close();
+        return false;
+    }
+
+    header_.num_traces  = static_cast<int32_t>(shape[0]);
+    header_.num_samples = static_cast<int32_t>(shape[1]);
+    header_.sample_type = SampleType::FLOAT32;
+    header_.sample_size = 4;
+    header_.data_length = 0;
+    header_.title_space = 0;
+
+    if (header_.num_traces <= 0 || header_.num_samples <= 0) {
+        error = "Empty array."; close(); return false;
+    }
+
+    trace_block_offset_ = static_cast<int64_t>(data_start);
+    bytes_per_trace_    = static_cast<int64_t>(header_.num_samples) * header_.sample_size;
+
+    const int64_t needed = trace_block_offset_
+                          + static_cast<int64_t>(header_.num_traces) * bytes_per_trace_;
+    if (needed > static_cast<int64_t>(mmap_size_)) {
+        error = "File too short for declared shape.";
+        close();
+        return false;
+    }
+
+    madvise(mmap_ptr_, mmap_size_, MADV_RANDOM);
+    return true;
 }
 
 bool TrsFile::parseHeader(const uint8_t* data, size_t size, std::string& error) {
