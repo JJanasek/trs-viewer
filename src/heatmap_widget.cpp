@@ -423,17 +423,18 @@ void HeatmapWidget::wheelEvent(QWheelEvent* e) {
     double cx = view_x0_ + (view_x1_ - view_x0_) * (px - pr.left()) / pr.width();
     double cy = view_y0_ + (view_y1_ - view_y0_) * (py - pr.top())  / pr.height();
 
+    double Md_x = static_cast<double>(cols_);
+    double Md_y = static_cast<double>(rows_);
+
     double factor = (e->angleDelta().y() > 0) ? 0.7 : 1.0 / 0.7;
-    double span_x = std::max(2.0, (view_x1_ - view_x0_) * factor);
-    double span_y = std::max(2.0, (view_y1_ - view_y0_) * factor);
+    double span_x = std::clamp((view_x1_ - view_x0_) * factor, 2.0, Md_x);
+    double span_y = std::clamp((view_y1_ - view_y0_) * factor, 2.0, Md_y);
 
     double frac_x = (pr.width()  > 0) ? (px - pr.left()) / pr.width()  : 0.5;
     double frac_y = (pr.height() > 0) ? (py - pr.top())  / pr.height() : 0.5;
     double nx0 = cx - frac_x * span_x;
     double ny0 = cy - frac_y * span_y;
 
-    double Md_x = static_cast<double>(cols_);
-    double Md_y = static_cast<double>(rows_);
     view_x0_ = std::clamp(nx0, 0.0, Md_x - span_x);
     view_x1_ = view_x0_ + span_x;
     if (view_x1_ > Md_x) { view_x1_ = Md_x; view_x0_ = std::max(0.0, Md_x - span_x); }
