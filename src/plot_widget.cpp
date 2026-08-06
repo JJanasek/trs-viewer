@@ -111,6 +111,17 @@ void PlotWidget::clearCropRanges() {
     update();
 }
 
+void PlotWidget::setMatchMarkers(const std::vector<std::pair<int64_t,int64_t>>& ranges) {
+    match_markers_ = ranges;
+    update();
+}
+
+void PlotWidget::clearMatchMarkers() {
+    if (match_markers_.empty()) return;
+    match_markers_.clear();
+    update();
+}
+
 // ---------------------------------------------------------------------------
 // Per-trace shifts
 // ---------------------------------------------------------------------------
@@ -1026,6 +1037,28 @@ void PlotWidget::paintEvent(QPaintEvent*) {
             p.setFont(cf);
             p.setPen(lc);
             p.drawText(x1 + 3, pr.top() + 13, QString("#%1").arg(i + 1));
+        }
+    }
+
+    // Match-marker overlay (e.g. template-match hits) — amber, thin outline only
+    // so many closely-spaced hits stay legible; read-only, no drag/edit affordance.
+    if (!match_markers_.empty()) {
+        const QColor fc(255, 176, 0, 40);
+        const QColor lc(255, 176, 0, 200);
+        QFont mf = font(); mf.setPointSize(8); mf.setBold(true);
+        for (int i = 0; i < static_cast<int>(match_markers_.size()); i++) {
+            int x1 = sampleToPixel(match_markers_[i].first,  pr);
+            int x2 = sampleToPixel(match_markers_[i].second, pr);
+            x1 = std::clamp(x1, pr.left(), pr.right());
+            x2 = std::clamp(x2, pr.left(), pr.right());
+            if (x1 >= x2) continue;
+            p.fillRect(QRect(x1, pr.top(), x2 - x1, pr.height()), fc);
+            p.setPen(QPen(lc, 1, Qt::DashLine));
+            p.drawLine(x1, pr.top(), x1, pr.bottom());
+            p.drawLine(x2, pr.top(), x2, pr.bottom());
+            p.setFont(mf);
+            p.setPen(lc);
+            p.drawText(x1 + 3, pr.bottom() - 5, QString("M%1").arg(i + 1));
         }
     }
 
