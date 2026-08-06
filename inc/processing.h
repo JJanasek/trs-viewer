@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <random>
@@ -126,34 +127,49 @@ private:
 };
 
 // ---------------------------------------------------------------------------
-// Window Resample: divide trace into non-overlapping blocks of `window_size`
-// and replace each block with its mean.  Output has floor(N / window_size)
-// samples — the trace is shortened (decimated).
+// Window Resample: slide a `window_size`-sample window across the trace,
+// advancing by `hop_size = window_size * (1 - overlap)` samples each step,
+// and replace each window with its mean. overlap = 0 (default) gives the
+// original non-overlapping block-decimation behaviour; overlap → 1 makes
+// consecutive windows nearly identical (hop clamped to >= 1 sample).
+// Output has num_windows = (N - window_size) / hop_size + 1 samples.
 // ---------------------------------------------------------------------------
 class WindowResampleTransform : public ITransform {
 public:
-    explicit WindowResampleTransform(int window_size = 64);
+    explicit WindowResampleTransform(int window_size = 64, float overlap = 0.0f);
 
     std::string name() const override;
     int64_t apply(float* buf, int64_t count, int64_t sample_offset) override;
     int64_t transformedCount(int64_t input_count) const override;
     void reset() override;
     bool requiresSequential() const override { return true; }
-    // No startup transient — valid output from first complete block.
+    // No startup transient — valid output from first complete window.
     int64_t startupSamples() const override { return 0; }
 
-    void setWindowSize(int w);
-    int  windowSize() const { return window_size_; }
+    void  setWindowSize(int w);
+    int   windowSize() const { return window_size_; }
+    void  setOverlap(float o);
+    float overlap()    const { return overlap_; }
+    // hop = window_size * (1 - overlap), rounded, clamped to >= 1.
+    int   hopSize()     const;
 
     std::shared_ptr<ITransform> clone() const override {
         return std::make_shared<WindowResampleTransform>(*this);
     }
 
 private:
-    int     window_size_;
-    // Partial-block state (carries over between chunks)
-    double  partial_sum_   = 0.0;
-    int     partial_count_ = 0;
+    int    window_size_;
+    float  overlap_;   // 0 = no overlap; approaches 1 = near-total overlap
+
+    // Streaming state — a ring buffer holding the current window's samples
+    // (needed even for the non-overlapping case, since chunked callers, e.g.
+    // the zoomed-out plot renderer, feed this transform one chunk at a time)
+    std::vector<float> ring_;
+    double  ring_sum_      = 0.0;
+    int     ring_pos_      = 0;
+    int64_t ring_count_    = 0;   // samples currently held (caps at window_size_)
+    int64_t samples_seen_  = 0;   // total raw samples fed since last reset()
+    int64_t next_emit_at_  = 0;   // absolute index of the next window's last sample
 };
 
 // ---------------------------------------------------------------------------
@@ -298,6 +314,18 @@ public:
     int    windowSize()   const { return window_size_; }
     int    hopSize()      const { return hop_size_;    }
     Window window()       const { return window_;      }
+
+    // Convenience view of hop_size_ as a fraction of window_size_: overlap =
+    // 1 - hop/window. setOverlap() just derives and stores hop_size_ (hop
+    // stays the single source of truth, so setHopSize()/hopSize() and
+    // setOverlap()/overlap() can be mixed without going out of sync).
+    void  setOverlap(float o) {
+        float clamped = std::clamp(o, 0.0f, 0.999f);
+        setHopSize(std::max(1, static_cast<int>(std::llround(window_size_ * (1.0 - clamped)))));
+    }
+    float overlap() const {
+        return 1.0f - static_cast<float>(hop_size_) / static_cast<float>(window_size_);
+    }
 
     std::shared_ptr<ITransform> clone() const override {
         return std::make_shared<STFTMagnitudeTransform>(*this);

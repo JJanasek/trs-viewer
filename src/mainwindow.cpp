@@ -48,6 +48,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 #ifdef _OPENMP
 #  include <omp.h>
@@ -287,7 +288,7 @@ MainWindow::MainWindow(QWidget* parent)
                           : id == 1 ? InteractionMode::Measure
                           : id == 2 ? InteractionMode::BoxZoom
                                     : InteractionMode::AlignDrag;
-        plot_widget_->setMode(m);
+        plotWidget()->setMode(m);
         if (id == 0 || id == 2 || id == 3) lbl_measure_->setText("–");
     });
 
@@ -297,7 +298,7 @@ MainWindow::MainWindow(QWidget* parent)
     btn_stack_->setCheckable(true);
     btn_stack_->setToolTip("Draw each trace in its own lane instead of overlapping it with the others");
     connect(btn_stack_, &QPushButton::toggled, this, [this](bool on) {
-        plot_widget_->setStacked(on);
+        plotWidget()->setStacked(on);
     });
 
     // Separator
@@ -317,13 +318,13 @@ MainWindow::MainWindow(QWidget* parent)
     btn_yzoom_in ->setToolTip("Zoom in Y / taller traces (also: Ctrl/Shift+scroll up)");
     btn_yzoom_out->setToolTip("Zoom out Y / shorter traces (also: Ctrl/Shift+scroll down)");
 
-    // plot_widget_ hasn't been constructed yet at this point, so use lambdas
-    // that capture `this` — by the time the button is clicked, plot_widget_ is valid.
-    connect(btn_zoom_in_,  &QPushButton::clicked, this, [this](){ plot_widget_->zoomIn(); });
-    connect(btn_zoom_out_, &QPushButton::clicked, this, [this](){ plot_widget_->zoomOut(); });
+    // plotWidget() resolves to whichever tab is active at click time (there's
+    // no single fixed plot widget any more — each tab owns its own).
+    connect(btn_zoom_in_,  &QPushButton::clicked, this, [this](){ plotWidget()->zoomIn(); });
+    connect(btn_zoom_out_, &QPushButton::clicked, this, [this](){ plotWidget()->zoomOut(); });
     connect(btn_reset_,    &QPushButton::clicked, this, &MainWindow::onResetView);
-    connect(btn_yzoom_in,  &QPushButton::clicked, this, [this](){ plot_widget_->zoomInY(); });
-    connect(btn_yzoom_out, &QPushButton::clicked, this, [this](){ plot_widget_->zoomOutY(); });
+    connect(btn_yzoom_in,  &QPushButton::clicked, this, [this](){ plotWidget()->zoomInY(); });
+    connect(btn_yzoom_out, &QPushButton::clicked, this, [this](){ plotWidget()->zoomOutY(); });
 
     btn_undo_ = new QPushButton("↩ Undo");
     btn_undo_->setToolTip("Undo last action [Ctrl+Z]");
@@ -354,6 +355,15 @@ MainWindow::MainWindow(QWidget* parent)
     toolbar_l->addWidget(combo_theme_);
     toolbar_l->addStretch();
 
+    // "Tile Vertically" — show every open tab's plot stacked at once instead
+    // of one at a time. Independent of everything else on the toolbar.
+    btn_tile_ = new QPushButton("⬒ Tile Tabs");
+    btn_tile_->setCheckable(true);
+    btn_tile_->setToolTip("Show every open tab stacked vertically, each with its own "
+                         "axes, instead of one at a time");
+    connect(btn_tile_, &QPushButton::toggled, this, &MainWindow::onToggleTile);
+    toolbar_l->addWidget(btn_tile_);
+
     // Dataset tab bar
     tab_bar_ = new QTabBar;
     tab_bar_->setTabsClosable(true);
@@ -366,6 +376,9 @@ MainWindow::MainWindow(QWidget* parent)
             int next = (idx > 0) ? idx - 1 : 1;
             tab_bar_->setCurrentIndex(next);
         }
+        datasets_[static_cast<size_t>(idx)].plot_widget->deleteLater();
+        if (datasets_[static_cast<size_t>(idx)].extra_toolbar)
+            datasets_[static_cast<size_t>(idx)].extra_toolbar->deleteLater();
         datasets_.erase(datasets_.begin() + idx);
         tab_bar_->removeTab(idx);
         // Recompute active_idx_ after removal.
@@ -373,28 +386,25 @@ MainWindow::MainWindow(QWidget* parent)
         if (active_idx_ < 0) {
             // No datasets left
             active_idx_ = -1;
-            plot_widget_->clearTraces();
             updateFileInfo();
             rebuildTransformList();
         }
+        updateViewLayout();
     });
 
-    // Plot widget
-    plot_widget_ = new PlotWidget;
-    connect(plot_widget_, &PlotWidget::viewChanged,
-            this, &MainWindow::onViewChanged);
-    connect(plot_widget_, &PlotWidget::measurementUpdated,
-            this, &MainWindow::onMeasurementUpdated);
-    connect(plot_widget_, &PlotWidget::traceShiftsChanged,
-            this, &MainWindow::onDragAlignChanged);
-    connect(plot_widget_, &PlotWidget::alignDragStarted,
-            this, &MainWindow::saveSnapshot);
-    connect(plot_widget_, &PlotWidget::beforeViewChange,
-            this, &MainWindow::saveSnapshot);
+    // View container: holds every tab's own PlotWidget. Single-view mode
+    // shows only the active one; tiled mode stacks all of them.
+    view_container_ = new QWidget;
+    view_layout_    = new QVBoxLayout(view_container_);
+    view_layout_->setContentsMargins(0, 0, 0, 0);
+    view_layout_->setSpacing(4);
+
+    placeholder_widget_ = new PlotWidget(view_container_);
+    view_layout_->addWidget(placeholder_widget_, 1);
 
     right_l->addWidget(tab_bar_);
     right_l->addWidget(toolbar);
-    right_l->addWidget(plot_widget_, 1);
+    right_l->addWidget(view_container_, 1);
 
     splitter->addWidget(side);
     splitter->addWidget(right_pane);
@@ -407,13 +417,13 @@ MainWindow::MainWindow(QWidget* parent)
     auto* sc_reset = new QShortcut(QKeySequence("R"), this);
     connect(sc_reset, &QShortcut::activated, this, &MainWindow::onResetView);
     auto* sc_plus  = new QShortcut(QKeySequence("+"), this);
-    connect(sc_plus,  &QShortcut::activated, plot_widget_, &PlotWidget::zoomIn);
+    connect(sc_plus,  &QShortcut::activated, this, [this]() { plotWidget()->zoomIn(); });
     auto* sc_minus = new QShortcut(QKeySequence("-"), this);
-    connect(sc_minus, &QShortcut::activated, plot_widget_, &PlotWidget::zoomOut);
+    connect(sc_minus, &QShortcut::activated, this, [this]() { plotWidget()->zoomOut(); });
     auto* sc_p = new QShortcut(QKeySequence("P"), this);
     connect(sc_p, &QShortcut::activated, this, [this]() {
-        bool measure = (plot_widget_->mode() == InteractionMode::Pan);
-        plot_widget_->setMode(measure ? InteractionMode::Measure
+        bool measure = (plotWidget()->mode() == InteractionMode::Pan);
+        plotWidget()->setMode(measure ? InteractionMode::Measure
                                        : InteractionMode::Pan);
         btn_mode_pan_->setChecked(!measure);
         btn_mode_measure_->setChecked(measure);
@@ -422,8 +432,8 @@ MainWindow::MainWindow(QWidget* parent)
     });
     auto* sc_z = new QShortcut(QKeySequence("Z"), this);
     connect(sc_z, &QShortcut::activated, this, [this]() {
-        bool box_zoom = (plot_widget_->mode() == InteractionMode::BoxZoom);
-        plot_widget_->setMode(box_zoom ? InteractionMode::Pan
+        bool box_zoom = (plotWidget()->mode() == InteractionMode::BoxZoom);
+        plotWidget()->setMode(box_zoom ? InteractionMode::Pan
                                        : InteractionMode::BoxZoom);
         btn_mode_pan_->setChecked(box_zoom);
         btn_mode_measure_->setChecked(false);
@@ -443,8 +453,9 @@ void MainWindow::onSwitchDataset(int idx) {
     if (idx == active_idx_) return;
     active_idx_ = idx;
 
-    plot_widget_->clearTraces();
-    plot_widget_->setTransforms(activeDs().pipeline);
+    // Each tab owns its own persistent PlotWidget with its own traces/view
+    // already loaded — switching just changes which one is active and
+    // refreshes the side panel; it never reloads or resets the plot.
     rebuildTransformList();
 
     int n = activeDs().file ? activeDs().file->header().num_traces : 0;
@@ -453,7 +464,7 @@ void MainWindow::onSwitchDataset(int idx) {
 
     updateFileInfo();
     updateUndoButton();
-    onApplyTraces();
+    updateViewLayout();
 }
 
 void MainWindow::onCloseDataset() {
@@ -463,15 +474,143 @@ void MainWindow::onCloseDataset() {
         int next = (idx > 0) ? idx - 1 : 1;
         tab_bar_->setCurrentIndex(next);
     }
+    datasets_[static_cast<size_t>(idx)].plot_widget->deleteLater();
+    if (datasets_[static_cast<size_t>(idx)].extra_toolbar)
+        datasets_[static_cast<size_t>(idx)].extra_toolbar->deleteLater();
     datasets_.erase(datasets_.begin() + idx);
     tab_bar_->removeTab(idx);
     active_idx_ = tab_bar_->currentIndex();
     if (active_idx_ < 0 || datasets_.empty()) {
         active_idx_ = -1;
-        plot_widget_->clearTraces();
         updateFileInfo();
         rebuildTransformList();
     }
+    updateViewLayout();
+}
+
+// ---------------------------------------------------------------------------
+// Tab / tile view management
+// ---------------------------------------------------------------------------
+
+PlotWidget* MainWindow::createPlotWidgetForTab() {
+    auto* pw = new PlotWidget(view_container_);
+
+    // Interaction signals from any tab's widget can fire while that tab is
+    // not the active one (tiled mode shows every widget at once) — route
+    // through activateDatasetForWidget() first so activeDs()/plotWidget()
+    // resolve to the dataset that actually owns the widget that fired.
+    connect(pw, &PlotWidget::viewChanged, this,
+            [this, pw](int64_t s, int64_t e, int64_t t) {
+                activateDatasetForWidget(pw);
+                onViewChanged(s, e, t);
+            });
+    connect(pw, &PlotWidget::measurementUpdated, this,
+            [this, pw](int64_t s1, double v1, int64_t s2, double v2, bool has_p2) {
+                activateDatasetForWidget(pw);
+                onMeasurementUpdated(s1, v1, s2, v2, has_p2);
+            });
+    connect(pw, &PlotWidget::traceShiftsChanged, this,
+            [this, pw]() {
+                activateDatasetForWidget(pw);
+                onDragAlignChanged();
+            });
+    connect(pw, &PlotWidget::alignDragStarted, this,
+            [this, pw]() {
+                activateDatasetForWidget(pw);
+                saveSnapshot();
+            });
+    connect(pw, &PlotWidget::beforeViewChange, this,
+            [this, pw]() {
+                activateDatasetForWidget(pw);
+                saveSnapshot();
+            });
+    return pw;
+}
+
+void MainWindow::updateViewLayout() {
+    // Pull everything currently in the layout back out (the widgets
+    // themselves stay alive — they're owned by view_container_/datasets_ —
+    // this just clears the arrangement so it can be rebuilt from scratch).
+    while (view_layout_->count() > 0) {
+        QLayoutItem* item = view_layout_->takeAt(0);
+        if (item->widget()) item->widget()->setVisible(false);
+        delete item;
+    }
+
+    if (datasets_.empty()) {
+        placeholder_widget_->setVisible(true);
+        view_layout_->addWidget(placeholder_widget_, 1);
+        return;
+    }
+    placeholder_widget_->setVisible(false);
+
+    auto addDatasetWidgets = [this](Dataset& ds) {
+        if (ds.extra_toolbar) {
+            view_layout_->addWidget(ds.extra_toolbar, 0);
+            ds.extra_toolbar->setVisible(true);
+        }
+        view_layout_->addWidget(ds.plot_widget, 1);
+        ds.plot_widget->setVisible(true);
+    };
+
+    if (tiled_) {
+        for (auto& ds : datasets_) addDatasetWidgets(ds);
+    } else if (hasActiveDs()) {
+        addDatasetWidgets(activeDs());
+    }
+}
+
+int MainWindow::datasetIndexForWidget(PlotWidget* pw) const {
+    for (size_t i = 0; i < datasets_.size(); i++)
+        if (datasets_[i].plot_widget == pw) return static_cast<int>(i);
+    return -1;
+}
+
+void MainWindow::activateDatasetForWidget(PlotWidget* pw) {
+    int idx = datasetIndexForWidget(pw);
+    if (idx < 0 || idx == active_idx_) return;
+    active_idx_ = idx;
+
+    // Side panel only — never touch the plot contents or the view layout
+    // here, since this can be called for a tiled, non-selected panel that
+    // must keep rendering exactly as it already is.
+    tab_bar_->blockSignals(true);
+    tab_bar_->setCurrentIndex(idx);
+    tab_bar_->blockSignals(false);
+
+    rebuildTransformList();
+    int n = activeDs().file ? activeDs().file->header().num_traces : 0;
+    spin_first_->setMaximum(std::max(0, n - 1));
+    spin_count_->setMaximum(std::max(1, n));
+    updateFileInfo();
+    updateUndoButton();
+}
+
+void MainWindow::onToggleTile(bool on) {
+    tiled_ = on;
+    updateViewLayout();
+}
+
+void MainWindow::addResultTab(const std::vector<float>& result, const QString& title,
+                               const QColor& color, const QString& trace_label)
+{
+    Dataset ds;
+    ds.is_result    = true;
+    ds.display_name = title;
+    ds.plot_widget  = createPlotWidgetForTab();
+    datasets_.push_back(std::move(ds));
+    active_idx_ = static_cast<int>(datasets_.size()) - 1;
+
+    tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
+    tab_bar_->setCurrentIndex(active_idx_);
+
+    auto data = std::make_shared<std::vector<float>>(result);
+    plotWidget()->addTrace(data, color, trace_label);
+    plotWidget()->resetView();
+
+    rebuildTransformList();
+    updateFileInfo();
+    updateViewLayout();
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +726,7 @@ void MainWindow::saveSnapshot() {
     snap.align_first_trace  = ds.align_first_trace;
     snap.align_first_sample = ds.align_first_sample;
     snap.align_n_samples    = ds.align_n_samples;
-    snap.view               = plot_widget_->captureViewState();
+    snap.view               = plotWidget()->captureViewState();
     ds.undo_stack.push_front(std::move(snap));
     if (static_cast<int>(ds.undo_stack.size()) > Dataset::kMaxUndo)
         ds.undo_stack.pop_back();
@@ -603,19 +742,19 @@ void MainWindow::restoreSnapshot(DatasetSnapshot snap) {
     ds.align_n_samples    = snap.align_n_samples;
 
     rebuildTransformList();
-    plot_widget_->setTransforms(ds.pipeline);
-    plot_widget_->restoreViewState(snap.view);
+    plotWidget()->setTransforms(ds.pipeline);
+    plotWidget()->restoreViewState(snap.view);
 
     // Re-apply shifts to currently visible traces.
-    plot_widget_->clearTraceShifts();
+    plotWidget()->clearTraceShifts();
     if (!ds.align_shifts.empty() && ds.plot_file_backed) {
-        int n = static_cast<int>(plot_widget_->traceShifts().size());
+        int n = static_cast<int>(plotWidget()->traceShifts().size());
         for (int i = 0; i < n; i++) {
             int shift_idx = ds.plot_first_trace + i - ds.align_first_trace;
             if (shift_idx >= 0 && shift_idx < static_cast<int>(ds.align_shifts.size())) {
                 int32_t shift = ds.align_shifts[static_cast<size_t>(shift_idx)];
                 if (shift != kAlignDiscardShift)
-                    plot_widget_->setTraceShift(i, shift);
+                    plotWidget()->setTraceShift(i, shift);
             }
         }
     }
@@ -666,6 +805,7 @@ void MainWindow::openFile(const QString& path) {
     Dataset ds;
     ds.file         = std::move(f);
     ds.display_name = QFileInfo(path).fileName();
+    ds.plot_widget  = createPlotWidgetForTab();
     datasets_.push_back(std::move(ds));
     active_idx_ = static_cast<int>(datasets_.size()) - 1;
 
@@ -673,7 +813,7 @@ void MainWindow::openFile(const QString& path) {
     tab_bar_->setCurrentIndex(active_idx_);
 
     rebuildTransformList();
-    plot_widget_->setTransforms(activeDs().pipeline);
+    plotWidget()->setTransforms(activeDs().pipeline);
 
     int n = activeDs().file->header().num_traces;
     spin_first_->setMaximum(std::max(0, n - 1));
@@ -683,6 +823,7 @@ void MainWindow::openFile(const QString& path) {
 
     updateFileInfo();
     onApplyTraces();
+    updateViewLayout();
 }
 
 static QString hexBytes(const uint8_t* p, size_t n, int group = 0) {
@@ -697,6 +838,12 @@ static QString hexBytes(const uint8_t* p, size_t n, int group = 0) {
 void MainWindow::updateFileInfo() {
     if (!hasActiveDs()) { lbl_file_->setText("No file"); lbl_info_->clear();
                       lbl_trace_data_->setText("–"); return; }
+    if (activeDs().is_result) {
+        lbl_file_->setText(activeDs().display_name);
+        lbl_info_->setText("Derived result (no source file)");
+        lbl_trace_data_->setText("–");
+        return;
+    }
 
     const auto& h = activeDs().file->header();
     lbl_file_->setText(QString::fromStdString(activeDs().file->path()).section('/', -1));
@@ -727,7 +874,7 @@ void MainWindow::updateFileInfo() {
 }
 
 void MainWindow::updateTraceDataDisplay() {
-    if (!hasActiveDs()) { lbl_trace_data_->setText("–"); return; }
+    if (!hasActiveDs() || activeDs().is_result) { lbl_trace_data_->setText("–"); return; }
     const auto& h = activeDs().file->header();
     if (h.data_length <= 0) { lbl_trace_data_->setText("(no data)"); return; }
 
@@ -781,9 +928,19 @@ void MainWindow::updateTraceDataDisplay() {
 }
 
 void MainWindow::onApplyTraces() {
-    if (!hasActiveDs()) return;
+    if (!hasActiveDs() || activeDs().is_result) return;
 
-    plot_widget_->clearTraces();
+    // This button (re)populates the trace list — it's not the Reset button,
+    // so the current pan/zoom should survive it. clearTraces() unconditionally
+    // wipes the view, so capture it first and restore afterward (clamped to
+    // whatever the reloaded traces actually span). A dataset with no prior
+    // view (first load) falls back to a full reset instead.
+    const bool    had_view    = plotWidget()->totalSamples() > 0;
+    const int64_t saved_start = plotWidget()->viewStart();
+    const int64_t saved_end   = plotWidget()->viewEnd();
+    const float   saved_yscale = plotWidget()->yScale();
+
+    plotWidget()->clearTraces();
 
     int first = spin_first_->value();
     int count = spin_count_->value();
@@ -792,10 +949,16 @@ void MainWindow::onApplyTraces() {
     for (int i = 0; i < count && (first + i) < max; i++) {
         QColor  col   = TRACE_COLORS[(first + i) % NUM_COLORS];
         QString label = QString("Trace %1").arg(first + i);
-        plot_widget_->addTrace(activeDs().file.get(), first + i, col, label);
+        plotWidget()->addTrace(activeDs().file.get(), first + i, col, label);
     }
-    plot_widget_->setTransforms(activeDs().pipeline);
-    plot_widget_->resetView();
+    plotWidget()->setTransforms(activeDs().pipeline);
+
+    if (had_view) {
+        plotWidget()->setViewRange(saved_start, saved_end);
+        plotWidget()->setYScale(saved_yscale);
+    } else {
+        plotWidget()->resetView();
+    }
 
     // Clear alignment state — new trace set makes old shifts stale.
     activeDs().align_shifts.clear();
@@ -813,7 +976,7 @@ void MainWindow::onDragAlignChanged() {
     // Only update alignment state when the plot holds file-backed traces.
     if (!activeDs().file || !activeDs().plot_file_backed) return;
 
-    auto shifts = plot_widget_->traceShifts();
+    auto shifts = plotWidget()->traceShifts();
     if (shifts.empty()) return;
 
     activeDs().align_first_trace  = activeDs().plot_first_trace;
@@ -829,8 +992,15 @@ void MainWindow::onAddTransform() {
     activeDs().pipeline.push_back(tx);
     rebuildTransformList();
     updateFileInfo();
-    plot_widget_->setTransforms(activeDs().pipeline);
-    plot_widget_->update();
+    // Only push the live pipeline to the plot when it's showing raw,
+    // file-backed traces. When the main view holds a static baked-in
+    // result (e.g. after Align Traces → Apply to Main View, which already
+    // applied the pipeline once to produce it), re-syncing here would
+    // silently re-apply the pipeline on top of that already-processed
+    // result the next time it repaints.
+    if (activeDs().plot_file_backed)
+        plotWidget()->setTransforms(activeDs().pipeline);
+    plotWidget()->update();
 }
 
 void MainWindow::onRemoveTransform() {
@@ -840,8 +1010,9 @@ void MainWindow::onRemoveTransform() {
     activeDs().pipeline.erase(activeDs().pipeline.begin() + row);
     rebuildTransformList();
     updateFileInfo();
-    plot_widget_->setTransforms(activeDs().pipeline);
-    plot_widget_->update();
+    if (activeDs().plot_file_backed)
+        plotWidget()->setTransforms(activeDs().pipeline);
+    plotWidget()->update();
 }
 
 void MainWindow::onMoveTransformUp() {
@@ -852,8 +1023,9 @@ void MainWindow::onMoveTransformUp() {
     rebuildTransformList();
     list_transforms_->setCurrentRow(row - 1);
     updateFileInfo();
-    plot_widget_->setTransforms(activeDs().pipeline);
-    plot_widget_->update();
+    if (activeDs().plot_file_backed)
+        plotWidget()->setTransforms(activeDs().pipeline);
+    plotWidget()->update();
 }
 
 void MainWindow::onMoveTransformDown() {
@@ -864,21 +1036,21 @@ void MainWindow::onMoveTransformDown() {
     rebuildTransformList();
     list_transforms_->setCurrentRow(row + 1);
     updateFileInfo();
-    plot_widget_->setTransforms(activeDs().pipeline);
-    plot_widget_->update();
+    if (activeDs().plot_file_backed)
+        plotWidget()->setTransforms(activeDs().pipeline);
+    plotWidget()->update();
 }
 
 void MainWindow::onResetView() {
-    if (hasActiveDs()) {
-        saveSnapshot();
-        activeDs().align_shifts.clear();
-        activeDs().align_first_trace  = 0;
-        activeDs().align_first_sample = 0;
-        activeDs().align_n_samples    = 0;
-    }
-    plot_widget_->clearTraceShifts();
-    plot_widget_->resetView();
-    plot_widget_->clearCropRanges();
+    // View-only reset: pan/zoom back to the full range and clear crop
+    // ranges. Alignment (align_shifts and any per-trace drag shifts) is
+    // deliberately left untouched — Reset is for the view, not for
+    // discarding an alignment you just computed. Loading/refreshing traces
+    // still clears alignment, since a different trace range makes old
+    // shifts stale.
+    if (hasActiveDs()) saveSnapshot();
+    plotWidget()->resetView();
+    plotWidget()->clearCropRanges();
 }
 
 void MainWindow::onViewChanged(int64_t start, int64_t end, int64_t /*total*/) {
@@ -922,7 +1094,7 @@ void MainWindow::onMeasurementUpdated(int64_t s1, double v1,
 }
 
 void MainWindow::onThemeChanged(int index) {
-    plot_widget_->setTheme(index == 0 ? PlotTheme::dark() : PlotTheme::light());
+    plotWidget()->setTheme(index == 0 ? PlotTheme::dark() : PlotTheme::light());
 }
 
 void MainWindow::rebuildTransformList() {
@@ -1029,7 +1201,7 @@ static bool exportTracesToTrs(
 }
 
 void MainWindow::onExportTrs() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "Export TRS", "No file loaded.");
         return;
     }
@@ -1091,7 +1263,7 @@ void MainWindow::onExportPng() {
     if (path.isEmpty()) return;
     updateRecentDir("export", path);
 
-    QPixmap px = plot_widget_->grab();
+    QPixmap px = plotWidget()->grab();
     QImage img = px.toImage();
     constexpr int kMaxPx = 2400;
     if (img.width() > kMaxPx || img.height() > kMaxPx)
@@ -1113,7 +1285,7 @@ void MainWindow::onExportPdf() {
     updateRecentDir("export", path);
 
     // Grab the plot at current widget resolution, then paint into PDF.
-    QPixmap px = plot_widget_->grab();
+    QPixmap px = plotWidget()->grab();
 
     QPdfWriter writer(path);
     writer.setResolution(150);
@@ -2485,6 +2657,7 @@ void MainWindow::onOpenNpyTraces() {
     Dataset ds;
     ds.file         = std::move(f);
     ds.display_name = QFileInfo(path).fileName();
+    ds.plot_widget  = createPlotWidgetForTab();
     datasets_.push_back(std::move(ds));
     active_idx_ = static_cast<int>(datasets_.size()) - 1;
 
@@ -2492,7 +2665,7 @@ void MainWindow::onOpenNpyTraces() {
     tab_bar_->setCurrentIndex(active_idx_);
 
     rebuildTransformList();
-    plot_widget_->setTransforms(activeDs().pipeline);
+    plotWidget()->setTransforms(activeDs().pipeline);
 
     int n = activeDs().file->header().num_traces;
     spin_first_->setMaximum(std::max(0, n - 1));
@@ -2502,13 +2675,14 @@ void MainWindow::onOpenNpyTraces() {
 
     updateFileInfo();
     onApplyTraces();
+    updateViewLayout();
 }
 
 // ---------------------------------------------------------------------------
 // Export traces → 2-D NPY (n_traces × n_samples, pipeline applied)
 // ---------------------------------------------------------------------------
 void MainWindow::onExportNpy() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "Export NPY", "No file loaded."); return;
     }
     const TrsHeader& h = activeDs().file->header();
@@ -2587,7 +2761,7 @@ void MainWindow::onExportNpy() {
 // Export traces → NPZ (traces.npy + data.npy if TRS has data bytes)
 // ---------------------------------------------------------------------------
 void MainWindow::onExportNpz() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "Export NPZ", "No file loaded."); return;
     }
     const TrsHeader& h = activeDs().file->header();
@@ -2677,7 +2851,7 @@ void MainWindow::onExportNpz() {
 }
 
 void MainWindow::onRunTTest() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "T-test", "No file loaded.");
         return;
     }
@@ -2915,22 +3089,18 @@ void MainWindow::onRunTTest() {
 
     int64_t n0 = acc.countGroup(0), n1 = acc.countGroup(1);
 
-    // --- Result window ---
+    // --- Result tab ---
     auto tstat_ptr  = std::make_shared<std::vector<float>>(std::move(tstat));
     auto current_ptr = std::make_shared<std::vector<float>>(*tstat_ptr);
     auto df_orig    = std::make_shared<std::vector<double>>();
     acc_ptr->computeWelchDf(*df_orig);
     auto current_df = std::make_shared<std::vector<double>>(*df_orig);
 
-    auto* dlg = new QDialog(this);
-    dlg->setAttribute(Qt::WA_DeleteOnClose);
-    dlg->setWindowTitle(QString("Welch t-test — %1 traces (G0:%2  G1:%3)")
-                            .arg(eff_count).arg(n0).arg(n1));
-    dlg->resize(1100, 520);
-
-    auto* pw = new PlotWidget(dlg);
+    QString tab_title = QString("Welch t-test — %1 traces (G0:%2  G1:%3)")
+                            .arg(eff_count).arg(n0).arg(n1);
+    addResultTab(*current_ptr, tab_title, QColor("#1f77b4"), "t-value");
+    PlotWidget* pw = plotWidget();
     pw->setTheme(PlotTheme::light());
-    pw->addTrace(current_ptr, QColor("#1f77b4"), "t-value");
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", "t-value");
     pw->setThresholds(true, 4.5, -4.5);
@@ -2951,7 +3121,7 @@ void MainWindow::onRunTTest() {
 
     auto* chk_onesided = new QCheckBox("One-sided (+)");
     chk_onesided->setToolTip("Show only the positive threshold (use when signal is preprocessed with abs())");
-    connect(chk_onesided, &QCheckBox::toggled, dlg, [pw, lbl_thr](bool on) {
+    connect(chk_onesided, &QCheckBox::toggled, pw, [pw, lbl_thr](bool on) {
         pw->setThresholdOneSided(on);
         lbl_thr->setText(on ? "Threshold +:" : "Threshold ±:");
     });
@@ -2962,13 +3132,13 @@ void MainWindow::onRunTTest() {
     connect(spin_thr, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
             [pw](double v) { pw->setThresholds(true, v, -v); });
 
-    connect(btn_exp_trs, &QPushButton::clicked, dlg, [dlg, current_ptr]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as TRS",
+    connect(btn_exp_trs, &QPushButton::clicked, pw, [this, current_ptr]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export t-test as TRS",
                                                     MainWindow::recentDir("trs"), "TRS files (*.trs)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("trs", path);
         FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
-        if (!fp) { QMessageBox::critical(dlg, "Export failed", "Cannot create file."); return; }
+        if (!fp) { QMessageBox::critical(this, "Export failed", "Cannot create file."); return; }
         int32_t ns = static_cast<int32_t>(current_ptr->size());
         auto wle32 = [&](int32_t v) {
             uint8_t b[4] = {uint8_t(v),uint8_t(v>>8),uint8_t(v>>16),uint8_t(v>>24)};
@@ -2981,11 +3151,11 @@ void MainWindow::onRunTTest() {
         std::fputc(0x5F, fp); std::fputc(0x00, fp);
         std::fwrite(current_ptr->data(), sizeof(float), static_cast<size_t>(ns), fp);
         std::fclose(fp);
-        QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+        QMessageBox::information(this, "Export complete", "Saved: " + path);
     });
 
-    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, current_ptr, current_df]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as NumPy",
+    connect(btn_exp_npy, &QPushButton::clicked, pw, [this, current_ptr, current_df]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export t-test as NumPy",
                                                     MainWindow::recentDir("npy"), "NumPy archive (*.npz)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("npy", path);
@@ -2998,14 +3168,14 @@ void MainWindow::onRunTTest() {
                                                       sizeof(double))});
         QString err;
         if (!saveNpz(path, entries, err))
-            QMessageBox::critical(dlg, "Export failed", err);
+            QMessageBox::critical(this, "Export failed", err);
         else
-            QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+            QMessageBox::information(this, "Export complete", "Saved: " + path);
     });
 
     auto* btn_calc_th = new QPushButton("Calc TH…");
-    connect(btn_calc_th, &QPushButton::clicked, dlg, [=]() {
-        auto* cd = new QDialog(dlg);
+    connect(btn_calc_th, &QPushButton::clicked, pw, [=]() {
+        auto* cd = new QDialog(pw);
         cd->setWindowTitle("Threshold Calculator");
         cd->setWindowModality(Qt::WindowModal);
         auto* fl = new QFormLayout(cd);
@@ -3067,8 +3237,8 @@ void MainWindow::onRunTTest() {
 
     // Style dialog button
     auto* btn_style = new QPushButton("Style…");
-    connect(btn_style, &QPushButton::clicked, dlg, [=]() {
-        auto* sd = new QDialog(dlg);
+    connect(btn_style, &QPushButton::clicked, pw, [=]() {
+        auto* sd = new QDialog(pw);
         sd->setWindowTitle("Plot Style");
         sd->setWindowModality(Qt::NonModal);
         auto* fl2 = new QFormLayout(sd);
@@ -3111,8 +3281,8 @@ void MainWindow::onRunTTest() {
 
     // PDF / PNG export buttons
     auto* btn_exp_pdf = new QPushButton("Export PDF…");
-    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PDF", MainWindow::recentDir("export"), "PDF files (*.pdf)");
+    connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export t-test as PDF", MainWindow::recentDir("export"), "PDF files (*.pdf)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("export", path);
         QPdfWriter writer(path);
@@ -3126,21 +3296,21 @@ void MainWindow::onRunTTest() {
         painter.scale(sc, sc);
         pw->render(&painter);
         painter.end();
-        QMessageBox::information(dlg, "Exported", "Saved: " + path);
+        QMessageBox::information(this, "Exported", "Saved: " + path);
     });
     auto* btn_exp_png = new QPushButton("Export PNG…");
-    connect(btn_exp_png, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PNG", MainWindow::recentDir("export"), "PNG images (*.png)");
+    connect(btn_exp_png, &QPushButton::clicked, pw, [=]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export t-test as PNG", MainWindow::recentDir("export"), "PNG images (*.png)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("export", path);
         QPixmap pix = pw->grab();
         if (!pix.save(path, "PNG"))
-            QMessageBox::warning(dlg, "Export PNG", "Could not save:\n" + path);
+            QMessageBox::warning(this, "Export PNG", "Could not save:\n" + path);
         else
-            QMessageBox::information(dlg, "Exported", "Saved: " + path);
+            QMessageBox::information(this, "Exported", "Saved: " + path);
     });
 
-    auto* ctrl = new QWidget(dlg);
+    auto* ctrl = new QWidget;
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
     ctrl_l->setSpacing(6);
@@ -3160,19 +3330,19 @@ void MainWindow::onRunTTest() {
     btn_bz_tt->setToolTip("Drag to rubber-band zoom");
     btn_crop_tt->setToolTip("Drag to select a region to cut (exclude from export)");
     btn_rst_tt->setToolTip("Reset view");
-    auto* mg_tt = new QButtonGroup(dlg);
+    auto* mg_tt = new QButtonGroup(pw);
     mg_tt->addButton(btn_pan_tt,  0);
     mg_tt->addButton(btn_meas_tt, 1);
     mg_tt->addButton(btn_bz_tt,   2);
     mg_tt->addButton(btn_crop_tt, 3);
-    connect(mg_tt, QOverload<int>::of(&QButtonGroup::idClicked), dlg, [pw](int id) {
+    connect(mg_tt, QOverload<int>::of(&QButtonGroup::idClicked), pw, [pw](int id) {
         InteractionMode m = id == 0 ? InteractionMode::Pan
                           : id == 1 ? InteractionMode::Measure
                           : id == 2 ? InteractionMode::BoxZoom
                                     : InteractionMode::CropSelect;
         pw->setMode(m);
     });
-    connect(btn_rst_tt, &QPushButton::clicked, dlg, [pw]() { pw->resetView(); });
+    connect(btn_rst_tt, &QPushButton::clicked, pw, [pw]() { pw->resetView(); });
 
     ctrl_l->addWidget(btn_pan_tt);
     ctrl_l->addWidget(btn_meas_tt);
@@ -3186,8 +3356,8 @@ void MainWindow::onRunTTest() {
     auto* btn_yzo = new QPushButton("↓ Amp");
     btn_yzi->setToolTip("Zoom in Y (Ctrl/Shift+scroll up)");
     btn_yzo->setToolTip("Zoom out Y / shorter traces (Ctrl/Shift+scroll down)");
-    connect(btn_yzi, &QPushButton::clicked, dlg, [pw](){ pw->zoomInY(); });
-    connect(btn_yzo, &QPushButton::clicked, dlg, [pw](){ pw->zoomOutY(); });
+    connect(btn_yzi, &QPushButton::clicked, pw, [pw](){ pw->zoomInY(); });
+    connect(btn_yzo, &QPushButton::clicked, pw, [pw](){ pw->zoomOutY(); });
 
     ctrl_l->addWidget(lbl_thr);
     ctrl_l->addWidget(spin_thr);
@@ -3206,7 +3376,7 @@ void MainWindow::onRunTTest() {
 
     // Trim row
     int64_t n_full_tt = static_cast<int64_t>(tstat_ptr->size());
-    auto* trim_row = new QWidget(dlg);
+    auto* trim_row = new QWidget;
     auto* trim_l   = new QHBoxLayout(trim_row);
     trim_l->setContentsMargins(4, 0, 4, 0);
     auto* sp_excl_start = new QSpinBox; sp_excl_start->setRange(0, static_cast<int>(n_full_tt / 2));
@@ -3231,7 +3401,7 @@ void MainWindow::onRunTTest() {
         pw->replaceMemTrace(0, current_ptr);
         upd_lbl_tt();
     };
-    connect(pw, &PlotWidget::cropRangesChanged, dlg, [=]() {
+    connect(pw, &PlotWidget::cropRangesChanged, pw, [=]() {
         if (*skip_tt) return;
         const auto& cr = pw->cropRanges();
         if (cr.empty()) return;
@@ -3252,8 +3422,8 @@ void MainWindow::onRunTTest() {
         pw->replaceMemTrace(0, current_ptr);
         upd_lbl_tt();
     });
-    connect(sp_excl_start, QOverload<int>::of(&QSpinBox::valueChanged), dlg, [=](int){ do_trim_tt(); });
-    connect(sp_excl_end,   QOverload<int>::of(&QSpinBox::valueChanged), dlg, [=](int){ do_trim_tt(); });
+    connect(sp_excl_start, QOverload<int>::of(&QSpinBox::valueChanged), pw, [=](int){ do_trim_tt(); });
+    connect(sp_excl_end,   QOverload<int>::of(&QSpinBox::valueChanged), pw, [=](int){ do_trim_tt(); });
     upd_lbl_tt();
 
     trim_l->addWidget(new QLabel("Exclude:"));
@@ -3265,14 +3435,14 @@ void MainWindow::onRunTTest() {
     trim_l->addWidget(lbl_vis_tt);
     trim_l->addStretch();
 
-    auto* vl = new QVBoxLayout(dlg);
-    vl->setContentsMargins(4, 4, 4, 4);
-    vl->setSpacing(4);
-    vl->addWidget(ctrl);
-    vl->addWidget(trim_row);
-    vl->addWidget(pw, 1);
-
-    dlg->show();
+    auto* extra = new QWidget;
+    auto* extra_l = new QVBoxLayout(extra);
+    extra_l->setContentsMargins(0, 0, 0, 0);
+    extra_l->setSpacing(4);
+    extra_l->addWidget(ctrl);
+    extra_l->addWidget(trim_row);
+    activeDs().extra_toolbar = extra;
+    updateViewLayout();
 }
 
 // ---------------------------------------------------------------------------
@@ -3280,13 +3450,13 @@ void MainWindow::onRunTTest() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onCropEdit() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "Crop & Merge", "No file loaded.");
         return;
     }
 
     // Restore Pan mode when dialog is closed
-    InteractionMode prev_mode = plot_widget_->mode();
+    InteractionMode prev_mode = plotWidget()->mode();
 
     auto* dlg = new QDialog(this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -3335,7 +3505,7 @@ void MainWindow::onCropEdit() {
     // ---- helpers ----
     auto rebuildList = [=]() {
         list->clear();
-        const auto& ranges = plot_widget_->cropRanges();
+        const auto& ranges = plotWidget()->cropRanges();
         int64_t total = 0;
         for (int i = 0; i < static_cast<int>(ranges.size()); i++) {
             int64_t len = ranges[i].second - ranges[i].first;
@@ -3355,35 +3525,35 @@ void MainWindow::onCropEdit() {
     rebuildList();
 
     // ---- connections ----
-    connect(plot_widget_, &PlotWidget::cropRangesChanged, dlg, rebuildList);
+    connect(plotWidget(), &PlotWidget::cropRangesChanged, dlg, rebuildList);
 
     connect(btn_drag, &QPushButton::toggled, dlg, [this](bool on) {
-        plot_widget_->setMode(on ? InteractionMode::CropSelect : InteractionMode::Pan);
+        plotWidget()->setMode(on ? InteractionMode::CropSelect : InteractionMode::Pan);
     });
 
     connect(btn_add_view, &QPushButton::clicked, dlg, [this]() {
-        plot_widget_->addCropRange(plot_widget_->viewStart(), plot_widget_->viewEnd());
+        plotWidget()->addCropRange(plotWidget()->viewStart(), plotWidget()->viewEnd());
     });
 
     connect(btn_remove, &QPushButton::clicked, dlg, [=]() {
         int row = list->currentRow();
-        if (row >= 0) plot_widget_->removeCropRangeAt(row);
+        if (row >= 0) plotWidget()->removeCropRangeAt(row);
     });
 
     connect(btn_clear, &QPushButton::clicked, dlg, [this]() {
-        plot_widget_->clearCropRanges();
+        plotWidget()->clearCropRanges();
     });
 
     connect(btn_close, &QPushButton::clicked, dlg, &QDialog::close);
 
     connect(dlg, &QDialog::finished, this, [this, prev_mode]() {
         // Restore previous interaction mode and clear any pending rubber-band
-        plot_widget_->setMode(prev_mode);
+        plotWidget()->setMode(prev_mode);
     });
 
     // ---- export ----
     connect(btn_export, &QPushButton::clicked, dlg, [this, dlg]() {
-        const auto& ranges = plot_widget_->cropRanges();
+        const auto& ranges = plotWidget()->cropRanges();
         if (ranges.empty()) return;
 
         // Compute total samples per output trace
@@ -3492,7 +3662,7 @@ void MainWindow::onCropEdit() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onRunXCorr() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "Cross-Correlation", "No file loaded.");
         return;
     }
@@ -4026,12 +4196,52 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
         return std::make_shared<MovingAverageTransform>(w);
     }
     case 3: {
-        bool ok;
-        int w = QInputDialog::getInt(this, "Window Resample",
-                                     "Window size (samples per output point):",
-                                     64, 2, 1'000'000, 1, &ok);
-        if (!ok) return nullptr;
-        return std::make_shared<WindowResampleTransform>(w);
+        QDialog d(this);
+        d.setWindowTitle("Window Resample — parameters");
+        auto* fl = new QFormLayout(&d);
+
+        auto* sp_win = new QSpinBox; sp_win->setRange(2, 1'000'000); sp_win->setValue(64);
+        sp_win->setToolTip("Samples averaged into each output point.");
+        auto* sp_overlap = new QDoubleSpinBox;
+        sp_overlap->setRange(0.0, 0.99);
+        sp_overlap->setSingleStep(0.05);
+        sp_overlap->setDecimals(2);
+        sp_overlap->setValue(0.0);
+        sp_overlap->setToolTip("Fraction of each window reused by the next one (0 = "
+                               "non-overlapping blocks, closer to 1 = windows slide by "
+                               "just a few samples at a time).");
+
+        fl->addRow("Window size (samples):", sp_win);
+        fl->addRow("Overlap (0-1):",          sp_overlap);
+
+        // Show approximate output size as the user adjusts parameters.
+        auto* lbl_out = new QLabel;
+        fl->addRow("Output samples/trace:", lbl_out);
+        int n_samples = activeDs().file ? activeDs().file->header().num_samples : 0;
+        auto updateOut = [&]() {
+            int W = sp_win->value();
+            int hop = std::max(1, static_cast<int>(
+                std::llround(W * (1.0 - sp_overlap->value()))));
+            if (n_samples >= W) {
+                int64_t nw = (n_samples - W) / hop + 1;
+                lbl_out->setText(QString("%1  (hop = %2 samples)").arg(nw).arg(hop));
+            } else {
+                lbl_out->setText("Window larger than trace — no output");
+            }
+        };
+        updateOut();
+        connect(sp_win, QOverload<int>::of(&QSpinBox::valueChanged), [&](int){ updateOut(); });
+        connect(sp_overlap, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                [&](double){ updateOut(); });
+
+        auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        fl->addRow(bb);
+        connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+        connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+        if (d.exec() != QDialog::Accepted) return nullptr;
+
+        return std::make_shared<WindowResampleTransform>(
+            sp_win->value(), static_cast<float>(sp_overlap->value()));
     }
     case 4: {
         bool ok;
@@ -4077,34 +4287,45 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
 
         auto* sp_win = new QSpinBox; sp_win->setRange(4, 1<<20); sp_win->setValue(256);
         sp_win->setToolTip("Samples per FFT window. Powers of 2 are fastest.");
-        auto* sp_hop = new QSpinBox; sp_hop->setRange(1, 1<<20); sp_hop->setValue(128);
-        sp_hop->setToolTip("Samples between consecutive windows (overlap = window − hop).");
+        auto* sp_overlap = new QDoubleSpinBox;
+        sp_overlap->setRange(0.0, 0.99);
+        sp_overlap->setSingleStep(0.05);
+        sp_overlap->setDecimals(2);
+        sp_overlap->setValue(0.5);
+        sp_overlap->setToolTip("Fraction of each window reused by the next one "
+                               "(hop = window × (1 - overlap)).");
         auto* cmb = new QComboBox;
         cmb->addItems({ "Rectangular", "Hann", "Hamming", "Blackman" });
         cmb->setCurrentIndex(1);
 
         fl->addRow("Window size (samples):", sp_win);
-        fl->addRow("Hop size (samples):",    sp_hop);
+        fl->addRow("Overlap (0-1):",          sp_overlap);
         fl->addRow("Window function:",       cmb);
 
-        // Show approximate output size as the user adjusts parameters.
+        // Show the derived hop size and approximate output size as the user
+        // adjusts parameters.
         auto* lbl_out = new QLabel;
         fl->addRow("Output bins/trace:", lbl_out);
         int n_samples = activeDs().file ? activeDs().file->header().num_samples : 0;
+        auto hopFromOverlap = [&]() {
+            int W = sp_win->value();
+            return std::max(1, static_cast<int>(std::llround(W * (1.0 - sp_overlap->value()))));
+        };
         auto updateOut = [&]() {
-            int W = sp_win->value(), H = sp_hop->value();
+            int W = sp_win->value(), H = hopFromOverlap();
             if (n_samples >= W) {
                 int64_t nw = (n_samples - W) / H + 1;
                 int64_t nb = W / 2 + 1;
-                lbl_out->setText(QString("%1 windows × %2 bins = %3 total")
-                                     .arg(nw).arg(nb).arg(nw * nb));
+                lbl_out->setText(QString("%1 windows × %2 bins = %3 total  (hop = %4 samples)")
+                                     .arg(nw).arg(nb).arg(nw * nb).arg(H));
             } else {
                 lbl_out->setText("Window larger than trace — no output");
             }
         };
         updateOut();
         connect(sp_win, QOverload<int>::of(&QSpinBox::valueChanged), [&](int){ updateOut(); });
-        connect(sp_hop, QOverload<int>::of(&QSpinBox::valueChanged), [&](int){ updateOut(); });
+        connect(sp_overlap, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                [&](double){ updateOut(); });
 
         auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
         fl->addRow(bb);
@@ -4120,7 +4341,7 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
             case 3: win = W2::Blackman;    break;
             default: break;
         }
-        return std::make_shared<STFTMagnitudeTransform>(sp_win->value(), sp_hop->value(), win);
+        return std::make_shared<STFTMagnitudeTransform>(sp_win->value(), hopFromOverlap(), win);
     }
     case 9: {
         bool ok;
@@ -4140,7 +4361,7 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
 // ---------------------------------------------------------------------------
 void MainWindow::onAlignTraces()
 {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "Align Traces", "No file loaded.");
         return;
     }
@@ -4169,8 +4390,8 @@ void MainWindow::onAlignTraces()
     sp_ref_len->setValue(std::min(200, h.num_samples));
 
     // Seed from first crop range if one exists
-    if (!plot_widget_->cropRanges().empty()) {
-        auto [cs, ce] = plot_widget_->cropRanges()[0];
+    if (!plotWidget()->cropRanges().empty()) {
+        auto [cs, ce] = plotWidget()->cropRanges()[0];
         sp_ref_first->setValue(static_cast<int>(cs));
         sp_ref_len->setValue(static_cast<int>(std::max<int64_t>(2, ce - cs)));
     }
@@ -4182,8 +4403,8 @@ void MainWindow::onAlignTraces()
                          "Drag to mark the reference region, then come back here.");
 
     connect(btn_draw, &QPushButton::clicked, dlg, [=]() {
-        plot_widget_->clearCropRanges();
-        plot_widget_->setMode(InteractionMode::CropSelect);
+        plotWidget()->clearCropRanges();
+        plotWidget()->setMode(InteractionMode::CropSelect);
         btn_draw->setText("Drawing… (drag on plot)");
         btn_draw->setEnabled(false);
     });
@@ -4191,22 +4412,22 @@ void MainWindow::onAlignTraces()
     // A QObject parented to dlg so the connection is torn down when the dialog
     // closes, even if the user never finishes drawing.
     auto* crop_guard = new QObject(dlg);
-    connect(plot_widget_, &PlotWidget::cropRangesChanged, crop_guard, [=]() {
-        const auto& ranges = plot_widget_->cropRanges();
+    connect(plotWidget(), &PlotWidget::cropRangesChanged, crop_guard, [=]() {
+        const auto& ranges = plotWidget()->cropRanges();
         if (ranges.empty()) return;
         auto [s, e] = ranges.back();
         sp_ref_first->setValue(static_cast<int>(s));
         sp_ref_len->setValue(static_cast<int>(std::max<int64_t>(2, e - s)));
         // Restore normal mode and re-enable button
-        plot_widget_->setMode(InteractionMode::Pan);
+        plotWidget()->setMode(InteractionMode::Pan);
         btn_draw->setText("Draw on plot →");
         btn_draw->setEnabled(true);
     });
 
     // Restore Pan mode if the dialog is closed mid-draw
     connect(dlg, &QDialog::finished, dlg, [=](int) {
-        if (plot_widget_->mode() == InteractionMode::CropSelect)
-            plot_widget_->setMode(InteractionMode::Pan);
+        if (plotWidget()->mode() == InteractionMode::CropSelect)
+            plotWidget()->setMode(InteractionMode::Pan);
     });
 
     auto* region_row = new QWidget;
@@ -4480,13 +4701,43 @@ void MainWindow::onAlignTraces()
             out_len   = h.num_samples;
         }
 
+        // Effective sample count after the processing pipeline — an
+        // expanding stage (e.g. STFT) needs a larger buffer than out_len.
+        int64_t effective_len = out_len;
+        for (const auto& t : activeDs().pipeline)
+            effective_len = t->transformedCount(effective_len);
+
+        // Memory estimate: an expanding pipeline stage (e.g. STFT) combined
+        // with "Full trace" mode (out_len = the entire raw trace) can need
+        // far more memory than the raw file itself, especially for "Show in
+        // New Window" which — unlike "Apply to Main View" — has no cap on
+        // how many traces it builds. Warn before allocating instead of
+        // crashing partway through.
+        {
+            int64_t n_kept = 0;
+            for (int i = 0; i < num_tr; i++)
+                if (shifts[static_cast<size_t>(i)] != kAlignDiscardShift) n_kept++;
+            int64_t n_to_build = std::min<int64_t>(n_kept, max_display);
+            int64_t bytes_per_trace = std::max(out_len, effective_len)
+                                     * static_cast<int64_t>(sizeof(float));
+            int64_t total_bytes = bytes_per_trace * n_to_build;
+            if (total_bytes > 2LL * 1024 * 1024 * 1024) {
+                if (QMessageBox::warning(dlg, "Memory warning",
+                        QString("Building %1 aligned trace(s) will require ~%2 GB.\nContinue?")
+                            .arg(n_to_build)
+                            .arg(double(total_bytes) / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1),
+                        QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+                    return false;
+            }
+        }
+
         int shown = 0;
         for (int i = 0; i < num_tr && shown < max_display; i++) {
             int64_t shift = static_cast<int64_t>(shifts[static_cast<size_t>(i)]);
             if (shift == kAlignDiscardShift) continue;   // below correlation threshold
 
             auto data = std::make_shared<std::vector<float>>(
-                static_cast<size_t>(out_len), 0.0f);
+                static_cast<size_t>(std::max(out_len, effective_len)), 0.0f);
 
             int64_t raw_start = out_start + shift;
             int64_t raw_end   = raw_start + out_len;
@@ -4512,9 +4763,19 @@ void MainWindow::onAlignTraces()
                     int64_t tail_off = dst_off + valid;
                     if (tail_off < out_len)
                         std::fill(data->begin() + static_cast<size_t>(tail_off),
-                                  data->end(), avg);
+                                  data->begin() + static_cast<size_t>(out_len), avg);
                 }
             }
+
+            // Apply the processing pipeline so the displayed/baked trace is
+            // the aligned *result of the pipeline* — the same processed
+            // signal the alignment search itself matched against, not the
+            // raw trace.
+            for (const auto& t : activeDs().pipeline) t->reset();
+            int64_t n_out = out_len;
+            for (const auto& t : activeDs().pipeline)
+                n_out = t->apply(data->data(), n_out, 0);
+            data->resize(static_cast<size_t>(std::max<int64_t>(0, n_out)));
 
             pw->addTrace(std::move(data),
                          TRACE_COLORS[shown % NUM_COLORS],
@@ -4580,10 +4841,14 @@ void MainWindow::onAlignTraces()
         // Show only NUM_COLORS representative traces in the main plot.
         // These are in-memory baked-in traces — mark as not file-backed so
         // drag-align on them won't overwrite the stored alignment state.
-        plot_widget_->clearTraces();
-        if (!buildAligned(plot_widget_, NUM_COLORS)) return;
-        plot_widget_->setTransforms({});
-        plot_widget_->resetView();
+        // buildAligned() already applied activeDs().pipeline to produce
+        // them, so the plot's own live transforms must stay empty here —
+        // otherwise the pipeline would be applied a second time on top of
+        // the already-processed result.
+        plotWidget()->clearTraces();
+        if (!buildAligned(plotWidget(), NUM_COLORS)) return;
+        plotWidget()->setTransforms({});
+        plotWidget()->resetView();
         activeDs().plot_file_backed = false;
         dlg->accept();
     });
@@ -4596,7 +4861,7 @@ void MainWindow::onAlignTraces()
 // CPA / DPA
 // ---------------------------------------------------------------------------
 void MainWindow::onRunCpa() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "CPA", "No file loaded.");
         return;
     }
@@ -4980,7 +5245,7 @@ void MainWindow::onRunCpa() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onRunSNR() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "SNR", "No file loaded.");
         return;
     }
@@ -5151,45 +5416,41 @@ void MainWindow::onRunSNR() {
         return;
     }
 
-    // --- Result window ---
+    // --- Result tab ---
     auto snr_ptr = std::make_shared<std::vector<float>>(std::move(snr));
 
-    auto* dlg = new QDialog(this);
-    dlg->setAttribute(Qt::WA_DeleteOnClose);
     QString mode_str;
     if      (mode == 0) mode_str = "raw byte";
     else if (mode == 1) mode_str = "HW(byte)";
     else if (mode == 2) mode_str = QString("SBox(byte⊕0x%1)").arg(key_byte, 2, 16, QChar('0'));
     else                mode_str = QString("HW(SBox(byte⊕0x%1))").arg(key_byte, 2, 16, QChar('0'));
-    dlg->setWindowTitle(QString("SNR — %1 traces, %2 (%3 classes)")
+    QString tab_title = QString("SNR — %1 traces, %2 (%3 classes)")
                             .arg(acc.totalTraces())
                             .arg(mode_str)
-                            .arg(n_classes));
-    dlg->resize(1100, 520);
-
-    auto* pw = new PlotWidget(dlg);
-    pw->addTrace(snr_ptr, QColor("#f4a63a"), "SNR");
+                            .arg(n_classes);
+    addResultTab(*snr_ptr, tab_title, QColor("#f4a63a"), "SNR");
+    PlotWidget* pw = plotWidget();
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", "SNR");
     pw->setThresholds(false, 0.0, 0.0);
     pw->resetView();
 
     auto* btn_exp_npy = new QPushButton("Export .npy…");
-    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, snr_ptr]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export SNR as NumPy",
+    connect(btn_exp_npy, &QPushButton::clicked, pw, [this, snr_ptr]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export SNR as NumPy",
                                                     MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("npy", path);
         QString e;
         if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
-            QMessageBox::critical(dlg, "Export failed", e);
+            QMessageBox::critical(this, "Export failed", e);
         else
-            QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+            QMessageBox::information(this, "Export complete", "Saved: " + path);
     });
 
     auto* btn_exp_pdf = new QPushButton("Export PDF…");
-    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export SNR as PDF",
+    connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export SNR as PDF",
                                                     MainWindow::recentDir("export"), "PDF files (*.pdf)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("export", path);
@@ -5204,16 +5465,15 @@ void MainWindow::onRunSNR() {
             painter.drawPixmap(painter.viewport(), px);
     });
 
-    auto* hl = new QHBoxLayout;
+    auto* extra = new QWidget;
+    auto* hl = new QHBoxLayout(extra);
+    hl->setContentsMargins(4, 2, 4, 2);
     hl->addWidget(btn_exp_npy);
     hl->addWidget(btn_exp_pdf);
     hl->addStretch();
 
-    auto* vl = new QVBoxLayout(dlg);
-    vl->addWidget(pw, 1);
-    vl->addLayout(hl);
-
-    dlg->show();
+    activeDs().extra_toolbar = extra;
+    updateViewLayout();
 }
 
 // ---------------------------------------------------------------------------
@@ -5222,7 +5482,7 @@ void MainWindow::onRunSNR() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onRunStaticSNR() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "Static SNR", "No file loaded.");
         return;
     }
@@ -5328,13 +5588,9 @@ void MainWindow::onRunStaticSNR() {
 
     auto snr_ptr = std::make_shared<std::vector<float>>(std::move(snr));
 
-    auto* dlg = new QDialog(this);
-    dlg->setAttribute(Qt::WA_DeleteOnClose);
-    dlg->setWindowTitle(QString("Static SNR |μ/σ| — %1 traces").arg(N));
-    dlg->resize(1100, 520);
-
-    auto* pw = new PlotWidget(dlg);
-    pw->addTrace(snr_ptr, QColor("#4fc3f7"), "|μ/σ|");
+    QString tab_title = QString("Static SNR |μ/σ| — %1 traces").arg(N);
+    addResultTab(*snr_ptr, tab_title, QColor("#4fc3f7"), "|μ/σ|");
+    PlotWidget* pw = plotWidget();
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", "|μ/σ|");
     pw->setThresholds(false, 0.0, 0.0);
@@ -5348,21 +5604,21 @@ void MainWindow::onRunStaticSNR() {
     lbl_stats->setTextFormat(Qt::RichText);
 
     auto* btn_exp_npy = new QPushButton("Export .npy…");
-    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, snr_ptr]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export static SNR as NumPy",
+    connect(btn_exp_npy, &QPushButton::clicked, pw, [this, snr_ptr]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export static SNR as NumPy",
                                                     MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("npy", path);
         QString e;
         if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
-            QMessageBox::critical(dlg, "Export failed", e);
+            QMessageBox::critical(this, "Export failed", e);
         else
-            QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+            QMessageBox::information(this, "Export complete", "Saved: " + path);
     });
 
     auto* btn_exp_pdf = new QPushButton("Export PDF…");
-    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export static SNR as PDF",
+    connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export static SNR as PDF",
                                                     MainWindow::recentDir("export"), "PDF files (*.pdf)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("export", path);
@@ -5377,17 +5633,16 @@ void MainWindow::onRunStaticSNR() {
             painter.drawPixmap(painter.viewport(), px);
     });
 
-    auto* hl = new QHBoxLayout;
+    auto* extra = new QWidget;
+    auto* hl = new QHBoxLayout(extra);
+    hl->setContentsMargins(4, 2, 4, 2);
     hl->addWidget(lbl_stats);
     hl->addStretch();
     hl->addWidget(btn_exp_npy);
     hl->addWidget(btn_exp_pdf);
 
-    auto* vl = new QVBoxLayout(dlg);
-    vl->addWidget(pw, 1);
-    vl->addLayout(hl);
-
-    dlg->show();
+    activeDs().extra_toolbar = extra;
+    updateViewLayout();
 }
 
 // ---------------------------------------------------------------------------
@@ -5395,7 +5650,7 @@ void MainWindow::onRunStaticSNR() {
 // ---------------------------------------------------------------------------
 
 void MainWindow::onRunFFT() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "FFT", "No file loaded.");
         return;
     }
@@ -5868,7 +6123,7 @@ static bool runAddLabelDialog(QWidget* parent, int max_byte, LabelDef& def)
 }
 
 void MainWindow::onExportDataset() {
-    if (!hasActiveDs()) {
+    if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "Export Dataset", "No file loaded.");
         return;
     }
