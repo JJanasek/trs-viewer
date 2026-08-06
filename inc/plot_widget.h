@@ -85,6 +85,11 @@ struct TraceEntry {
     bool      visible   = true;
     bool      filled    = false;  // render as filled min/max band (zoomed-out mode)
     int32_t   shift     = 0;      // sample shift applied during read (AlignDrag)
+    // If true, this trace never gets the widget's shared pipeline (see
+    // setTransforms()) — for pre-computed derived results (t-test/SNR
+    // curves, etc.) added alongside raw traces, which must never be
+    // reprocessed by a pipeline meant for raw samples.
+    bool      no_pipeline = false;
     std::shared_ptr<std::vector<float>> mem_data; // non-null for in-memory traces
     std::vector<std::shared_ptr<ITransform>> transforms;
     TraceCache cache;
@@ -100,8 +105,11 @@ public:
 
     void addTrace(TrsFile* file, int32_t trace_idx,
                   QColor color, const QString& label = {});
+    // no_pipeline=true excludes this trace from the shared pipeline set via
+    // setTransforms() — for pre-computed derived results (e.g. a t-test/SNR
+    // curve) added alongside raw, pipeline-processed traces.
     void addTrace(std::shared_ptr<std::vector<float>> data,
-                  QColor color, const QString& label = {});
+                  QColor color, const QString& label = {}, bool no_pipeline = false);
     void clearTraces();
     void setTransforms(const std::vector<std::shared_ptr<ITransform>>& tx);
 
@@ -119,6 +127,9 @@ public:
     void zoomOutY();        // expand y range → shorter traces
     void resetYZoom();
     float yScale() const { return y_scale_; }
+    // Directly set the Y-zoom multiplier (clamped like zoomInY/zoomOutY).
+    // Used to restore amplitude zoom after a trace-list reload.
+    void setYScale(float s);
     void setThresholds(bool show, double pos = 4.5, double neg = -4.5);
     // When one_sided=true only the positive threshold line is drawn (use after abs() preprocessing).
     void setThresholdOneSided(bool one_sided);

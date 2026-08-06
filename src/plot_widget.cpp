@@ -183,7 +183,15 @@ void PlotWidget::setViewRange(int64_t start, int64_t end) {
     if (end <= start || total_samples_ <= 0) return;
     view_start_ = std::clamp(start, INT64_C(0), total_samples_);
     view_end_   = std::clamp(end,   INT64_C(0), total_samples_);
-    if (view_end_ <= view_start_) view_end_ = std::min(view_start_ + 1, total_samples_);
+    if (view_end_ <= view_start_) {
+        // The requested range clamped down to a single point — it was
+        // entirely outside [0, total_samples_), which happens when
+        // restoring a saved view after the underlying data got shorter
+        // (e.g. reloading a smaller trace range). Fall back to a minimal
+        // valid window anchored at that point instead of an empty [x, x).
+        view_end_   = std::min(view_start_ + 1, total_samples_);
+        view_start_ = std::max(INT64_C(0), view_end_ - 1);
+    }
     emit viewChanged(view_start_, view_end_, total_samples_);
     update();
 }
@@ -370,13 +378,15 @@ void PlotWidget::addTrace(TrsFile* file, int32_t trace_idx,
 }
 
 void PlotWidget::addTrace(std::shared_ptr<std::vector<float>> data,
-                           QColor color, const QString& label)
+                           QColor color, const QString& label, bool no_pipeline)
 {
     TraceEntry te;
-    te.mem_data  = std::move(data);
-    te.color     = color;
-    te.label     = label.isEmpty() ? QString("T-statistic") : label;
-    for (const auto& t : transforms_) te.transforms.push_back(t->clone());
+    te.mem_data    = std::move(data);
+    te.color       = color;
+    te.label       = label.isEmpty() ? QString("T-statistic") : label;
+    te.no_pipeline = no_pipeline;
+    if (!no_pipeline)
+        for (const auto& t : transforms_) te.transforms.push_back(t->clone());
     traces_.push_back(std::move(te));
 
     if (total_samples_ == 0 && !traces_.back().mem_data->empty()) {
@@ -399,6 +409,7 @@ void PlotWidget::clearTraces() {
 void PlotWidget::setTransforms(const std::vector<std::shared_ptr<ITransform>>& tx) {
     transforms_ = tx;
     for (auto& te : traces_) {
+        if (te.no_pipeline) continue;   // pre-computed result — never reprocessed
         te.transforms.clear();
         for (const auto& t : tx) te.transforms.push_back(t->clone());
         te.cache.valid = false;
@@ -455,6 +466,11 @@ void PlotWidget::zoomInY() {
 void PlotWidget::zoomOutY() {
     notifyBeforeViewChange();
     y_scale_ = std::clamp(y_scale_ / 0.75f, 0.05f, 200.0f);
+    update();
+}
+
+void PlotWidget::setYScale(float s) {
+    y_scale_ = std::clamp(s, 0.05f, 200.0f);
     update();
 }
 
@@ -1047,13 +1063,21 @@ void PlotWidget::paintEvent(QPaintEvent*) {
         int     x = pr.left() + pr.width() * i / 6;
         p.drawLine(x, pr.bottom(), x, pr.bottom() + 4);
 
-        double sv = static_cast<double>(s) * x_label_scale_ + x_label_offset_;
+        // Label in the pipeline's own output domain — e.g. after a
+        // decimating stage (Window/Stride Resample) the axis should read in
+        // resampled-sample units, not raw-sample units, even though pixel
+        // position (x, above) stays raw-sample-based so pan/zoom/crop keep
+        // working in raw coordinates.
+        int64_t label_idx = s;
+        for (const auto& t : transforms_) label_idx = t->transformedCount(label_idx);
+
+        double sv = static_cast<double>(label_idx) * x_label_scale_ + x_label_offset_;
         QString lbl;
         if (x_label_scale_ == 1.0 && x_label_offset_ == 0.0) {
-            // Raw sample/bin index — use integer formatting with k/M suffixes.
-            if      (s >= 1'000'000) lbl = QString("%1M").arg(s / 1'000'000.0, 0, 'f', 2);
-            else if (s >= 1'000)     lbl = QString("%1k").arg(s / 1'000.0,     0, 'f', 1);
-            else                     lbl = QString::number(s);
+            // Raw/resampled sample index — use integer formatting with k/M suffixes.
+            if      (label_idx >= 1'000'000) lbl = QString("%1M").arg(label_idx / 1'000'000.0, 0, 'f', 2);
+            else if (label_idx >= 1'000)     lbl = QString("%1k").arg(label_idx / 1'000.0,     0, 'f', 1);
+            else                             lbl = QString::number(label_idx);
         } else {
             // Scaled axis (e.g. Hz) — use SI prefixes.
             double av = std::abs(sv);

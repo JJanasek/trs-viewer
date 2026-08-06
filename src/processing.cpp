@@ -128,26 +128,39 @@ int64_t GaussianNoiseTransform::apply(float* buf, int64_t count, int64_t) {
 }
 
 // ---------------------------------------------------------------------------
-// WindowResampleTransform  (block decimation: floor(N/W) output samples)
+// WindowResampleTransform  (sliding-window mean, hop = window*(1-overlap))
 // ---------------------------------------------------------------------------
-WindowResampleTransform::WindowResampleTransform(int window_size)
+WindowResampleTransform::WindowResampleTransform(int window_size, float overlap)
     : window_size_(std::max(1, window_size))
-{}
+    , overlap_(std::clamp(overlap, 0.0f, 0.999f))
+{
+    reset();
+}
 
 std::string WindowResampleTransform::name() const {
-    char buf[64];
-    std::snprintf(buf, sizeof(buf), "Window Resample (w=%d)", window_size_);
+    char buf[80];
+    std::snprintf(buf, sizeof(buf), "Window Resample (w=%d, overlap=%.2f)",
+                 window_size_, static_cast<double>(overlap_));
     return buf;
 }
 
+int WindowResampleTransform::hopSize() const {
+    int hop = static_cast<int>(std::llround(window_size_ * (1.0 - overlap_)));
+    return std::max(1, hop);
+}
+
 int64_t WindowResampleTransform::transformedCount(int64_t input_count) const {
-    // Number of complete blocks (partial last block is discarded)
-    return input_count / window_size_;
+    if (input_count < window_size_) return 0;
+    return (input_count - window_size_) / hopSize() + 1;
 }
 
 void WindowResampleTransform::reset() {
-    partial_sum_   = 0.0;
-    partial_count_ = 0;
+    ring_.assign(static_cast<size_t>(window_size_), 0.0f);
+    ring_sum_     = 0.0;
+    ring_pos_     = 0;
+    ring_count_   = 0;
+    samples_seen_ = 0;
+    next_emit_at_ = window_size_ - 1;
 }
 
 void WindowResampleTransform::setWindowSize(int w) {
@@ -155,37 +168,32 @@ void WindowResampleTransform::setWindowSize(int w) {
     reset();
 }
 
+void WindowResampleTransform::setOverlap(float o) {
+    overlap_ = std::clamp(o, 0.0f, 0.999f);
+    reset();
+}
+
 int64_t WindowResampleTransform::apply(float* buf, int64_t count, int64_t) {
+    const int64_t hop = hopSize();
     int64_t out = 0;
-    int64_t i   = 0;
 
-    // First: try to complete any partial block carried over from the previous chunk
-    if (partial_count_ > 0) {
-        while (i < count && partial_count_ < window_size_) {
-            partial_sum_ += buf[i++];
-            partial_count_++;
+    for (int64_t i = 0; i < count; i++) {
+        float v = buf[i];
+        if (ring_count_ < window_size_) {
+            ring_sum_ += v;
+            ring_[static_cast<size_t>(ring_pos_)] = v;
+            ring_count_++;
+        } else {
+            ring_sum_ += static_cast<double>(v) - ring_[static_cast<size_t>(ring_pos_)];
+            ring_[static_cast<size_t>(ring_pos_)] = v;
         }
-        if (partial_count_ == window_size_) {
-            buf[out++] = static_cast<float>(partial_sum_ / window_size_);
-            partial_sum_   = 0.0;
-            partial_count_ = 0;
+        ring_pos_ = (ring_pos_ + 1) % window_size_;
+
+        if (samples_seen_ == next_emit_at_) {
+            buf[out++] = static_cast<float>(ring_sum_ / window_size_);
+            next_emit_at_ += hop;
         }
-        // else: still not enough samples to complete a block — keep accumulating
-    }
-
-    // Full blocks from the remaining input
-    while (i + window_size_ <= count) {
-        double sum = 0.0;
-        for (int j = 0; j < window_size_; j++)
-            sum += buf[i + j];
-        buf[out++] = static_cast<float>(sum / window_size_);
-        i += window_size_;
-    }
-
-    // Save any trailing partial block for the next chunk
-    while (i < count) {
-        partial_sum_ += buf[i++];
-        partial_count_++;
+        samples_seen_++;
     }
 
     return out;

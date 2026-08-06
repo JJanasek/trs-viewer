@@ -223,6 +223,86 @@ TEST(WindowResampleTransform, RequiresSequential) {
 }
 
 // ---------------------------------------------------------------------------
+// WindowResampleTransform — overlap
+// ---------------------------------------------------------------------------
+
+TEST(WindowResampleTransform, DefaultOverlapIsZero) {
+    WindowResampleTransform tx(4);
+    EXPECT_FLOAT_EQ(tx.overlap(), 0.0f);
+    EXPECT_EQ(tx.hopSize(), 4);
+}
+
+TEST(WindowResampleTransform, HopSizeReflectsOverlap) {
+    WindowResampleTransform tx(100, 0.5f);
+    EXPECT_EQ(tx.hopSize(), 50);
+    tx.setOverlap(0.75f);
+    EXPECT_EQ(tx.hopSize(), 25);
+    // Overlap approaching 1 still advances by at least 1 sample.
+    tx.setOverlap(0.999f);
+    EXPECT_EQ(tx.hopSize(), 1);
+}
+
+TEST(WindowResampleTransform, OverlappingWindowsMeanCorrect) {
+    // window=4, overlap=0.5 → hop=2. Windows: [0,4) [2,6) [4,8).
+    WindowResampleTransform tx(4, 0.5f);
+    auto out = applyTransform(tx, {1.f, 2.f, 3.f, 4.f, 5.f, 6.f, 7.f, 8.f});
+    ASSERT_EQ(out.size(), 3u);
+    EXPECT_FLOAT_EQ(out[0], 2.5f);   // mean(1,2,3,4)
+    EXPECT_FLOAT_EQ(out[1], 4.5f);   // mean(3,4,5,6)
+    EXPECT_FLOAT_EQ(out[2], 6.5f);   // mean(5,6,7,8)
+}
+
+TEST(WindowResampleTransform, TransformedCountWithOverlap) {
+    WindowResampleTransform tx(4, 0.5f);   // hop = 2
+    EXPECT_EQ(tx.transformedCount(8),  3);
+    EXPECT_EQ(tx.transformedCount(4),  1);
+    EXPECT_EQ(tx.transformedCount(3),  0);
+    EXPECT_EQ(tx.transformedCount(10), 4);  // (10-4)/2+1 = 4
+}
+
+TEST(WindowResampleTransform, ChunkedStreamingMatchesSingleShot) {
+    // The ring-buffer streaming state must give identical output whether
+    // fed as one call or split across several apply() calls (as the
+    // zoomed-out plot renderer does).
+    WindowResampleTransform tx_single(5, 0.6f);   // hop = 2
+    WindowResampleTransform tx_chunked(5, 0.6f);
+
+    std::vector<float> data(37);
+    for (size_t i = 0; i < data.size(); i++) data[i] = static_cast<float>(i) * 1.5f - 3.f;
+
+    auto full = applyTransform(tx_single, data);
+
+    tx_chunked.reset();
+    std::vector<float> chunked_out;
+    size_t pos = 0;
+    const size_t chunk_sizes[] = {7, 3, 12, 1, 14};
+    for (size_t cs : chunk_sizes) {
+        size_t n = std::min(cs, data.size() - pos);
+        if (n == 0) continue;
+        std::vector<float> chunk(data.begin() + static_cast<long>(pos),
+                                 data.begin() + static_cast<long>(pos + n));
+        int64_t out_n = tx_chunked.apply(chunk.data(), static_cast<int64_t>(n), 0);
+        for (int64_t i = 0; i < out_n; i++) chunked_out.push_back(chunk[static_cast<size_t>(i)]);
+        pos += n;
+    }
+    ASSERT_EQ(pos, data.size());
+
+    ASSERT_EQ(full.size(), chunked_out.size());
+    for (size_t i = 0; i < full.size(); i++)
+        EXPECT_NEAR(full[i], chunked_out[i], 1e-4f) << "index " << i;
+}
+
+TEST(WindowResampleTransform, NoOverlapMatchesOriginalBlockDecimation) {
+    // overlap=0 must reproduce the exact non-overlapping block-mean behavior.
+    WindowResampleTransform tx(2);
+    auto out = applyTransform(tx, {1.f, 3.f, 2.f, 4.f, 5.f, 7.f});
+    ASSERT_EQ(out.size(), 3u);
+    EXPECT_FLOAT_EQ(out[0], 2.f);
+    EXPECT_FLOAT_EQ(out[1], 3.f);
+    EXPECT_FLOAT_EQ(out[2], 6.f);
+}
+
+// ---------------------------------------------------------------------------
 // StrideResampleTransform
 // ---------------------------------------------------------------------------
 
@@ -383,6 +463,52 @@ TEST(STFTMagnitudeTransform, SinePeakPerWindowAtExpectedBin) {
 TEST(STFTMagnitudeTransform, RequiresSequential) {
     STFTMagnitudeTransform tx(64, 32);
     EXPECT_TRUE(tx.requiresSequential());
+}
+
+// ---------------------------------------------------------------------------
+// STFTMagnitudeTransform — overlap (a convenience view of hopSize())
+// ---------------------------------------------------------------------------
+
+TEST(STFTMagnitudeTransform, OverlapReflectsHopSize) {
+    STFTMagnitudeTransform tx(256, 128);   // hop = half the window
+    EXPECT_FLOAT_EQ(tx.overlap(), 0.5f);
+
+    tx.setHopSize(256);                    // no overlap
+    EXPECT_FLOAT_EQ(tx.overlap(), 0.0f);
+
+    tx.setHopSize(64);                     // 75% overlap
+    EXPECT_FLOAT_EQ(tx.overlap(), 0.75f);
+}
+
+TEST(STFTMagnitudeTransform, SetOverlapDerivesHopSize) {
+    STFTMagnitudeTransform tx(200, 1);
+    tx.setOverlap(0.5f);
+    EXPECT_EQ(tx.hopSize(), 100);
+
+    tx.setOverlap(0.75f);
+    EXPECT_EQ(tx.hopSize(), 50);
+
+    tx.setOverlap(0.0f);
+    EXPECT_EQ(tx.hopSize(), 200);
+
+    // Overlap approaching 1 still advances by at least 1 sample.
+    tx.setOverlap(0.999f);
+    EXPECT_EQ(tx.hopSize(), 1);
+}
+
+TEST(STFTMagnitudeTransform, SetOverlapProducesSameOutputAsEquivalentHop) {
+    STFTMagnitudeTransform tx_overlap(128, 1);
+    tx_overlap.setOverlap(0.5f);   // → hop = 64
+    STFTMagnitudeTransform tx_hop(128, 64);
+
+    const int N = 512;
+    std::vector<float> buf1(N), buf2(N);
+    for (int i = 0; i < N; ++i) buf1[i] = buf2[i] = std::sin(0.05f * i);
+
+    int64_t n1 = tx_overlap.apply(buf1.data(), N, 0);
+    int64_t n2 = tx_hop.apply(buf2.data(), N, 0);
+    ASSERT_EQ(n1, n2);
+    for (int64_t i = 0; i < n1; ++i) EXPECT_FLOAT_EQ(buf1[i], buf2[i]);
 }
 
 // ---------------------------------------------------------------------------

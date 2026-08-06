@@ -18,6 +18,8 @@
 #include <memory>
 #include <vector>
 
+class QVBoxLayout;
+
 // ---------------------------------------------------------------------------
 // Snapshot of mutable per-dataset state, used for undo.
 // ---------------------------------------------------------------------------
@@ -37,6 +39,19 @@ struct Dataset {
     std::unique_ptr<TrsFile>                  file;
     std::vector<std::shared_ptr<ITransform>>  pipeline;
     QString                                   display_name;
+
+    // True for a tab holding a derived result (t-test/SNR/... curve) rather
+    // than a real trace file — file is null, and most file-dependent menu
+    // actions refuse to run against it.
+    bool                 is_result          = false;
+
+    // This tab's own, persistent plot — every tab gets one so several can
+    // be shown at once when tiled (see MainWindow::tiled_).
+    PlotWidget*          plot_widget        = nullptr;
+
+    // Optional analysis-specific toolbar (t-test/SNR/... controls) shown
+    // above plot_widget when this tab holds a derived result.
+    QWidget*             extra_toolbar      = nullptr;
 
     // Alignment state (populated by "Apply to Main View" or drag-align)
     std::vector<int32_t> align_shifts;
@@ -94,6 +109,7 @@ private slots:
     void onExportDataset();
     void onDragAlignChanged();
     void onUndoAction();
+    void onToggleTile(bool on);
 
 private:
     void setupMenuBar();
@@ -107,16 +123,45 @@ private:
     void restoreSnapshot(DatasetSnapshot snap);
     void updateUndoButton();
 
+    // Opens a new tab holding a derived, pre-computed 1-D result (t-test/
+    // SNR/... curve) — same mechanism as opening another trace file, just
+    // with is_result=true and no backing TrsFile. Generic across analyses.
+    void addResultTab(const std::vector<float>& result, const QString& title,
+                       const QColor& color, const QString& trace_label);
+
+    // Creates a new, fully-wired PlotWidget for a tab (dataset or result).
+    PlotWidget* createPlotWidgetForTab();
+    // Arranges tab widgets in the view container: only the active tab's
+    // widget when single-view, every tab's widget stacked when tiled_.
+    void updateViewLayout();
+    // Finds which dataset owns `pw` (its plot_widget), or -1.
+    int  datasetIndexForWidget(PlotWidget* pw) const;
+    // If `pw` belongs to a non-active tab, makes it active (side panel only
+    // — does not touch any plot's content) so state-changing signals from a
+    // tiled, non-selected panel land on the right dataset.
+    void activateDatasetForWidget(PlotWidget* pw);
+
     // Multi-dataset state
     std::vector<Dataset> datasets_;
     int                  active_idx_ = -1;
+    bool                 tiled_      = false;
 
     bool     hasActiveDs() const { return active_idx_ >= 0; }
     Dataset& activeDs()          { return datasets_[static_cast<size_t>(active_idx_)]; }
     const Dataset& activeDs() const { return datasets_[static_cast<size_t>(active_idx_)]; }
+    // The widget that should currently receive toolbar actions (zoom, mode,
+    // reset, ...): the active tab's own widget, or a persistent empty
+    // placeholder when no tab is open yet.
+    PlotWidget* plotWidget() const {
+        return hasActiveDs() ? datasets_[static_cast<size_t>(active_idx_)].plot_widget
+                              : placeholder_widget_;
+    }
 
     // Widgets
-    PlotWidget*  plot_widget_     = nullptr;
+    PlotWidget*  placeholder_widget_ = nullptr;  // shown only while datasets_ is empty
+    QWidget*     view_container_  = nullptr;
+    QVBoxLayout* view_layout_     = nullptr;
+    QPushButton* btn_tile_        = nullptr;
     QTabBar*     tab_bar_         = nullptr;
 
     // Side panel
