@@ -2577,17 +2577,38 @@ void MainWindow::onOpenNpyTraces() {
             named_cols.push_back({colname, esz, std::move(cpayload)});
         }
     } else {
-        // Plain .npy
-        std::vector<int64_t> shape;
-        if (!loadNpy(path, traces_flat, shape, err)) {
-            QMessageBox::critical(this, "Load failed", err); return;
+        // Plain .npy: memory-map directly rather than reading the whole file into
+        // RAM (a copy here plus the copy TrsFile::openFromArray used to make meant
+        // multi-GB files needed ~2x their size in RAM and could get OOM-killed).
+        auto f = std::make_unique<TrsFile>();
+        std::string npy_err;
+        if (!f->openNpy(path.toStdString(), npy_err)) {
+            QMessageBox::critical(this, "Load failed", QString::fromStdString(npy_err)); return;
         }
-        if (shape.size() != 2) {
-            QMessageBox::critical(this, "Load failed",
-                QString("Expected a 2-D array (n_traces × n_samples), got %1-D.").arg(shape.size()));
-            return;
-        }
-        n_traces = shape[0]; n_samples = shape[1];
+
+        Dataset ds;
+        ds.file         = std::move(f);
+        ds.display_name = QFileInfo(path).fileName();
+        ds.plot_widget  = createPlotWidgetForTab();
+        datasets_.push_back(std::move(ds));
+        active_idx_ = static_cast<int>(datasets_.size()) - 1;
+
+        tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
+        tab_bar_->setCurrentIndex(active_idx_);
+
+        rebuildTransformList();
+        plotWidget()->setTransforms(activeDs().pipeline);
+
+        int n = activeDs().file->header().num_traces;
+        spin_first_->setMaximum(std::max(0, n - 1));
+        spin_first_->setValue(0);
+        spin_count_->setMaximum(n);
+        spin_count_->setValue(1);
+
+        updateFileInfo();
+        onApplyTraces();
+        updateViewLayout();
+        return;
     }
 
     if (n_traces < 1 || n_samples < 1) {
@@ -3670,10 +3691,21 @@ void MainWindow::onRunXCorr() {
     int n_total   = h.num_traces;
     int n_samples = h.num_samples;
 
+    struct TemplateSpec { int32_t trace; int64_t first; int64_t len; };
+    // Heap-allocated (like draw_target below): cfg is non-modal, so onRunXCorr()
+    // returns immediately and every lambda below must keep this alive by holding
+    // a copy of the shared_ptr rather than a reference to a local that's gone.
+    auto template_list = std::make_shared<QVector<TemplateSpec>>();
+
     // ---- Config dialog ----
-    QDialog cfg(this);
-    cfg.setWindowTitle("Cross-Correlation — configuration");
-    auto* vl_cfg = new QVBoxLayout(&cfg);
+    // Non-modal (show(), not exec()): QDialog::setVisible(false) tears down an
+    // exec() event loop as soon as it's hidden, which made the old hide()-while-
+    // drawing trick close this dialog outright instead of just stepping aside.
+    // Non-modal avoids that entirely — the main plot is always interactive.
+    auto* cfg = new QDialog(this);
+    cfg->setAttribute(Qt::WA_DeleteOnClose);
+    cfg->setWindowTitle("Cross-Correlation — configuration");
+    auto* vl_cfg = new QVBoxLayout(cfg);
 
     // Trace range
     auto* grp_traces = new QGroupBox("Traces");
@@ -3704,23 +3736,6 @@ void MainWindow::onRunXCorr() {
     fl_ds->addRow("Output M (samples):", lbl_M);
     fl_ds->addRow("Matrix memory:", lbl_mem);
 
-    // Update M / memory estimate labels (accounts for pipeline decimation)
-    auto updateEstimate = [&]() {
-        int64_t ns = sp_s_count->value() == 0 ? n_samples : sp_s_count->value();
-        for (const auto& t : activeDs().pipeline) ns = t->transformedCount(ns);
-        int     st = sp_stride->value();
-        int64_t M  = (ns + st - 1) / st;
-        lbl_M->setText(QString::number(M));
-        double mem_mb = static_cast<double>(M) * M * 4.0 / (1024.0 * 1024.0);
-        if (mem_mb >= 1024.0)
-            lbl_mem->setText(QString("%1 GB").arg(mem_mb / 1024.0, 0, 'f', 2));
-        else
-            lbl_mem->setText(QString("%1 MB").arg(mem_mb, 0, 'f', 1));
-    };
-    connect(sp_stride,  QOverload<int>::of(&QSpinBox::valueChanged), [&](int) { updateEstimate(); });
-    connect(sp_s_count, QOverload<int>::of(&QSpinBox::valueChanged), [&](int) { updateEstimate(); });
-    updateEstimate();
-
     // Method
     auto* grp_method  = new QGroupBox("Method");
     auto* vl_method   = new QVBoxLayout(grp_method);
@@ -3735,12 +3750,33 @@ void MainWindow::onRunXCorr() {
     lbl_dual_warn->setWordWrap(true);
     lbl_dual_warn->setEnabled(false);
     auto* rb_twowin   = new QRadioButton("Two-Window Template Match  (search × ref rectangular C)");
+    auto* rb_template = new QRadioButton("Template Match  (fixed template, sliding NCC per trace)");
+    // MP threshold scale (only shown for MP-Cleaned)
+    auto* mp_scale_row   = new QWidget;
+    auto* mp_scale_hl    = new QHBoxLayout(mp_scale_row);
+    mp_scale_hl->setContentsMargins(20, 0, 0, 0);
+    auto* mp_scale_lbl   = new QLabel("Threshold scale (×λ+):");
+    auto* sp_mp_scale    = new QDoubleSpinBox;
+    sp_mp_scale->setRange(1.0, 10.0);
+    sp_mp_scale->setSingleStep(0.1);
+    sp_mp_scale->setDecimals(2);
+    sp_mp_scale->setValue(1.0);
+    sp_mp_scale->setToolTip("Multiply λ+ by this factor before thresholding.\n"
+                            "1.0 = standard MP cutoff.\n"
+                            ">1.0 = keep only stronger signal components (more denoising).");
+    mp_scale_hl->addWidget(mp_scale_lbl);
+    mp_scale_hl->addWidget(sp_mp_scale);
+    mp_scale_row->setVisible(false);
+
     vl_method->addWidget(rb_baseline);
     vl_method->addWidget(rb_dual);
     vl_method->addWidget(rb_mp);
+    vl_method->addWidget(mp_scale_row);
     vl_method->addWidget(rb_twowin);
+    vl_method->addWidget(rb_template);
     vl_method->addWidget(lbl_dual_warn);
 
+    connect(rb_mp,   &QRadioButton::toggled, mp_scale_row, &QWidget::setVisible);
     connect(rb_dual, &QRadioButton::toggled, lbl_dual_warn, &QLabel::setEnabled);
     connect(rb_mp,   &QRadioButton::toggled, [lbl_dual_warn, rb_dual, rb_mp]() {
         lbl_dual_warn->setEnabled(rb_dual->isChecked() || rb_mp->isChecked());
@@ -3764,7 +3800,10 @@ void MainWindow::onRunXCorr() {
                        : QString())
         : "No alignment has been applied to the main view yet.");
     fl_align_xcorr->addRow(chk_shifts_xcorr);
-    auto applyAlignmentToSpinboxesXCorr = [&](bool on) {
+    // NOTE: [=] (not [&]) throughout this dialog — cfg is non-modal, so
+    // onRunXCorr() returns as soon as cfg->show() runs, and these lambdas keep
+    // firing long after that. Capturing locals by reference would dangle.
+    auto applyAlignmentToSpinboxesXCorr = [=](bool on) {
         if (on) {
             sp_first->setValue(activeDs().align_first_trace);
             sp_count->setValue(static_cast<int>(activeDs().align_shifts.size()));
@@ -3776,7 +3815,7 @@ void MainWindow::onRunXCorr() {
         sp_s_first->setEnabled(!on);
         sp_s_count->setEnabled(!on);
     };
-    connect(chk_shifts_xcorr, &QCheckBox::toggled, [&](bool on){ applyAlignmentToSpinboxesXCorr(on); });
+    connect(chk_shifts_xcorr, &QCheckBox::toggled, cfg, [=](bool on){ applyAlignmentToSpinboxesXCorr(on); });
     if (has_alignment_xcorr) applyAlignmentToSpinboxesXCorr(true);
 
     // Reference window (Two-Window mode only)
@@ -3789,9 +3828,188 @@ void MainWindow::onRunXCorr() {
     grp_ref->setVisible(false);
     connect(rb_twowin, &QRadioButton::toggled, grp_ref, &QWidget::setVisible);
 
+    // Template region(s) (Template Match mode only): step 1 — pick one or more templates.
+    // Each entry queued in the list below is matched independently; a separate
+    // result window opens for every template once the run completes.
+    auto* grp_tmpl   = new QGroupBox("1 · Templates  (Template Match mode)");
+    auto* vl_tmpl    = new QVBoxLayout(grp_tmpl);
+    auto* fl_tmpl    = new QFormLayout;
+    vl_tmpl->addLayout(fl_tmpl);
+    auto* sp_tmpl_trace = new QSpinBox;
+    sp_tmpl_trace->setRange(0, std::max(0, n_total - 1));
+    sp_tmpl_trace->setValue(spin_first_->value());
+    sp_tmpl_trace->setToolTip("Absolute trace index the template pattern is extracted from.");
+    auto* sp_tmpl_first = new QSpinBox; sp_tmpl_first->setRange(0, std::max(0, n_samples - 1)); sp_tmpl_first->setValue(0);
+    auto* sp_tmpl_len   = new QSpinBox; sp_tmpl_len->setRange(2, n_samples); sp_tmpl_len->setValue(std::min(512, n_samples));
+
+    // Seed from first crop range if one exists
+    if (!plotWidget()->cropRanges().empty()) {
+        auto [cs, ce] = plotWidget()->cropRanges()[0];
+        sp_tmpl_first->setValue(static_cast<int>(cs));
+        sp_tmpl_len->setValue(static_cast<int>(std::max<int64_t>(2, ce - cs)));
+    }
+
+    auto* btn_draw_tmpl = new QPushButton("Draw on plot →");
+    btn_draw_tmpl->setToolTip("Switch the main plot to crop-select mode.\n"
+                              "Drag to mark the template region, press Enter to confirm\n"
+                              "(Escape cancels), then this dialog comes back.");
+
+    auto* tmpl_region_row = new QWidget;
+    auto* tmpl_region_hl  = new QHBoxLayout(tmpl_region_row);
+    tmpl_region_hl->setContentsMargins(0, 0, 0, 0);
+    tmpl_region_hl->addWidget(new QLabel("First:"));
+    tmpl_region_hl->addWidget(sp_tmpl_first);
+    tmpl_region_hl->addWidget(new QLabel("Length:"));
+    tmpl_region_hl->addWidget(sp_tmpl_len);
+    tmpl_region_hl->addWidget(btn_draw_tmpl);
+    tmpl_region_hl->addStretch();
+
+    fl_tmpl->addRow("Template trace:",  sp_tmpl_trace);
+    fl_tmpl->addRow("Template region:", tmpl_region_row);
+
+    // Queued templates — each drawn region is appended here automatically;
+    // "Add to list" lets you queue the current spin-box values without drawing.
+    auto* lw_templates = new QListWidget;
+    lw_templates->setToolTip("Each entry here is matched independently against the search\n"
+                             "region — one result window opens per template.\n"
+                             "Empty list = run once, using the values above.");
+    auto* hl_tmpl_btns    = new QHBoxLayout;
+    auto* btn_tmpl_add    = new QPushButton("Add to list");
+    auto* btn_tmpl_remove = new QPushButton("Remove");
+    btn_tmpl_remove->setEnabled(false);
+    hl_tmpl_btns->addWidget(btn_tmpl_add);
+    hl_tmpl_btns->addWidget(btn_tmpl_remove);
+    hl_tmpl_btns->addStretch();
+    vl_tmpl->addWidget(lw_templates);
+    vl_tmpl->addLayout(hl_tmpl_btns);
+
+    auto tmplSummary = [](const TemplateSpec& s) {
+        return QString("Trace %1   [%2, %3)   len %4")
+            .arg(s.trace).arg(s.first).arg(s.first + s.len).arg(s.len);
+    };
+    auto addTemplateToList = [=](const TemplateSpec& spec) {
+        template_list->push_back(spec);
+        new QListWidgetItem(tmplSummary(spec), lw_templates);
+    };
+
+    connect(lw_templates, &QListWidget::currentRowChanged, cfg, [=](int row) {
+        btn_tmpl_remove->setEnabled(row >= 0);
+    });
+    connect(btn_tmpl_add, &QPushButton::clicked, cfg, [=]() {
+        addTemplateToList({ static_cast<int32_t>(sp_tmpl_trace->value()),
+                            static_cast<int64_t>(sp_tmpl_first->value()),
+                            static_cast<int64_t>(sp_tmpl_len->value()) });
+    });
+    connect(btn_tmpl_remove, &QPushButton::clicked, cfg, [=]() {
+        int row = lw_templates->currentRow();
+        if (row < 0) return;
+        template_list->remove(row);
+        delete lw_templates->takeItem(row);
+    });
+
+    grp_tmpl->setVisible(false);
+    connect(rb_template, &QRadioButton::toggled, grp_tmpl, &QWidget::setVisible);
+
+    // Search region draw button, appended next to the existing "Samples" group
+    // (used as the search window in Template Match mode).
+    auto* btn_draw_search = new QPushButton("Draw on plot →");
+    btn_draw_search->setToolTip("Switch the main plot to crop-select mode.\n"
+                                "Drag to mark the search region, press Enter to confirm\n"
+                                "(Escape cancels), then this dialog comes back.");
+    btn_draw_search->setVisible(false);
+    fl_samples->addRow("", btn_draw_search);
+    connect(rb_template, &QRadioButton::toggled, btn_draw_search, &QWidget::setVisible);
+    connect(rb_template, &QRadioButton::toggled, cfg, [=](bool on) {
+        grp_samples->setTitle(on ? "2 · Search Region" : "Samples");
+    });
+
+    // ── Interactive drag-select wiring, shared between the two drawable
+    //    regions (template / search) — only one can be "active" at a time.
+    enum class DrawTarget { None, Template, Search };
+    auto draw_target = std::make_shared<DrawTarget>(DrawTarget::None);
+
+    // cfg is non-modal (show(), not exec()), so the main plot stays interactive
+    // the whole time — no need to hide/show this dialog to "step out of the way".
+    auto startDraw = [=](DrawTarget target) {
+        *draw_target = target;
+        plotWidget()->clearCropRanges();
+        plotWidget()->setMode(InteractionMode::CropSelect);
+        btn_draw_tmpl->setText("Drag, then Enter…");
+        btn_draw_search->setText("Drag, then Enter…");
+        btn_draw_tmpl->setEnabled(false);
+        btn_draw_search->setEnabled(false);
+    };
+    connect(btn_draw_tmpl,   &QPushButton::clicked, cfg, [=]() { startDraw(DrawTarget::Template); });
+    connect(btn_draw_search, &QPushButton::clicked, cfg, [=]() { startDraw(DrawTarget::Search); });
+
+    auto* crop_guard = new QObject(cfg);
+    connect(plotWidget(), &PlotWidget::cropRangesChanged, crop_guard, [=]() {
+        const auto& ranges = plotWidget()->cropRanges();
+        if (ranges.empty() || *draw_target == DrawTarget::None) return;
+        auto [s, e] = ranges.back();
+        if (*draw_target == DrawTarget::Template) {
+            sp_tmpl_first->setValue(static_cast<int>(s));
+            sp_tmpl_len->setValue(static_cast<int>(std::max<int64_t>(2, e - s)));
+            // Each confirmed drag queues its own template — draw again for another.
+            addTemplateToList({ static_cast<int32_t>(sp_tmpl_trace->value()),
+                                s, std::max<int64_t>(2, e - s) });
+        } else {
+            sp_s_first->setValue(static_cast<int>(s));
+            sp_s_count->setValue(static_cast<int>(std::max<int64_t>(2, e - s)));
+        }
+        *draw_target = DrawTarget::None;
+        plotWidget()->setMode(InteractionMode::Pan);
+        btn_draw_tmpl->setText("Draw on plot →");
+        btn_draw_search->setText("Draw on plot →");
+        btn_draw_tmpl->setEnabled(true);
+        btn_draw_search->setEnabled(true);
+        cfg->raise();
+        cfg->activateWindow();
+    });
+
+    // Restore Pan mode (and bring the dialog back) if it's closed/hidden mid-draw
+    connect(cfg, &QDialog::finished, cfg, [=](int) {
+        if (plotWidget()->mode() == InteractionMode::CropSelect)
+            plotWidget()->setMode(InteractionMode::Pan);
+    });
+    // QDialog::accept()/reject() call done(), which hide()s rather than close()s
+    // the dialog — WA_DeleteOnClose alone would never fire, so clean up explicitly.
+    connect(cfg, &QDialog::finished, cfg, &QObject::deleteLater);
+
+    // Update output-size / memory estimate labels (accounts for pipeline decimation).
+    // Branches on Template Match (n_traces × n_lags) vs. matrix methods (M × M).
+    auto updateEstimate = [=]() {
+        int64_t ns = sp_s_count->value() == 0 ? n_samples : sp_s_count->value();
+        for (const auto& t : activeDs().pipeline) ns = t->transformedCount(ns);
+        int st = sp_stride->value();
+        double mem_mb;
+        if (rb_template->isChecked()) {
+            int64_t tmpl_ns = static_cast<int64_t>(sp_tmpl_len->value());
+            for (const auto& t : activeDs().pipeline) tmpl_ns = t->transformedCount(tmpl_ns);
+            int64_t n_lags = std::max<int64_t>(1, (ns - tmpl_ns) / std::max(1, st) + 1);
+            lbl_M->setText(QString("%1 lags").arg(n_lags));
+            mem_mb = static_cast<double>(sp_count->value()) * static_cast<double>(n_lags) * 4.0
+                   / (1024.0 * 1024.0);
+        } else {
+            int64_t M = (ns + st - 1) / st;
+            lbl_M->setText(QString::number(M));
+            mem_mb = static_cast<double>(M) * M * 4.0 / (1024.0 * 1024.0);
+        }
+        if (mem_mb >= 1024.0)
+            lbl_mem->setText(QString("%1 GB").arg(mem_mb / 1024.0, 0, 'f', 2));
+        else
+            lbl_mem->setText(QString("%1 MB").arg(mem_mb, 0, 'f', 1));
+    };
+    connect(sp_stride,    QOverload<int>::of(&QSpinBox::valueChanged), cfg, [=](int) { updateEstimate(); });
+    connect(sp_s_count,   QOverload<int>::of(&QSpinBox::valueChanged), cfg, [=](int) { updateEstimate(); });
+    connect(sp_count,     QOverload<int>::of(&QSpinBox::valueChanged), cfg, [=](int) { updateEstimate(); });
+    connect(sp_tmpl_len,  QOverload<int>::of(&QSpinBox::valueChanged), cfg, [=](int) { updateEstimate(); });
+    connect(rb_template,  &QRadioButton::toggled, cfg, [=](bool) { updateEstimate(); });
+    updateEstimate();
+
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
-    connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
-    connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    connect(cfg_bb, &QDialogButtonBox::accepted, cfg, &QDialog::accept);
+    connect(cfg_bb, &QDialogButtonBox::rejected, cfg, &QDialog::reject);
 
     vl_cfg->addWidget(grp_traces);
     vl_cfg->addWidget(grp_samples);
@@ -3799,9 +4017,14 @@ void MainWindow::onRunXCorr() {
     vl_cfg->addWidget(grp_ref);
     vl_cfg->addWidget(grp_ds);
     vl_cfg->addWidget(grp_method);
+    vl_cfg->addWidget(grp_tmpl);
     vl_cfg->addWidget(cfg_bb);
 
-    if (cfg.exec() != QDialog::Accepted) return;
+    // Everything below used to run synchronously after `cfg.exec()` returned
+    // Accepted. Now that cfg is non-modal, it runs instead when the user clicks
+    // OK, via QDialog::accepted() (emitted from within accept(), so this fires
+    // right after cfg_bb's "accepted" -> cfg->accept() connection above runs).
+    connect(cfg, &QDialog::accepted, cfg, [=]() {
 
     int32_t first_trace  = static_cast<int32_t>(sp_first->value());
     int32_t num_traces   = static_cast<int32_t>(sp_count->value());
@@ -3809,9 +4032,12 @@ void MainWindow::onRunXCorr() {
     int64_t num_samples_req = static_cast<int64_t>(sp_s_count->value()); // 0 = all
     int32_t stride       = static_cast<int32_t>(sp_stride->value());
     bool    is_twowin    = rb_twowin->isChecked();
+    bool    is_template  = rb_template->isChecked();
+    double  mp_scale     = sp_mp_scale->value();
     XCorrMethod method   = rb_mp->isChecked()     ? XCorrMethod::MPCleaned
                          : rb_dual->isChecked()    ? XCorrMethod::DualMatrix
                          : is_twowin               ? XCorrMethod::TwoWindow
+                         : is_template             ? XCorrMethod::TemplateMatch
                                                    : XCorrMethod::Baseline;
 
     const bool use_alignment_xcorr = chk_shifts_xcorr->isChecked();
@@ -3823,88 +4049,82 @@ void MainWindow::onRunXCorr() {
     }
     std::vector<int32_t> use_shifts = use_alignment_xcorr ? activeDs().align_shifts : std::vector<int32_t>{};
 
-    // Memory warning for large matrices (effective M accounts for pipeline)
+    // Template Match: the queued list, or (if empty) the currently staged
+    // trace/first/length spin-box values as a single implicit template.
+    std::vector<TemplateSpec> template_specs;
+    if (is_template) {
+        for (const auto& s : *template_list) template_specs.push_back(s);
+        if (template_specs.empty())
+            template_specs.push_back({ static_cast<int32_t>(sp_tmpl_trace->value()),
+                                       static_cast<int64_t>(sp_tmpl_first->value()),
+                                       static_cast<int64_t>(sp_tmpl_len->value()) });
+    }
+
+    // Memory warning for large matrices (effective M accounts for pipeline).
+    // For Template Match this is the worst case across all queued templates —
+    // each is computed (and shown) one at a time, so memory isn't cumulative.
     {
         int64_t ns = num_samples_req == 0 ? (n_samples - first_sample) : num_samples_req;
         for (const auto& t : activeDs().pipeline) ns = t->transformedCount(ns);
-        int64_t M  = (ns + stride - 1) / stride;
-        double  mem_mb = static_cast<double>(M) * M * 4.0 / (1024.0 * 1024.0);
+        double mem_mb = 0.0;
+        if (is_template) {
+            for (const auto& spec : template_specs) {
+                int64_t tmpl_ns = spec.len;
+                for (const auto& t : activeDs().pipeline) tmpl_ns = t->transformedCount(tmpl_ns);
+                int64_t n_lags = std::max<int64_t>(1, (ns - tmpl_ns) / std::max(1, stride) + 1);
+                double mb = static_cast<double>(num_traces) * static_cast<double>(n_lags) * 4.0
+                          / (1024.0 * 1024.0);
+                mem_mb = std::max(mem_mb, mb);
+            }
+        } else {
+            int64_t M = (ns + stride - 1) / stride;
+            mem_mb = static_cast<double>(M) * M * 4.0 / (1024.0 * 1024.0);
+        }
         if (mem_mb > 2048.0) {
             if (QMessageBox::warning(this, "Memory warning",
-                    QString("The output matrix will require ~%1 GB.\nContinue?")
+                    QString("The largest output matrix will require ~%1 GB.\nContinue?")
                         .arg(mem_mb / 1024.0, 0, 'f', 1),
                     QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
                 return;
         }
     }
 
-    // ---- Progress dialog + computation ----
+    // ---- Progress dialog ----
     QProgressDialog prog("Initialising…", "Cancel", 0, 100, this);
     prog.setWindowModality(Qt::WindowModal);
     prog.setMinimumDuration(0);
     prog.setValue(0);
     QApplication::processEvents();
 
-    XCorrResult result;
-    std::string err;
-
-    auto progCb = [&](int32_t done, int32_t total) -> bool {
-        if (prog.wasCanceled()) return false;
-        prog.setMaximum(total);
-        prog.setValue(done);
-        prog.setLabelText(
-            total > 0 ? QString("Processing trace %1 / %2…").arg(done).arg(total)
-                      : QString("Processing…"));
-        QApplication::processEvents();
-        return true;
-    };
-
-    bool ok;
-    if (is_twowin) {
-        int64_t ref_first = static_cast<int64_t>(sp_r_first->value());
-        int64_t ref_count = static_cast<int64_t>(sp_r_count->value());
-        int64_t ns = (num_samples_req == 0) ? (h.num_samples - first_sample) : num_samples_req;
-        ok = computeTwoWindowCorr(
-            activeDs().file.get(), first_trace, num_traces,
-            ref_first, ref_count,
-            first_sample, ns,
-            stride, activeDs().pipeline, use_shifts, result, progCb, err);
-    } else {
-        ok = computeXCorr(
-            activeDs().file.get(),
-            first_trace, num_traces,
-            first_sample, num_samples_req,
-            stride, method, activeDs().pipeline, use_shifts, result, progCb, err);
-    }
-
-    prog.setValue(prog.maximum());
-
-    if (!ok) {
-        if (!err.empty())
-            QMessageBox::critical(this, "Cross-Correlation failed",
-                                  QString::fromStdString(err));
-        return;  // cancelled
-    }
-
-    // ---- Result window ----
-    auto result_ptr = std::make_shared<XCorrResult>(std::move(result));
+    // ---- Result window (called once per template for Template Match,
+    //      once overall for the matrix methods) ----
+    auto showResultWindow = [=](XCorrResult result_in, const QString& extra_title) {
+    auto result_ptr = std::make_shared<XCorrResult>(std::move(result_in));
 
     auto* dlg = new QDialog(this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
 
-    QString method_str = result_ptr->method == XCorrMethod::MPCleaned  ? "MP-Cleaned"
-                       : result_ptr->method == XCorrMethod::DualMatrix  ? "Dual Matrix"
-                       : result_ptr->method == XCorrMethod::TwoWindow   ? "Two-Window"
-                                                                         : "Baseline";
-    QString title = (result_ptr->method == XCorrMethod::TwoWindow)
+    QString method_str = result_ptr->method == XCorrMethod::MPCleaned      ? "MP-Cleaned"
+                       : result_ptr->method == XCorrMethod::DualMatrix      ? "Dual Matrix"
+                       : result_ptr->method == XCorrMethod::TwoWindow       ? "Two-Window"
+                       : result_ptr->method == XCorrMethod::TemplateMatch   ? "Template Match"
+                                                                             : "Baseline";
+    QString title = (result_ptr->method == XCorrMethod::TemplateMatch)
+        ? QString("Template Match  template_len=%1  traces=%2  lags=%3  lag_stride=%4")
+              .arg(result_ptr->tm_template_len).arg(result_ptr->rows).arg(result_ptr->cols)
+              .arg(result_ptr->tm_lag_stride)
+        : (result_ptr->method == XCorrMethod::TwoWindow)
         ? QString("Two-Window Match  search=%1  ref=%2  n=%3")
               .arg(result_ptr->rows).arg(result_ptr->cols).arg(result_ptr->n_traces)
         : QString("Cross-Correlation [%1]  M=%2  n=%3")
               .arg(method_str).arg(result_ptr->M).arg(result_ptr->n_traces);
-    if (result_ptr->method == XCorrMethod::MPCleaned)
-        title += QString("  λ+=%1  signal=%2")
-                     .arg(result_ptr->lambda_plus, 0, 'g', 4)
-                     .arg(result_ptr->n_signal);
+    if (!extra_title.isEmpty()) title += "  " + extra_title;
+    if (result_ptr->method == XCorrMethod::MPCleaned) {
+        title += QString("  λ+=%1").arg(result_ptr->lambda_plus, 0, 'g', 4);
+        if (result_ptr->mp_threshold_scale > 1.0)
+            title += QString("×%1").arg(result_ptr->mp_threshold_scale, 0, 'f', 2);
+        title += QString("  signal=%1").arg(result_ptr->n_signal);
+    }
     dlg->setWindowTitle(title);
     dlg->resize(820, 760);
 
@@ -3951,10 +4171,18 @@ void MainWindow::onRunXCorr() {
     });
     connect(btn_reset_view, &QPushButton::clicked, heatmap, &HeatmapWidget::resetView);
 
-    connect(heatmap, &HeatmapWidget::hoverInfo, dlg, [lbl_hover](int s1, int s2, float val) {
-        lbl_hover->setText(
-            QString("C[%1, %2] = %3").arg(s1).arg(s2)
-                .arg(static_cast<double>(val), 0, 'g', 6));
+    connect(heatmap, &HeatmapWidget::hoverInfo, dlg, [lbl_hover, result_ptr](int s1, int s2, float val) {
+        if (result_ptr->method == XCorrMethod::TemplateMatch) {
+            int64_t abs_sample = result_ptr->tm_search_first_sample
+                               + static_cast<int64_t>(s2) * result_ptr->tm_lag_stride;
+            lbl_hover->setText(
+                QString("Trace %1  lag %2 (sample %3)  NCC = %4").arg(s1).arg(s2).arg(abs_sample)
+                    .arg(static_cast<double>(val), 0, 'g', 6));
+        } else {
+            lbl_hover->setText(
+                QString("C[%1, %2] = %3").arg(s1).arg(s2)
+                    .arg(static_cast<double>(val), 0, 'g', 6));
+        }
     });
 
     // Processing controls
@@ -3986,8 +4214,10 @@ void MainWindow::onRunXCorr() {
         }
     });
 
-    // Two-window: default to Lukasz colormap + abs value for template-match look
-    if (result_ptr->method == XCorrMethod::TwoWindow) {
+    // Two-Window / Template Match: default to Lukasz colormap + abs value for
+    // template-match look
+    if (result_ptr->method == XCorrMethod::TwoWindow ||
+        result_ptr->method == XCorrMethod::TemplateMatch) {
         combo_scheme2->setCurrentIndex(5);  // Lukasz (black → neon green)
         chk_abs2->setChecked(true);         // abs: collapses to [0,1], snaps vmin→0
     }
@@ -4044,9 +4274,9 @@ void MainWindow::onRunXCorr() {
         if (!fp) { QMessageBox::critical(dlg, "Export failed", "Cannot create:\n" + path); return; }
         const uint8_t magic[] = {0x93,'N','U','M','P','Y',0x01,0x00};
         std::fwrite(magic, 1, 8, fp);
-        int32_t M = result_ptr->M;
+        int32_t rows = result_ptr->rows, cols = result_ptr->cols;
         std::string dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
-                           std::to_string(M) + ", " + std::to_string(M) + "), }";
+                           std::to_string(rows) + ", " + std::to_string(cols) + "), }";
         size_t content_len = dict.size() + 1;
         size_t header_len  = ((content_len + 10 + 63) / 64) * 64 - 10;
         dict.resize(header_len - 1, ' ');
@@ -4056,7 +4286,7 @@ void MainWindow::onRunXCorr() {
         std::fwrite(hl_bytes, 1, 2, fp);
         std::fwrite(dict.c_str(), 1, dict.size(), fp);
         std::fwrite(result_ptr->matrix.data(), sizeof(float),
-                    static_cast<size_t>(M) * static_cast<size_t>(M), fp);
+                    static_cast<size_t>(rows) * static_cast<size_t>(cols), fp);
         std::fclose(fp);
         QMessageBox::information(dlg, "Saved", "Saved: " + path);
     });
@@ -4067,22 +4297,58 @@ void MainWindow::onRunXCorr() {
         int32_t cols = result_ptr->cols;
         if (rows <= 0 || cols <= 0) return;
 
+        const bool is_tm = (result_ptr->method == XCorrMethod::TemplateMatch);
+
+        // Rows can number in the thousands (M for matrix methods, n_traces for
+        // Template Match) and only NUM_COLORS distinct colours exist — ask which
+        // slice to actually plot instead of dumping every row into one view.
+        QDialog pick(dlg);
+        pick.setWindowTitle("Select rows to plot");
+        auto* pfl = new QFormLayout(&pick);
+        auto* lbl_avail = new QLabel(is_tm
+            ? QString("%1 traces available (trace %2..%3)")
+                  .arg(rows).arg(first_trace).arg(first_trace + rows - 1)
+            : QString("%1 rows available").arg(rows));
+        pfl->addRow(lbl_avail);
+        auto* sp_pick_first = new QSpinBox;
+        sp_pick_first->setRange(0, rows - 1);
+        sp_pick_first->setValue(0);
+        auto* sp_pick_count = new QSpinBox;
+        sp_pick_count->setRange(1, rows);
+        sp_pick_count->setValue(std::min(rows, NUM_COLORS));
+        sp_pick_count->setToolTip(QString("Only %1 distinct colours are used; they repeat past that many rows.")
+                                       .arg(NUM_COLORS));
+        pfl->addRow(is_tm ? "First trace row:" : "First row:", sp_pick_first);
+        pfl->addRow("Count:", sp_pick_count);
+        auto* pick_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        connect(pick_bb, &QDialogButtonBox::accepted, &pick, &QDialog::accept);
+        connect(pick_bb, &QDialogButtonBox::rejected, &pick, &QDialog::reject);
+        pfl->addRow(pick_bb);
+        if (pick.exec() != QDialog::Accepted) return;
+
+        int32_t sel_first = static_cast<int32_t>(sp_pick_first->value());
+        int32_t sel_count = std::min(static_cast<int32_t>(sp_pick_count->value()), rows - sel_first);
+
         auto* tdlg = new QDialog(dlg);
-        tdlg->setWindowTitle(
-            QString("Correlation traces — %1 traces × %2 samples").arg(rows).arg(cols));
+        tdlg->setWindowTitle(is_tm
+            ? QString("Match curves — %1 of %2 traces × %3 lags").arg(sel_count).arg(rows).arg(cols)
+            : QString("Correlation traces — %1 of %2 rows × %3 samples").arg(sel_count).arg(rows).arg(cols));
         tdlg->setAttribute(Qt::WA_DeleteOnClose);
         auto* tvl = new QVBoxLayout(tdlg);
         auto* pw  = new PlotWidget(tdlg);
+        if (is_tm)
+            pw->setAxisLabels("Lag (samples)", "NCC");
         tvl->addWidget(pw);
 
         const float* mat = result_ptr->matrix.data();
-        for (int32_t i = 0; i < rows; i++) {
+        for (int32_t i = sel_first; i < sel_first + sel_count; i++) {
             auto trace = std::make_shared<std::vector<float>>(
                 mat + static_cast<ptrdiff_t>(i) * cols,
                 mat + static_cast<ptrdiff_t>(i) * cols + cols);
             pw->addTrace(std::move(trace),
-                         TRACE_COLORS[i % NUM_COLORS],
-                         QString("C[%1,:]").arg(i));
+                         TRACE_COLORS[(i - sel_first) % NUM_COLORS],
+                         is_tm ? QString("Trace %1").arg(first_trace + i)
+                               : QString("C[%1,:]").arg(i));
         }
         pw->resetView();
         tdlg->resize(1100, 500);
@@ -4160,25 +4426,204 @@ void MainWindow::onRunXCorr() {
         info_bar = new QWidget(dlg);
         auto* il = new QHBoxLayout(info_bar);
         il->setContentsMargins(4, 0, 4, 0);
-        il->addWidget(new QLabel(
-            QString("λ+ (MP upper edge) = <b>%1</b>    "
-                    "Signal eigenvalues above λ+: <b>%2</b>")
-                .arg(result_ptr->lambda_plus, 0, 'g', 5)
-                .arg(result_ptr->n_signal)));
+        {
+            QString thr_str = QString("λ+ = <b>%1</b>").arg(result_ptr->lambda_plus, 0, 'g', 5);
+            if (result_ptr->mp_threshold_scale > 1.0)
+                thr_str += QString("  ×<b>%1</b> (threshold = <b>%2</b>)")
+                               .arg(result_ptr->mp_threshold_scale, 0, 'f', 2)
+                               .arg(result_ptr->lambda_plus * result_ptr->mp_threshold_scale, 0, 'g', 5);
+            thr_str += QString("    Signal eigenvalues above threshold: <b>%1</b>")
+                           .arg(result_ptr->n_signal);
+            il->addWidget(new QLabel(thr_str));
+        }
         auto* l = qobject_cast<QLabel*>(il->itemAt(0)->widget());
         if (l) l->setTextFormat(Qt::RichText);
         il->addStretch();
+    }
+
+    // ---- Template Match: project match peaks back onto the main trace plot ----
+    // The trivial "best match" is the template matching its own source location
+    // (NCC=1) — not useful. This instead finds every recurrence of the pattern
+    // above a threshold and highlights each one on the main plot as an amber
+    // marker, since the same operation can repeat many times in a trace.
+    QWidget* peak_row = nullptr;
+    if (result_ptr->method == XCorrMethod::TemplateMatch) {
+        peak_row = new QWidget(dlg);
+        auto* pl = new QHBoxLayout(peak_row);
+        pl->setContentsMargins(4, 2, 4, 2);
+
+        auto* sp_peak_trace = new QSpinBox;
+        sp_peak_trace->setRange(0, std::max(0, result_ptr->rows - 1));
+        sp_peak_trace->setValue(0);
+        sp_peak_trace->setToolTip("Row (trace) in this result whose match curve is scanned for peaks.");
+
+        auto* sp_peak_thr = new QDoubleSpinBox;
+        sp_peak_thr->setRange(-1.0, 1.0);
+        sp_peak_thr->setDecimals(2);
+        sp_peak_thr->setSingleStep(0.05);
+        sp_peak_thr->setValue(0.8);
+        sp_peak_thr->setToolTip("Local maxima of NCC at or above this value are projected onto\n"
+                                "the main trace plot as amber markers — finds every recurrence\n"
+                                "of the pattern, not just the trivial self-match.");
+
+        auto* chk_peak_show  = new QCheckBox("Show on main plot");
+        auto* lbl_peak_count = new QLabel;
+
+        auto updatePeaks = [=]() {
+            if (!chk_peak_show->isChecked()) {
+                plotWidget()->clearMatchMarkers();
+                lbl_peak_count->setText(QString());
+                return;
+            }
+            int32_t ti = sp_peak_trace->value();
+            if (ti < 0 || ti >= result_ptr->rows) return;
+            const float* row = result_ptr->matrix.data()
+                             + static_cast<size_t>(ti) * static_cast<size_t>(result_ptr->cols);
+            float   thr     = static_cast<float>(sp_peak_thr->value());
+            // Minimum spacing between accepted peaks, in lag columns: one
+            // template length, so a single true hit isn't reported many times.
+            int64_t min_sep = std::max<int64_t>(1, result_ptr->tm_template_len / result_ptr->tm_lag_stride);
+
+            std::vector<std::pair<int64_t,int64_t>> ranges;
+            int64_t lag = 0;
+            while (lag < result_ptr->cols) {
+                if (row[lag] >= thr) {
+                    int64_t best = lag;
+                    int64_t end  = std::min<int64_t>(result_ptr->cols, lag + min_sep);
+                    for (int64_t j = lag + 1; j < end; j++)
+                        if (row[j] > row[best]) best = j;
+                    int64_t abs_start = result_ptr->tm_search_first_sample
+                                       + best * result_ptr->tm_lag_stride;
+                    ranges.push_back({abs_start, abs_start + result_ptr->tm_template_len});
+                    lag = best + min_sep;
+                } else {
+                    lag++;
+                }
+            }
+            plotWidget()->setMatchMarkers(ranges);
+            lbl_peak_count->setText(QString("%1 match%2 found")
+                .arg(ranges.size()).arg(ranges.size() == 1 ? "" : "es"));
+        };
+
+        connect(sp_peak_trace, QOverload<int>::of(&QSpinBox::valueChanged),    dlg, [=](int)    { updatePeaks(); });
+        connect(sp_peak_thr,   QOverload<double>::of(&QDoubleSpinBox::valueChanged), dlg, [=](double) { updatePeaks(); });
+        connect(chk_peak_show, &QCheckBox::toggled,                            dlg, [=](bool)   { updatePeaks(); });
+
+        // Clear this window's markers when it closes, but only if it was the
+        // one showing them — avoids stomping on another still-open result window.
+        connect(dlg, &QObject::destroyed, this, [this, chk_peak_show]() {
+            if (chk_peak_show->isChecked()) plotWidget()->clearMatchMarkers();
+        });
+
+        pl->addWidget(new QLabel("Trace:"));
+        pl->addWidget(sp_peak_trace);
+        pl->addSpacing(8);
+        pl->addWidget(new QLabel("Threshold ≥:"));
+        pl->addWidget(sp_peak_thr);
+        pl->addSpacing(8);
+        pl->addWidget(chk_peak_show);
+        pl->addWidget(lbl_peak_count);
+        pl->addStretch();
     }
 
     auto* vl = new QVBoxLayout(dlg);
     vl->setContentsMargins(4, 4, 4, 4);
     vl->setSpacing(4);
     if (info_bar) vl->addWidget(info_bar);
+    if (peak_row) vl->addWidget(peak_row);
     vl->addWidget(ctrl);
     vl->addWidget(proc_row);
     vl->addWidget(heatmap, 1);
 
     dlg->show();
+    };
+
+    // ---- Computation ----
+    std::string err;
+
+    if (is_template) {
+        int64_t ns = (num_samples_req == 0) ? (h.num_samples - first_sample) : num_samples_req;
+        const int n_tmpl = static_cast<int>(template_specs.size());
+        for (int ti = 0; ti < n_tmpl; ti++) {
+            const auto& spec = template_specs[static_cast<size_t>(ti)];
+            QString prefix = n_tmpl > 1 ? QString("Template %1/%2 — ").arg(ti + 1).arg(n_tmpl) : QString();
+
+            auto progCb = [&](int32_t done, int32_t total) -> bool {
+                if (prog.wasCanceled()) return false;
+                prog.setMaximum(total);
+                prog.setValue(done);
+                prog.setLabelText(
+                    total > 0 ? prefix + QString("Processing trace %1 / %2…").arg(done).arg(total)
+                              : prefix + QString("Processing…"));
+                QApplication::processEvents();
+                return true;
+            };
+
+            XCorrResult result;
+            bool ok = computeTemplateMatch(
+                activeDs().file.get(), spec.trace, spec.first, spec.len,
+                first_trace, num_traces,
+                first_sample, ns,
+                stride, activeDs().pipeline, use_shifts, result, progCb, err);
+            prog.setValue(prog.maximum());
+
+            if (!ok) {
+                if (!err.empty())
+                    QMessageBox::critical(this, "Cross-Correlation failed",
+                                          QString::fromStdString(err));
+                return;  // cancelled / error — abort remaining templates too
+            }
+
+            QString extra = n_tmpl > 1
+                ? QString("[template %1/%2: trace %3, %4:%5]")
+                      .arg(ti + 1).arg(n_tmpl).arg(spec.trace).arg(spec.first).arg(spec.first + spec.len)
+                : QString();
+            showResultWindow(std::move(result), extra);
+        }
+    } else {
+        auto progCb = [&](int32_t done, int32_t total) -> bool {
+            if (prog.wasCanceled()) return false;
+            prog.setMaximum(total);
+            prog.setValue(done);
+            prog.setLabelText(
+                total > 0 ? QString("Processing trace %1 / %2…").arg(done).arg(total)
+                          : QString("Processing…"));
+            QApplication::processEvents();
+            return true;
+        };
+
+        XCorrResult result;
+        bool ok;
+        if (is_twowin) {
+            int64_t ref_first = static_cast<int64_t>(sp_r_first->value());
+            int64_t ref_count = static_cast<int64_t>(sp_r_count->value());
+            int64_t ns = (num_samples_req == 0) ? (h.num_samples - first_sample) : num_samples_req;
+            ok = computeTwoWindowCorr(
+                activeDs().file.get(), first_trace, num_traces,
+                ref_first, ref_count,
+                first_sample, ns,
+                stride, activeDs().pipeline, use_shifts, result, progCb, err);
+        } else {
+            ok = computeXCorr(
+                activeDs().file.get(),
+                first_trace, num_traces,
+                first_sample, num_samples_req,
+                stride, method, activeDs().pipeline, use_shifts, result, progCb, err,
+                mp_scale);
+        }
+        prog.setValue(prog.maximum());
+
+        if (!ok) {
+            if (!err.empty())
+                QMessageBox::critical(this, "Cross-Correlation failed",
+                                      QString::fromStdString(err));
+            return;  // cancelled
+        }
+        showResultWindow(std::move(result), QString());
+    }
+    });
+
+    cfg->show();
 }
 
 // ---------------------------------------------------------------------------

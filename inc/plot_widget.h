@@ -170,6 +170,12 @@ public:
     void    clearCropRanges();
     const   std::vector<std::pair<int64_t,int64_t>>& cropRanges() const { return crop_ranges_; }
 
+    // Match-marker overlay: read-only sample ranges highlighted in amber, separate
+    // from crop_ranges_ (which are user-editable and drive the crop/export tools).
+    // Used e.g. to project template-match hits back onto the trace.
+    void    setMatchMarkers(const std::vector<std::pair<int64_t,int64_t>>& ranges);
+    void    clearMatchMarkers();
+
     // Per-trace sample shifts (set by AlignDrag; also settable programmatically)
     int32_t             traceShift(int idx) const;
     std::vector<int32_t> traceShifts() const;
@@ -276,6 +282,9 @@ private:
     // Crop ranges
     std::vector<std::pair<int64_t,int64_t>> crop_ranges_;
     bool crop_overlay_visible_ = true;
+
+    // Match-marker overlay (read-only, e.g. template-match hits)
+    std::vector<std::pair<int64_t,int64_t>> match_markers_;
 
     // Pending cut selection (CropSelect mode: drag sets this, Enter confirms it)
     int64_t pending_cut_start_ = -1;

@@ -49,7 +49,8 @@ bool computeXCorr(
     const std::vector<int32_t>& shifts,
     XCorrResult&   out,
     XCorrProgress  progress,
-    std::string&   error)
+    std::string&   error,
+    double         mp_threshold_scale)
 {
     out = XCorrResult{};
     const TrsHeader& h = file->header();
@@ -273,10 +274,11 @@ bool computeXCorr(
     // Eigenvalues ascending; compute Marchenko-Pastur upper edge
     double gamma       = static_cast<double>(n) / M;
     double lambda_plus = (1.0 + std::sqrt(gamma)) * (1.0 + std::sqrt(gamma));
+    double threshold   = lambda_plus * std::max(mp_threshold_scale, 1.0);
 
     int n_signal = 0;
     for (int k = n - 1; k >= 0; k--)
-        if (solver.eigenvalues()[k] > lambda_plus) n_signal++;
+        if (solver.eigenvalues()[k] > threshold) n_signal++;
 
     // -----------------------------------------------------------------------
     // Phase 4: C = (A * V_sel) * (A * V_sel)^T / n  — two DGEMMs
@@ -289,7 +291,9 @@ bool computeXCorr(
             out.matrix.assign(static_cast<size_t>(M) * static_cast<size_t>(M), 0.0f);
             out.M = M; out.rows = M; out.cols = M;
             out.n_traces = n; out.method = method;
-            out.lambda_plus = lambda_plus; out.n_signal = 0;
+            out.lambda_plus = lambda_plus;
+            out.mp_threshold_scale = mp_threshold_scale;
+            out.n_signal = 0;
             return true;
         }
         V_sel = solver.eigenvectors().rightCols(k_select);
@@ -322,13 +326,14 @@ bool computeXCorr(
     if (progress && !progress(total_phases * n - 1, total_phases * n)) {
         error = "Cancelled."; return false;
     }
-    out.M           = M;
-    out.rows        = M;
-    out.cols        = M;
-    out.n_traces    = n;
-    out.method      = method;
-    out.lambda_plus = lambda_plus;
-    out.n_signal    = n_signal;
+    out.M                   = M;
+    out.rows                = M;
+    out.cols                = M;
+    out.n_traces            = n;
+    out.method              = method;
+    out.lambda_plus         = lambda_plus;
+    out.mp_threshold_scale  = mp_threshold_scale;
+    out.n_signal            = n_signal;
     return true;
 }
 
@@ -699,5 +704,164 @@ bool computeTwoWindowCorr(
     out.cols     = M_ref;
     out.n_traces = n;
     out.method   = XCorrMethod::TwoWindow;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Template matching: fixed template slid across each trace's search window.
+// out.matrix is row-major n_traces × n_lags: matrix[ti * n_lags + lag].
+// ---------------------------------------------------------------------------
+bool computeTemplateMatch(
+    TrsFile*       file,
+    int32_t        template_trace,
+    int64_t        template_first_sample,
+    int64_t        template_num_samples,
+    int32_t        first_trace,
+    int32_t        num_traces,
+    int64_t        search_first_sample,
+    int64_t        search_num_samples,
+    int32_t        lag_stride,
+    const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    const std::vector<int32_t>& shifts,
+    XCorrResult&   out,
+    XCorrProgress  progress,
+    std::string&   error)
+{
+    out = XCorrResult{};
+    const TrsHeader& h = file->header();
+
+    if (template_trace < 0 || template_trace >= h.num_traces) {
+        error = "Template trace index out of range."; return false;
+    }
+    if (first_trace + num_traces > h.num_traces)
+        num_traces = h.num_traces - first_trace;
+    if (num_traces < 1) { error = "Need at least 1 trace to scan."; return false; }
+
+    if (lag_stride < 1) lag_stride = 1;
+
+    template_first_sample = std::max<int64_t>(0, template_first_sample);
+    template_num_samples  = std::min(template_num_samples, h.num_samples - template_first_sample);
+    if (template_num_samples < 2) { error = "Template region too short (need >= 2 samples)."; return false; }
+
+    if (search_num_samples <= 0 || search_first_sample + search_num_samples > h.num_samples)
+        search_num_samples = h.num_samples - search_first_sample;
+    if (search_num_samples <= 0) { error = "Search region is empty or outside trace bounds."; return false; }
+
+    // Effective lengths after pipeline
+    int64_t template_eff = template_num_samples;
+    int64_t search_eff   = search_num_samples;
+    for (const auto& t : pipeline) {
+        template_eff = t->transformedCount(template_eff);
+        search_eff   = t->transformedCount(search_eff);
+    }
+    if (template_eff < 2 || search_eff < 2) { error = "Pipeline produces too few samples."; return false; }
+    if (template_eff > search_eff) { error = "Template is longer than the search window."; return false; }
+
+    const int64_t n_lags = (search_eff - template_eff) / lag_stride + 1;
+    if (n_lags < 1) { error = "No valid lag positions."; return false; }
+
+    const int n = num_traces;
+
+    // Memory guard: output matrix only (n_traces × n_lags floats); per-trace
+    // work buffers are tiny in comparison.
+    {
+        double mem_mb = (static_cast<double>(n) * static_cast<double>(n_lags) * 4.0)
+                       / (1024.0 * 1024.0);
+        if (mem_mb > 4096.0) {
+            error = "Estimated output matrix " + std::to_string(static_cast<int>(mem_mb))
+                  + " MB exceeds 4 GB. Increase lag stride or reduce ranges.";
+            return false;
+        }
+    }
+
+    // ---- Build the normalised (mean-centred) template ----
+    std::vector<float> tmpl_raw(static_cast<size_t>(std::max(template_num_samples, template_eff)), 0.0f);
+    {
+        int64_t avail = h.num_samples - template_first_sample;
+        int64_t got_n = std::min(template_num_samples, avail);
+        if (got_n > 0)
+            file->readSamples(template_trace, template_first_sample, got_n, tmpl_raw.data());
+        for (const auto& t : pipeline) t->reset();
+        int64_t n_out = template_num_samples;
+        for (const auto& t : pipeline) n_out = t->apply(tmpl_raw.data(), n_out, 0);
+        (void)n_out; // == template_eff
+    }
+    std::vector<float> tmpl_c(static_cast<size_t>(template_eff));
+    double t_sum = 0.0;
+    for (int64_t i = 0; i < template_eff; i++)
+        t_sum += static_cast<double>(tmpl_raw[static_cast<size_t>(i)]);
+    double t_mean = t_sum / static_cast<double>(template_eff);
+    double t_sq = 0.0;
+    for (int64_t i = 0; i < template_eff; i++) {
+        double v = static_cast<double>(tmpl_raw[static_cast<size_t>(i)]) - t_mean;
+        tmpl_c[static_cast<size_t>(i)] = static_cast<float>(v);
+        t_sq += v * v;
+    }
+    const double t_norm = std::sqrt(t_sq);
+    if (t_norm <= 0.0) { error = "Template has zero variance."; return false; }
+
+    out.matrix.assign(static_cast<size_t>(n) * static_cast<size_t>(n_lags), 0.0f);
+
+    std::vector<float> raw_full(static_cast<size_t>(std::max(search_num_samples, search_eff)));
+
+    for (int ti = 0; ti < n; ti++) {
+        if (progress && !progress(ti, n)) { error = "Cancelled."; return false; }
+
+        int32_t shift = (ti < static_cast<int>(shifts.size())) ? shifts[ti] : 0;
+        int32_t src   = first_trace + ti;
+        const int64_t adj_start = search_first_sample + shift;
+
+        std::fill(raw_full.begin(), raw_full.end(), 0.0f);
+        if (adj_start < h.num_samples && adj_start + search_num_samples > 0) {
+            int64_t src_start = std::max<int64_t>(0, adj_start);
+            int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + search_num_samples);
+            int64_t dst_off   = src_start - adj_start;
+            file->readSamples(src, src_start, src_end - src_start, raw_full.data() + dst_off);
+        }
+        for (const auto& t : pipeline) t->reset();
+        int64_t n_out = search_num_samples;
+        for (const auto& t : pipeline) n_out = t->apply(raw_full.data(), n_out, 0);
+
+        // Prefix sums over [0, n_out) for O(1) sliding-window mean/variance.
+        std::vector<double> prefix_sum(static_cast<size_t>(n_out) + 1, 0.0);
+        std::vector<double> prefix_sq (static_cast<size_t>(n_out) + 1, 0.0);
+        for (int64_t i = 0; i < n_out; i++) {
+            double v = static_cast<double>(raw_full[static_cast<size_t>(i)]);
+            prefix_sum[static_cast<size_t>(i) + 1] = prefix_sum[static_cast<size_t>(i)] + v;
+            prefix_sq [static_cast<size_t>(i) + 1] = prefix_sq [static_cast<size_t>(i)] + v * v;
+        }
+
+        float* row = out.matrix.data() + static_cast<size_t>(ti) * static_cast<size_t>(n_lags);
+
+        #pragma omp parallel for schedule(static)
+        for (int64_t lag = 0; lag < n_lags; lag++) {
+            int64_t off = lag * lag_stride;
+            if (off + template_eff > n_out) { row[lag] = 0.0f; continue; }
+
+            double wsum  = prefix_sum[static_cast<size_t>(off + template_eff)] - prefix_sum[static_cast<size_t>(off)];
+            double wsq   = prefix_sq [static_cast<size_t>(off + template_eff)] - prefix_sq [static_cast<size_t>(off)];
+            double wmean = wsum / static_cast<double>(template_eff);
+            double wvar  = wsq / static_cast<double>(template_eff) - wmean * wmean;
+
+            double dot = 0.0;
+            for (int64_t j = 0; j < template_eff; j++) {
+                double v = static_cast<double>(raw_full[static_cast<size_t>(off + j)]) - wmean;
+                dot += static_cast<double>(tmpl_c[static_cast<size_t>(j)]) * v;
+            }
+            double wnorm = std::sqrt(std::max(0.0, wvar) * static_cast<double>(template_eff));
+            row[lag] = (wnorm > 0.0) ? static_cast<float>(dot / (t_norm * wnorm)) : 0.0f;
+        }
+    }
+
+    if (progress) progress(n, n);
+
+    out.M                      = 0;
+    out.rows                   = n;
+    out.cols                   = static_cast<int32_t>(n_lags);
+    out.n_traces               = n;
+    out.method                 = XCorrMethod::TemplateMatch;
+    out.tm_template_len        = template_eff;
+    out.tm_search_first_sample = search_first_sample;
+    out.tm_lag_stride          = lag_stride;
     return true;
 }
