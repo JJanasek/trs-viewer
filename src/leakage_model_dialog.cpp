@@ -376,8 +376,11 @@ void LeakageModelDialog::onTest() {
     std::vector<uint8_t> data_flat(static_cast<size_t>(n_test) * std::max(DL, 0), 0);
     for (int i = 0; i < n_test; i++) {
         auto d = file_->readData(first_trace_ + i);
-        size_t copy = std::min<size_t>(d.size(), static_cast<size_t>(DL));
-        if (copy > 0) memcpy(data_flat.data() + i * DL, d.data(), copy);
+        // Clamp before the size_t cast, same as cpa.cpp's equivalent copy:
+        // a raw (unclamped) negative DL would wrap to a huge size_t here and
+        // walk data_flat.data() + i*DL backwards out of bounds below.
+        size_t copy = std::min<size_t>(d.size(), static_cast<size_t>(std::max(DL, 0)));
+        if (copy > 0) memcpy(data_flat.data() + i * std::max(DL, 0), d.data(), copy);
     }
 
     std::vector<float> out;
