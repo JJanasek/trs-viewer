@@ -30,7 +30,7 @@ option(ENABLE_SANITIZERS "Build tests with AddressSanitizer + LeakSanitizer" OFF
 # Non-GUI core object library shared by all test executables.
 # Excludes: main.cpp, all Qt widgets, leakage_model (Python-only), resources.
 # ---------------------------------------------------------------------------
-add_library(trs-core OBJECT
+add_library(trs-core-test OBJECT
     ${CMAKE_SOURCE_DIR}/src/trs_file.cpp
     ${CMAKE_SOURCE_DIR}/src/processing.cpp
     ${CMAKE_SOURCE_DIR}/src/snr.cpp
@@ -40,25 +40,25 @@ add_library(trs-core OBJECT
     ${CMAKE_SOURCE_DIR}/src/align.cpp
 )
 
-target_include_directories(trs-core PUBLIC
+target_include_directories(trs-core-test PUBLIC
     ${CMAKE_SOURCE_DIR}/inc
     ${CMAKE_SOURCE_DIR}/src
 )
 
-target_link_libraries(trs-core PUBLIC
+target_link_libraries(trs-core-test PUBLIC
     OpenMP::OpenMP_CXX
     Eigen3::Eigen
     ZLIB::ZLIB
 )
 
-target_compile_options(trs-core PRIVATE
+target_compile_options(trs-core-test PRIVATE
     -O1 -Wall -Wextra -Wno-unused-parameter
 )
 
 if(ENABLE_SANITIZERS)
     message(STATUS "Tests: AddressSanitizer + LeakSanitizer enabled")
-    target_compile_options(trs-core PUBLIC -fsanitize=address,leak -fno-omit-frame-pointer -g)
-    target_link_options(   trs-core PUBLIC -fsanitize=address,leak)
+    target_compile_options(trs-core-test PUBLIC -fsanitize=address,leak -fno-omit-frame-pointer -g)
+    target_link_options(   trs-core-test PUBLIC -fsanitize=address,leak)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -66,7 +66,7 @@ endif()
 # ---------------------------------------------------------------------------
 function(add_trs_test name)
     add_executable(${name} ${name}.cpp)
-    target_link_libraries(${name} PRIVATE trs-core GTest::gtest_main)
+    target_link_libraries(${name} PRIVATE trs-core-test GTest::gtest_main)
     target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/inc)
     if(ENABLE_SANITIZERS)
         target_compile_options(${name} PRIVATE -fsanitize=address,leak -fno-omit-frame-pointer -g)
