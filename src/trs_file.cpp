@@ -91,15 +91,18 @@ bool TrsFile::open(const std::string& path, std::string& error) {
         return false;
     }
 
-    mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd_, 0);
+    // Deliberately lazy (no MAP_POPULATE): pre-faulting the whole mapping
+    // here would block this call — and the caller's UI thread — for as long
+    // as it takes to read the entire file from disk, with no way to show
+    // progress or let the user cancel. Pages fault in on demand instead;
+    // callers that want the file warmed into cache up front (with visible
+    // progress) can call prefetch() explicitly after a successful open.
+    mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
     if (mmap_ptr_ == MAP_FAILED) {
-        mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-        if (mmap_ptr_ == MAP_FAILED) {
-            error = "mmap failed";
-            mmap_ptr_ = nullptr;
-            ::close(fd_); fd_ = -1;
-            return false;
-        }
+        error = "mmap failed";
+        mmap_ptr_ = nullptr;
+        ::close(fd_); fd_ = -1;
+        return false;
     }
 
     // Sequential hint for header parsing; switch to random after
@@ -137,15 +140,13 @@ bool TrsFile::openNpy(const std::string& path, std::string& error) {
         return false;
     }
 
-    mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE | MAP_POPULATE, fd_, 0);
+    // See open() — lazy mapping on purpose, no MAP_POPULATE.
+    mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
     if (mmap_ptr_ == MAP_FAILED) {
-        mmap_ptr_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
-        if (mmap_ptr_ == MAP_FAILED) {
-            error = "mmap failed";
-            mmap_ptr_ = nullptr;
-            ::close(fd_); fd_ = -1;
-            return false;
-        }
+        error = "mmap failed";
+        mmap_ptr_ = nullptr;
+        ::close(fd_); fd_ = -1;
+        return false;
     }
 
     const auto* base = static_cast<const uint8_t*>(mmap_ptr_);
@@ -474,4 +475,23 @@ std::vector<uint8_t> TrsFile::readData(int32_t trace_idx) const {
 
     const uint8_t* ptr = static_cast<const uint8_t*>(mmap_ptr_) + byte_off;
     return {ptr, ptr + header_.data_length};
+}
+
+void TrsFile::prefetch(const std::function<bool(int64_t, int64_t)>& progress) const {
+    if (!mmap_ptr_ || mmap_size_ == 0) return;   // nothing mapped, or in-memory mode
+
+    constexpr size_t kChunkBytes = 64ULL << 20;  // 64 MB per step between progress callbacks
+    constexpr size_t kPageStride = 4096;         // touch one byte per page — enough to fault it in
+
+    const auto* base = static_cast<const volatile uint8_t*>(mmap_ptr_);
+    size_t done = 0;
+    while (done < mmap_size_) {
+        size_t end = std::min(mmap_size_, done + kChunkBytes);
+        volatile uint8_t sink = 0;
+        for (size_t p = done; p < end; p += kPageStride) sink += base[p];
+        (void)sink;
+        done = end;
+        if (progress && !progress(static_cast<int64_t>(done), static_cast<int64_t>(mmap_size_)))
+            return;   // caller skipped/cancelled — remaining pages fault in lazily on first use
+    }
 }

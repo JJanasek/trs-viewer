@@ -123,6 +123,13 @@ private:
     void restoreSnapshot(DatasetSnapshot snap);
     void updateUndoButton();
 
+    // Warms a freshly-opened (lazily memory-mapped) file's page cache with a
+    // cancellable, byte-progress QProgressDialog. Only shows the dialog if
+    // warming actually takes a while (small files finish before the dialog's
+    // minimum duration elapses) — cancelling just stops early, the file is
+    // already fully usable via on-demand page faults either way.
+    void prefetchWithProgress(TrsFile* file, const QString& label);
+
     // Opens a new tab holding a derived, pre-computed 1-D result (t-test/
     // SNR/... curve) — same mechanism as opening another trace file, just
     // with is_result=true and no backing TrsFile. Generic across analyses.

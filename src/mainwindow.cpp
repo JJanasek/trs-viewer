@@ -793,6 +793,20 @@ void MainWindow::onOpenFile() {
     if (!path.isEmpty()) { updateRecentDir("trs", path); openFile(path); }
 }
 
+void MainWindow::prefetchWithProgress(TrsFile* file, const QString& label) {
+    QProgressDialog prog(label, "Skip", 0, 100, this);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(400);   // small/already-cached files never show it
+    prog.setValue(0);
+
+    file->prefetch([&](int64_t done, int64_t total) {
+        prog.setValue(total > 0 ? static_cast<int>(done * 100 / total) : 100);
+        QApplication::processEvents();
+        return !prog.wasCanceled();
+    });
+    prog.setValue(100);
+}
+
 void MainWindow::openFile(const QString& path) {
     auto f = std::make_unique<TrsFile>();
     std::string err;
@@ -801,6 +815,7 @@ void MainWindow::openFile(const QString& path) {
                               QString::fromStdString(err));
         return;
     }
+    prefetchWithProgress(f.get(), "Reading " + QFileInfo(path).fileName() + "…");
 
     Dataset ds;
     ds.file         = std::move(f);
@@ -960,15 +975,34 @@ void MainWindow::onApplyTraces() {
         plotWidget()->resetView();
     }
 
-    // Clear alignment state — new trace set makes old shifts stale.
-    activeDs().align_shifts.clear();
-    activeDs().align_first_trace = 0;
-    activeDs().align_first_sample = 0;
-    activeDs().align_n_samples = 0;
+    // Alignment state (align_shifts + its own first_trace/first_sample/
+    // n_samples) is kept on purpose: it's addressed by absolute trace index,
+    // not by whatever range happens to be loaded into the preview right now,
+    // so re-populating the list with a different first/count (e.g. widening
+    // the count to cover all traces before running a t-test) does not make
+    // it stale. It only becomes stale when the underlying file itself
+    // changes, and every load path (openFile/onOpenNpyTraces) already starts
+    // from a freshly-constructed Dataset with empty alignment fields — so
+    // there is nothing to clear here.
 
     // Mark plot as file-backed so drag-align updates alignment state.
     activeDs().plot_first_trace  = first;
     activeDs().plot_file_backed  = true;
+
+    // Re-apply previously computed shifts to the freshly (re)loaded traces
+    // so the preview still shows them aligned, same as after undo/redo.
+    plotWidget()->clearTraceShifts();
+    if (!activeDs().align_shifts.empty()) {
+        int n = static_cast<int>(plotWidget()->traceShifts().size());
+        for (int i = 0; i < n; i++) {
+            int shift_idx = first + i - activeDs().align_first_trace;
+            if (shift_idx >= 0 && shift_idx < static_cast<int>(activeDs().align_shifts.size())) {
+                int32_t shift = activeDs().align_shifts[static_cast<size_t>(shift_idx)];
+                if (shift != kAlignDiscardShift)
+                    plotWidget()->setTraceShift(i, shift);
+            }
+        }
+    }
 }
 
 void MainWindow::onDragAlignChanged() {
@@ -2585,6 +2619,7 @@ void MainWindow::onOpenNpyTraces() {
         if (!f->openNpy(path.toStdString(), npy_err)) {
             QMessageBox::critical(this, "Load failed", QString::fromStdString(npy_err)); return;
         }
+        prefetchWithProgress(f.get(), "Reading " + QFileInfo(path).fileName() + "…");
 
         Dataset ds;
         ds.file         = std::move(f);
