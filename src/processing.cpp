@@ -128,11 +128,68 @@ int64_t GaussianNoiseTransform::apply(float* buf, int64_t count, int64_t) {
 }
 
 // ---------------------------------------------------------------------------
+// BiquadFilterTransform
+// ---------------------------------------------------------------------------
+std::string BiquadFilterTransform::name() const {
+    const char* t = type_ == FilterType::Lowpass  ? "Lowpass"  :
+                    type_ == FilterType::Highpass ? "Highpass" :
+                    type_ == FilterType::Bandpass ? "Bandpass" : "Notch";
+    char buf[96];
+    std::snprintf(buf, sizeof(buf), "%s Filter (fc=%.3f×Nyq, Q=%.2f)",
+                  t, static_cast<double>(cutoff_), static_cast<double>(q_));
+    return buf;
+}
+
+// RBJ "Audio EQ Cookbook" biquad design. w0 = pi * cutoff since cutoff is
+// already a fraction of Nyquist (i.e. w0 = 2*pi*(f0/fs) with f0/fs =
+// cutoff/2). Coefficients normalised by a0 up front so apply() never divides.
+void BiquadFilterTransform::computeCoeffs() {
+    const double w0    = M_PI * static_cast<double>(cutoff_);
+    const double cw     = std::cos(w0);
+    const double sw     = std::sin(w0);
+    const double alpha = sw / (2.0 * static_cast<double>(q_));
+
+    double b0, b1, b2, a0, a1, a2;
+    switch (type_) {
+    case FilterType::Lowpass:
+        b0 = (1.0 - cw) / 2.0; b1 = 1.0 - cw; b2 = (1.0 - cw) / 2.0;
+        a0 = 1.0 + alpha;      a1 = -2.0 * cw; a2 = 1.0 - alpha;
+        break;
+    case FilterType::Highpass:
+        b0 = (1.0 + cw) / 2.0; b1 = -(1.0 + cw); b2 = (1.0 + cw) / 2.0;
+        a0 = 1.0 + alpha;      a1 = -2.0 * cw;   a2 = 1.0 - alpha;
+        break;
+    case FilterType::Bandpass:
+        b0 = sw / 2.0; b1 = 0.0; b2 = -sw / 2.0;
+        a0 = 1.0 + alpha; a1 = -2.0 * cw; a2 = 1.0 - alpha;
+        break;
+    case FilterType::Notch:
+    default:
+        b0 = 1.0; b1 = -2.0 * cw; b2 = 1.0;
+        a0 = 1.0 + alpha; a1 = -2.0 * cw; a2 = 1.0 - alpha;
+        break;
+    }
+    b0_ = b0 / a0; b1_ = b1 / a0; b2_ = b2 / a0;
+    a1_ = a1 / a0; a2_ = a2 / a0;
+}
+
+int64_t BiquadFilterTransform::apply(float* buf, int64_t count, int64_t) {
+    for (int64_t i = 0; i < count; i++) {
+        double x = static_cast<double>(buf[i]);
+        double y = b0_ * x + z1_;
+        z1_ = b1_ * x + z2_ - a1_ * y;
+        z2_ = b2_ * x - a2_ * y;
+        buf[i] = static_cast<float>(y);
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------------------
 // WindowResampleTransform  (sliding-window mean, hop = window*(1-overlap))
 // ---------------------------------------------------------------------------
 WindowResampleTransform::WindowResampleTransform(int window_size, float overlap)
     : window_size_(std::max(1, window_size))
-    , overlap_(std::clamp(overlap, 0.0f, 0.999f))
+    , overlap_(std::clamp(overlap, 0.0f, 1.0f))
 {
     reset();
 }
@@ -169,7 +226,7 @@ void WindowResampleTransform::setWindowSize(int w) {
 }
 
 void WindowResampleTransform::setOverlap(float o) {
-    overlap_ = std::clamp(o, 0.0f, 0.999f);
+    overlap_ = std::clamp(o, 0.0f, 1.0f);
     reset();
 }
 

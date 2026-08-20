@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 #include <vector>
@@ -74,6 +75,15 @@ public:
 
     // Read the auxiliary data bytes for a trace (e.g. input/key bytes).
     std::vector<uint8_t> readData(int32_t trace_idx) const;
+
+    // Optional: warms the page cache by touching the memory-mapped file
+    // sequentially in chunks, so later random-access reads (panning,
+    // analysis) don't stall on disk I/O one page at a time. Purely an
+    // optimisation — skipping or cancelling it just defers those page
+    // faults to whenever each page is first touched. No-op in in-memory
+    // mode (openFromArray). progress(bytes_done, bytes_total) is called
+    // between chunks; return false to stop early.
+    void prefetch(const std::function<bool(int64_t, int64_t)>& progress) const;
 
 private:
     bool    parseHeader(const uint8_t* data, size_t size, std::string& error);
