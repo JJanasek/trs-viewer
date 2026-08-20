@@ -45,6 +45,46 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Pipeline-domain <-> raw-domain sample count conversion.
+//
+// transformedCount() only goes forward (raw count -> processed count); these
+// let UI code that wants to think in the smaller, pipeline-processed domain
+// (e.g. a decimating window-resample stage) work out the raw sample range
+// that actually needs to be read, instead of the caller guessing a raw
+// count and hoping it's enough (or reading far more than necessary).
+// ---------------------------------------------------------------------------
+
+// Forward: raw sample count -> processed sample count, chaining every stage.
+inline int64_t processedCountForRaw(
+    const std::vector<std::shared_ptr<ITransform>>& pipeline, int64_t raw_count)
+{
+    int64_t n = raw_count;
+    for (const auto& t : pipeline) n = t->transformedCount(n);
+    return n;
+}
+
+// Inverse: the smallest raw sample count (capped at max_raw_count) whose
+// processed output is >= desired_processed_count. Exact for the common
+// decimating/expanding stages (window/stride resample, FFT/STFT) since their
+// transformedCount() is monotonically non-decreasing in its input; found by
+// binary search rather than inverting each transform's formula individually,
+// so it works for any pipeline without special-casing per transform type.
+inline int64_t rawCountForProcessedCount(
+    const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    int64_t desired_processed_count, int64_t max_raw_count)
+{
+    if (pipeline.empty() || desired_processed_count <= 0)
+        return std::clamp<int64_t>(desired_processed_count, 0, max_raw_count);
+    int64_t lo = 0, hi = max_raw_count;
+    while (lo < hi) {
+        int64_t mid = lo + (hi - lo) / 2;
+        if (processedCountForRaw(pipeline, mid) >= desired_processed_count) hi = mid;
+        else lo = mid + 1;
+    }
+    return lo;
+}
+
+// ---------------------------------------------------------------------------
 // Point-wise transforms  (no inter-sample state, safe for strided sampling)
 // ---------------------------------------------------------------------------
 
@@ -284,6 +324,66 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// BiquadFilterTransform — standard 2nd-order IIR filter (RBJ "Audio EQ
+// Cookbook" formulas), Direct Form II Transposed for numerical stability.
+// Causal and stateful (two delay registers), reset between traces like any
+// other sequential transform.
+//
+// cutoff is a *normalised* frequency: fraction of Nyquist (0, 1), not Hz —
+// TRS files don't reliably carry a real sample rate, so this keeps the
+// filter portable across any trace set. 0.1 means "10% of Nyquist"; for a
+// trace sampled at 1 GS/s that's 50 MHz, but the filter itself only ever
+// sees the ratio.
+//
+// q shapes the resonance/rolloff:
+//   Lowpass/Highpass: Q ~ 0.707 (1/sqrt(2)) is the maximally-flat Butterworth
+//     response; higher Q peaks near the cutoff before rolling off.
+//   Bandpass/Notch: Q sets how narrow the passband/notch is — bandwidth
+//     (in octaves) ~ cutoff/Q, so higher Q = narrower.
+// ---------------------------------------------------------------------------
+class BiquadFilterTransform : public ITransform {
+public:
+    enum class FilterType { Lowpass, Highpass, Bandpass, Notch };
+
+    explicit BiquadFilterTransform(FilterType type = FilterType::Lowpass,
+                                    float cutoff = 0.1f, float q = 0.707f)
+        : type_(type)
+        , cutoff_(std::clamp(cutoff, 1e-4f, 0.999f))
+        , q_(std::max(0.05f, q))
+    {
+        computeCoeffs();
+    }
+
+    std::string name() const override;
+    int64_t apply(float* buf, int64_t count, int64_t) override;
+    void reset() override { z1_ = z2_ = 0.0; }
+    bool requiresSequential() const override { return true; }
+
+    void setType(FilterType t)   { type_ = t; computeCoeffs(); }
+    void setCutoff(float c)      { cutoff_ = std::clamp(c, 1e-4f, 0.999f); computeCoeffs(); }
+    void setQ(float q)           { q_ = std::max(0.05f, q); computeCoeffs(); }
+    FilterType type() const { return type_; }
+    float      cutoff() const { return cutoff_; }
+    float      q()      const { return q_; }
+
+    std::shared_ptr<ITransform> clone() const override {
+        return std::make_shared<BiquadFilterTransform>(*this);
+    }
+
+private:
+    void computeCoeffs();
+
+    FilterType type_;
+    float  cutoff_;   // fraction of Nyquist, (0, 1)
+    float  q_;
+
+    // Normalised coefficients (b0,b1,b2,a1,a2; a0 folded to 1) and the two
+    // Direct-Form-II-Transposed delay registers.
+    double b0_ = 1.0, b1_ = 0.0, b2_ = 0.0, a1_ = 0.0, a2_ = 0.0;
+    double z1_ = 0.0, z2_ = 0.0;
+};
+
+// ---------------------------------------------------------------------------
 class STFTMagnitudeTransform : public ITransform {
 public:
     enum class Window { Rectangular, Hann, Hamming, Blackman };
@@ -320,7 +420,7 @@ public:
     // stays the single source of truth, so setHopSize()/hopSize() and
     // setOverlap()/overlap() can be mixed without going out of sync).
     void  setOverlap(float o) {
-        float clamped = std::clamp(o, 0.0f, 0.999f);
+        float clamped = std::clamp(o, 0.0f, 1.0f);
         setHopSize(std::max(1, static_cast<int>(std::llround(window_size_ * (1.0 - clamped)))));
     }
     float overlap() const {

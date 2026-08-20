@@ -84,13 +84,14 @@ void PlotWidget::setMode(InteractionMode mode) {
     update();
 }
 
-void PlotWidget::addCropRange(int64_t start, int64_t end) {
+void PlotWidget::addCropRange(int64_t start, int64_t end, bool is_repeat) {
     if (end <= start) return;
     start = std::clamp(start, INT64_C(0), total_samples_);
     end   = std::clamp(end,   INT64_C(0), total_samples_);
     if (end <= start) return;
     notifyBeforeViewChange();
     crop_ranges_.push_back({start, end});
+    crop_range_is_repeat_.push_back(is_repeat);
     emit cropRangesChanged();
     update();
 }
@@ -99,6 +100,7 @@ void PlotWidget::removeCropRangeAt(int idx) {
     if (idx < 0 || idx >= static_cast<int>(crop_ranges_.size())) return;
     notifyBeforeViewChange();
     crop_ranges_.erase(crop_ranges_.begin() + idx);
+    crop_range_is_repeat_.erase(crop_range_is_repeat_.begin() + idx);
     emit cropRangesChanged();
     update();
 }
@@ -107,6 +109,7 @@ void PlotWidget::clearCropRanges() {
     if (crop_ranges_.empty()) return;
     notifyBeforeViewChange();
     crop_ranges_.clear();
+    crop_range_is_repeat_.clear();
     emit cropRangesChanged();
     update();
 }
@@ -172,6 +175,7 @@ PlotViewState PlotWidget::captureViewState() const {
     s.sticky_ymin  = sticky_ymin_;
     s.sticky_ymax  = sticky_ymax_;
     s.crop_ranges  = crop_ranges_;
+    s.crop_range_is_repeat = crop_range_is_repeat_;
     return s;
 }
 
@@ -183,6 +187,10 @@ void PlotWidget::restoreViewState(const PlotViewState& s) {
     sticky_ymin_  = s.sticky_ymin;
     sticky_ymax_  = s.sticky_ymax;
     crop_ranges_  = s.crop_ranges;
+    // Older snapshots (pre-dating this field) may be shorter/empty — pad with
+    // false rather than desyncing the parallel vector.
+    crop_range_is_repeat_ = s.crop_range_is_repeat;
+    crop_range_is_repeat_.resize(crop_ranges_.size(), false);
     for (auto& te : traces_) te.cache.valid = false;
     emit viewChanged(view_start_, view_end_, total_samples_);
     emit cropRangesChanged();
@@ -1018,9 +1026,13 @@ void PlotWidget::paintEvent(QPaintEvent*) {
 
     // Crop range overlays (drawn on top of traces)
     if (!crop_ranges_.empty() && crop_overlay_visible_) {
-        // Two alternating green hues for adjacent ranges
-        const QColor fill_colors[2] = { QColor(60, 200, 80, 45),  QColor(60, 200, 160, 45)  };
-        const QColor line_colors[2] = { QColor(80, 220, 80, 200), QColor(80, 220, 160, 200) };
+        // Two alternating green hues for hand-picked ranges; two alternating
+        // blue/violet hues for ranges added by the repeat generator (Crop &
+        // Merge dialog), so a repeat set visibly stands apart from the rest.
+        const QColor fill_colors[2]        = { QColor(60, 200,  80, 45),  QColor(60, 200, 160, 45)  };
+        const QColor line_colors[2]        = { QColor(80, 220,  80, 200), QColor(80, 220, 160, 200) };
+        const QColor repeat_fill_colors[2] = { QColor(70, 130, 230, 45),  QColor(140, 100, 230, 45) };
+        const QColor repeat_line_colors[2] = { QColor(90, 150, 240, 200), QColor(160, 120, 240, 200) };
         QFont cf = font(); cf.setPointSize(8); cf.setBold(true);
         for (int i = 0; i < static_cast<int>(crop_ranges_.size()); i++) {
             int x1 = sampleToPixel(crop_ranges_[i].first,  pr);
@@ -1028,15 +1040,17 @@ void PlotWidget::paintEvent(QPaintEvent*) {
             x1 = std::clamp(x1, pr.left(), pr.right());
             x2 = std::clamp(x2, pr.left(), pr.right());
             if (x1 >= x2) continue;
-            const QColor& fc = fill_colors[i & 1];
-            const QColor& lc = line_colors[i & 1];
+            bool is_repeat = i < static_cast<int>(crop_range_is_repeat_.size()) && crop_range_is_repeat_[i];
+            const QColor& fc = is_repeat ? repeat_fill_colors[i & 1] : fill_colors[i & 1];
+            const QColor& lc = is_repeat ? repeat_line_colors[i & 1] : line_colors[i & 1];
             p.fillRect(QRect(x1, pr.top(), x2 - x1, pr.height()), fc);
             p.setPen(QPen(lc, 1));
             p.drawLine(x1, pr.top(), x1, pr.bottom());
             p.drawLine(x2, pr.top(), x2, pr.bottom());
             p.setFont(cf);
             p.setPen(lc);
-            p.drawText(x1 + 3, pr.top() + 13, QString("#%1").arg(i + 1));
+            p.drawText(x1 + 3, pr.top() + 13,
+                       is_repeat ? QString("#%1 rep").arg(i + 1) : QString("#%1").arg(i + 1));
         }
     }
 
@@ -1360,6 +1374,12 @@ void PlotWidget::mouseReleaseEvent(QMouseEvent* e) {
                     view_start_ = s1;
                     view_end_   = s2;
                     emit viewChanged(view_start_, view_end_, total_samples_);
+                } else if (crop_auto_confirm_) {
+                    // Single-shot region pickers: commit immediately, no
+                    // Enter needed (see setCropAutoConfirm()).
+                    crop_ranges_.push_back({s1, s2});
+                    crop_range_is_repeat_.push_back(false);
+                    emit cropRangesChanged();
                 } else {
                     // CropSelect: stage as pending — user presses Enter to confirm, Escape to cancel
                     pending_cut_start_ = s1;
@@ -1437,6 +1457,7 @@ void PlotWidget::keyPressEvent(QKeyEvent* ev) {
     if (mode_ == InteractionMode::CropSelect && pending_cut_start_ >= 0) {
         if (ev->key() == Qt::Key_Return || ev->key() == Qt::Key_Enter) {
             crop_ranges_.push_back({pending_cut_start_, pending_cut_end_});
+            crop_range_is_repeat_.push_back(false);
             pending_cut_start_ = pending_cut_end_ = -1;
             emit cropRangesChanged();
             update();

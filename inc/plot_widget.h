@@ -23,6 +23,7 @@ struct PlotViewState {
     float   sticky_ymin =  std::numeric_limits<float>::infinity();
     float   sticky_ymax = -std::numeric_limits<float>::infinity();
     std::vector<std::pair<int64_t,int64_t>> crop_ranges;
+    std::vector<bool> crop_range_is_repeat; // parallel to crop_ranges; see PlotWidget::addCropRange
 };
 
 // ---------------------------------------------------------------------------
@@ -164,11 +165,23 @@ public:
     // When false the crop-range green overlays are not drawn (but ranges are still tracked).
     void    setCropOverlayVisible(bool visible);
 
-    // Crop ranges (used by CropSelect mode and crop dialog)
-    void    addCropRange(int64_t start, int64_t end);
+    // Crop ranges (used by CropSelect mode and crop dialog).
+    // is_repeat marks a range added by the "repeat selected range" generator
+    // (Crop & Merge dialog) so it can be highlighted distinctly from a
+    // hand-drawn/hand-added one; purely cosmetic, doesn't affect export.
+    void    addCropRange(int64_t start, int64_t end, bool is_repeat = false);
     void    removeCropRangeAt(int idx);
     void    clearCropRanges();
     const   std::vector<std::pair<int64_t,int64_t>>& cropRanges() const { return crop_ranges_; }
+
+    // When true, a CropSelect drag commits straight to crop_ranges_ (and
+    // fires cropRangesChanged()) on mouse release instead of staging as a
+    // pending cut awaiting Enter/Escape. For single-shot "pick one region"
+    // pickers (e.g. Align Traces' reference region) where there's nothing to
+    // protect against re-drawing accidentally — unlike the crop/export tool,
+    // which keeps the Enter-confirm step. Off by default; callers should
+    // reset it to false once they leave CropSelect mode.
+    void    setCropAutoConfirm(bool on) { crop_auto_confirm_ = on; }
 
     // Match-marker overlay: read-only sample ranges highlighted in amber, separate
     // from crop_ranges_ (which are user-editable and drive the crop/export tools).
@@ -281,6 +294,7 @@ private:
 
     // Crop ranges
     std::vector<std::pair<int64_t,int64_t>> crop_ranges_;
+    std::vector<bool> crop_range_is_repeat_; // parallel to crop_ranges_; see addCropRange
     bool crop_overlay_visible_ = true;
 
     // Match-marker overlay (read-only, e.g. template-match hits)
@@ -289,6 +303,7 @@ private:
     // Pending cut selection (CropSelect mode: drag sets this, Enter confirms it)
     int64_t pending_cut_start_ = -1;
     int64_t pending_cut_end_   = -1;
+    bool    crop_auto_confirm_ = false;
 
     // Debounce for beforeViewChange() signal (wheel scroll bursts)
     QTimer* wheel_debounce_  = nullptr;
