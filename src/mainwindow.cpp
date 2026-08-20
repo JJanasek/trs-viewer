@@ -180,6 +180,7 @@ MainWindow::MainWindow(QWidget* parent)
         "FFT Magnitude",
         "STFT Magnitude",
         "Gaussian Noise",
+        "Filter (Lowpass/Highpass/Bandpass/Notch)",
     });
 
     list_transforms_ = new QListWidget;
@@ -331,6 +332,18 @@ MainWindow::MainWindow(QWidget* parent)
     btn_undo_->setEnabled(false);
     connect(btn_undo_, &QPushButton::clicked, this, &MainWindow::onUndoAction);
 
+    // Reverts "Align Traces -> Apply to Main View"'s baked-in static traces
+    // back to normal, live, file-backed ones (same rebuild Load/Refresh
+    // already does) — the computed alignment itself (align_shifts etc.) is
+    // kept, just no longer frozen into the plot, so pipeline edits and
+    // t-test/CPA/xcorr reuse still work as if nothing changed.
+    btn_unapply_ = new QPushButton("Un-apply Shifts");
+    btn_unapply_->setToolTip("Restore the live, file-backed view after \"Apply to Main "
+                             "View\" — keeps the computed alignment for later reuse, "
+                             "just stops it being baked into the plot.");
+    btn_unapply_->setEnabled(false);
+    connect(btn_unapply_, &QPushButton::clicked, this, &MainWindow::onApplyTraces);
+
     // Theme selector
     combo_theme_ = new QComboBox;
     combo_theme_->addItems({"Dark", "Light"});
@@ -350,6 +363,7 @@ MainWindow::MainWindow(QWidget* parent)
     toolbar_l->addWidget(btn_yzoom_out);
     toolbar_l->addWidget(sep2);
     toolbar_l->addWidget(btn_undo_);
+    toolbar_l->addWidget(btn_unapply_);
     toolbar_l->addWidget(sep3);
     toolbar_l->addWidget(new QLabel("Theme:"));
     toolbar_l->addWidget(combo_theme_);
@@ -367,9 +381,10 @@ MainWindow::MainWindow(QWidget* parent)
     // Dataset tab bar
     tab_bar_ = new QTabBar;
     tab_bar_->setTabsClosable(true);
-    tab_bar_->setMovable(false);
+    tab_bar_->setMovable(true);
     tab_bar_->setExpanding(false);
     connect(tab_bar_, &QTabBar::currentChanged, this, &MainWindow::onSwitchDataset);
+    connect(tab_bar_, &QTabBar::tabMoved, this, &MainWindow::onTabMoved);
     connect(tab_bar_, &QTabBar::tabCloseRequested, this, [this](int idx) {
         // Select a neighbour before removing so onSwitchDataset fires cleanly.
         if (tab_bar_->count() > 1) {
@@ -613,6 +628,20 @@ void MainWindow::addResultTab(const std::vector<float>& result, const QString& t
     updateViewLayout();
 }
 
+void MainWindow::onTabMoved(int from, int to) {
+    // Keep datasets_ index-aligned with the tab bar's now-reordered tabs —
+    // everything else (activeDs(), updateViewLayout()'s tiled stacking
+    // order) indexes into datasets_ assuming that alignment holds.
+    if (from < 0 || from >= static_cast<int>(datasets_.size()) ||
+        to   < 0 || to   >= static_cast<int>(datasets_.size()))
+        return;
+    Dataset moved = std::move(datasets_[static_cast<size_t>(from)]);
+    datasets_.erase(datasets_.begin() + from);
+    datasets_.insert(datasets_.begin() + to, std::move(moved));
+    active_idx_ = tab_bar_->currentIndex();
+    updateViewLayout();
+}
+
 // ---------------------------------------------------------------------------
 
 void MainWindow::setupMenuBar() {
@@ -773,6 +802,12 @@ void MainWindow::onUndoAction() {
 void MainWindow::updateUndoButton() {
     if (btn_undo_)
         btn_undo_->setEnabled(hasActiveDs() && !activeDs().undo_stack.empty());
+    // Piggybacks on the same call sites as the undo button — every one of
+    // them is a point where plot_file_backed could plausibly have changed
+    // (tab switch, undo/redo, Apply to Main View, Load/Refresh itself).
+    if (btn_unapply_)
+        btn_unapply_->setEnabled(hasActiveDs() && !activeDs().is_result
+                                  && !activeDs().plot_file_backed);
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,6 +1038,7 @@ void MainWindow::onApplyTraces() {
             }
         }
     }
+    updateUndoButton();   // also refreshes btn_unapply_'s enabled state
 }
 
 void MainWindow::onDragAlignChanged() {
@@ -1017,6 +1053,56 @@ void MainWindow::onDragAlignChanged() {
     activeDs().align_shifts       = std::move(shifts);
     activeDs().align_first_sample = 0;
     activeDs().align_n_samples    = activeDs().file->header().num_samples;
+}
+
+void MainWindow::rebakeAlignedView() {
+    Dataset& ds = activeDs();
+    if (ds.plot_file_backed || ds.align_n_samples <= 0 || !ds.file) return;
+
+    const auto& shifts = ds.align_shifts;
+    int32_t first_tr    = ds.align_first_trace;
+    int64_t out_start    = ds.align_first_sample;
+    int64_t out_len       = ds.align_n_samples;
+    const TrsHeader& h  = ds.file->header();
+
+    int64_t effective_len = out_len;
+    for (const auto& t : ds.pipeline) effective_len = t->transformedCount(effective_len);
+
+    // Preserve the current pan/zoom across the rebuild — clearTraces()
+    // zeroes the view and the first addTrace() below would otherwise reset
+    // it to full range, which would be a jarring surprise on every pipeline
+    // tweak (as opposed to the live, non-baked path's setTransforms(), which
+    // never touches the view at all).
+    PlotViewState saved_view = plotWidget()->captureViewState();
+    plotWidget()->clearTraces();
+    int shown = 0;
+    for (int i = 0; i < static_cast<int>(shifts.size()) && shown < NUM_COLORS; i++) {
+        int64_t shift = static_cast<int64_t>(shifts[static_cast<size_t>(i)]);
+        if (shift == kAlignDiscardShift) continue;
+
+        auto data = std::make_shared<std::vector<float>>(
+            static_cast<size_t>(std::max(out_len, effective_len)), 0.0f);
+
+        int64_t raw_start = out_start + shift;
+        int64_t raw_end   = raw_start + out_len;
+        int64_t src_start = std::max<int64_t>(0, raw_start);
+        int64_t src_end   = std::min<int64_t>(h.num_samples, raw_end);
+        int64_t dst_off   = src_start - raw_start;
+
+        if (src_start < src_end)
+            ds.file->readSamples(first_tr + i, src_start, src_end - src_start,
+                                  data->data() + static_cast<size_t>(dst_off));
+
+        for (const auto& t : ds.pipeline) t->reset();
+        int64_t n_out = out_len;
+        for (const auto& t : ds.pipeline) n_out = t->apply(data->data(), n_out, 0);
+        data->resize(static_cast<size_t>(std::max<int64_t>(0, n_out)));
+
+        plotWidget()->addTrace(std::move(data), TRACE_COLORS[shown % NUM_COLORS],
+            QString("T%1 (%2%3)").arg(first_tr + i).arg(shift >= 0 ? "+" : "").arg(shift));
+        shown++;
+    }
+    plotWidget()->restoreViewState(saved_view);
 }
 
 void MainWindow::onAddTransform() {
@@ -1034,6 +1120,8 @@ void MainWindow::onAddTransform() {
     // result the next time it repaints.
     if (activeDs().plot_file_backed)
         plotWidget()->setTransforms(activeDs().pipeline);
+    else
+        rebakeAlignedView();
     plotWidget()->update();
 }
 
@@ -1046,6 +1134,8 @@ void MainWindow::onRemoveTransform() {
     updateFileInfo();
     if (activeDs().plot_file_backed)
         plotWidget()->setTransforms(activeDs().pipeline);
+    else
+        rebakeAlignedView();
     plotWidget()->update();
 }
 
@@ -1059,6 +1149,8 @@ void MainWindow::onMoveTransformUp() {
     updateFileInfo();
     if (activeDs().plot_file_backed)
         plotWidget()->setTransforms(activeDs().pipeline);
+    else
+        rebakeAlignedView();
     plotWidget()->update();
 }
 
@@ -1072,6 +1164,8 @@ void MainWindow::onMoveTransformDown() {
     updateFileInfo();
     if (activeDs().plot_file_backed)
         plotWidget()->setTransforms(activeDs().pipeline);
+    else
+        rebakeAlignedView();
     plotWidget()->update();
 }
 
@@ -3523,7 +3617,8 @@ void MainWindow::onCropEdit() {
     auto* lbl_hint = new QLabel(
         "Drag on the plot (in drag-select mode) or click "
         "<b>Add current view</b> to add sample ranges.\n"
-        "The selected ranges are concatenated per trace on export.");
+        "Ranges are concatenated per trace on export, unless "
+        "<b>Export ranges separately</b> is checked below.");
     lbl_hint->setTextFormat(Qt::RichText);
     lbl_hint->setWordWrap(true);
 
@@ -3542,12 +3637,39 @@ void MainWindow::onCropEdit() {
     auto* btn_export   = new QPushButton("Export TRS…");
     auto* btn_close    = new QPushButton("Close");
 
+    // Repeat generator: takes the selected list row (or the last range if
+    // none selected) as the base window and stamps out N-1 more same-width
+    // copies of it, `period` samples apart — for marking every occurrence of
+    // a repeating operation (e.g. AES rounds) once you've hand-picked one.
+    auto* grp_repeat  = new QGroupBox("Repeat selected range");
+    auto* fl_repeat   = new QFormLayout(grp_repeat);
+    auto* sp_rep_count  = new QSpinBox;
+    sp_rep_count->setRange(1, 100000);
+    sp_rep_count->setValue(1);
+    sp_rep_count->setToolTip("Total number of copies, including the base range.");
+    auto* sp_rep_period = new QSpinBox;
+    sp_rep_period->setRange(1, 2000000000);
+    sp_rep_period->setValue(1);
+    sp_rep_period->setToolTip("Samples between the start of each successive copy.");
+    auto* btn_apply_repeat = new QPushButton("Add repeats");
+    fl_repeat->addRow("Count:",           sp_rep_count);
+    fl_repeat->addRow("Period (samples):", sp_rep_period);
+    fl_repeat->addRow(btn_apply_repeat);
+
+    auto* chk_separate = new QCheckBox("Export ranges separately (one output trace per range, not merged)");
+    chk_separate->setToolTip(
+        "Off: each source trace's ranges are concatenated into one output trace (old behavior).\n"
+        "On: every range becomes its own output trace, so N traces × K ranges → N×K output traces.\n"
+        "Requires all ranges to be the same length.");
+
     // ---- layout ----
     auto* vl = new QVBoxLayout(dlg);
     vl->addWidget(lbl_hint);
     vl->addWidget(btn_drag);
     vl->addWidget(list, 1);
     vl->addWidget(lbl_total);
+    vl->addWidget(grp_repeat);
+    vl->addWidget(chk_separate);
 
     auto* btns_l = new QHBoxLayout;
     btns_l->addWidget(btn_add_view);
@@ -3596,6 +3718,36 @@ void MainWindow::onCropEdit() {
         if (row >= 0) plotWidget()->removeCropRangeAt(row);
     });
 
+    connect(btn_apply_repeat, &QPushButton::clicked, dlg, [this, dlg, list, sp_rep_count, sp_rep_period]() {
+        const auto& ranges = plotWidget()->cropRanges();
+        if (ranges.empty()) {
+            QMessageBox::information(dlg, "Repeat range", "Add a base range first (drag on the plot or click \"Add current view\").");
+            return;
+        }
+        // Base window: the selected row, or the last range if none is selected.
+        int base_idx = list->currentRow();
+        if (base_idx < 0) base_idx = static_cast<int>(ranges.size()) - 1;
+        auto [base_start, base_end] = ranges[base_idx];
+        int64_t width  = base_end - base_start;
+        if (width <= 0) return;
+        int64_t period = sp_rep_period->value();
+        int     count  = sp_rep_count->value();
+        int64_t total  = plotWidget()->totalSamples();
+        int     added = 0;
+        for (int i = 1; i < count; i++) {
+            int64_t s = base_start + static_cast<int64_t>(i) * period;
+            int64_t e = s + width;
+            if (e > total) break; // stop once a copy would run past the end of the trace
+            plotWidget()->addCropRange(s, e, /*is_repeat=*/true);
+            added++;
+        }
+        if (added < count - 1) {
+            QMessageBox::information(dlg, "Repeat range",
+                QString("Added %1 of %2 requested repeats; the rest would run past the end of the trace.")
+                    .arg(added).arg(count - 1));
+        }
+    });
+
     connect(btn_clear, &QPushButton::clicked, dlg, [this]() {
         plotWidget()->clearCropRanges();
     });
@@ -3608,9 +3760,26 @@ void MainWindow::onCropEdit() {
     });
 
     // ---- export ----
-    connect(btn_export, &QPushButton::clicked, dlg, [this, dlg]() {
+    connect(btn_export, &QPushButton::clicked, dlg, [this, dlg, chk_separate]() {
         const auto& ranges = plotWidget()->cropRanges();
         if (ranges.empty()) return;
+
+        bool separate = chk_separate->isChecked();
+
+        // Separate mode needs one fixed sample count for every output trace,
+        // so every range must be the same width (TRS files have a single
+        // global NUMBER_SAMPLES for all traces).
+        int64_t range_width = ranges[0].second - ranges[0].first;
+        if (separate) {
+            for (const auto& r : ranges) {
+                if (r.second - r.first != range_width) {
+                    QMessageBox::warning(dlg, "Export failed",
+                        "\"Export ranges separately\" requires every range to be the same "
+                        "length. Use the repeat generator, or fix up ranges so their widths match.");
+                    return;
+                }
+            }
+        }
 
         // Compute total samples per output trace
         int64_t total_samples = 0;
@@ -3624,8 +3793,13 @@ void MainWindow::onCropEdit() {
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("trs", path);
 
-        int n_traces = h.num_traces;
-        QProgressDialog prog("Exporting traces…", "Cancel", 0, n_traces, dlg);
+        int     n_src_traces = h.num_traces;
+        int64_t out_samples  = separate ? range_width : total_samples;
+        int     n_out_traces = separate
+            ? static_cast<int>(static_cast<int64_t>(n_src_traces) * static_cast<int64_t>(ranges.size()))
+            : n_src_traces;
+
+        QProgressDialog prog("Exporting traces…", "Cancel", 0, n_src_traces, dlg);
         prog.setWindowModality(Qt::WindowModal);
         prog.setMinimumDuration(400);
 
@@ -3649,8 +3823,8 @@ void MainWindow::onCropEdit() {
         };
 
         // Write TRS header
-        tlv(0x41, 4); fputle32(n_traces);                       // NUMBER_TRACES
-        tlv(0x42, 4); fputle32(static_cast<int32_t>(total_samples)); // NUMBER_SAMPLES
+        tlv(0x41, 4); fputle32(n_out_traces);                    // NUMBER_TRACES
+        tlv(0x42, 4); fputle32(static_cast<int32_t>(out_samples)); // NUMBER_SAMPLES
         tlv(0x43, 1); std::fputc(0x14, fp);                     // float32
         if (h.data_length > 0) {
             tlv(0x44, 2); fputle16(h.data_length);              // DATA_LENGTH
@@ -3661,50 +3835,61 @@ void MainWindow::onCropEdit() {
         std::vector<float> buf(CHUNK);
         bool cancelled = false;
 
-        for (int ti = 0; ti < n_traces && !cancelled; ti++) {
+        // Writes samples [s, end) of source trace ti, zero-filling on a short read.
+        auto writeSampleRange = [&](int ti, int64_t s, int64_t end) {
+            while (s < end) {
+                int64_t chunk = std::min(CHUNK, end - s);
+                int64_t read  = activeDs().file->readSamples(ti, s, chunk, buf.data());
+                if (read <= 0) {
+                    int64_t remain = end - s;
+                    std::fill(buf.begin(), buf.begin() + remain, 0.0f);
+                    std::fwrite(buf.data(), sizeof(float),
+                                static_cast<size_t>(remain), fp);
+                    break;
+                }
+                std::fwrite(buf.data(), sizeof(float),
+                            static_cast<size_t>(read), fp);
+                s += read;
+            }
+        };
+
+        for (int ti = 0; ti < n_src_traces && !cancelled; ti++) {
             if (prog.wasCanceled()) { cancelled = true; break; }
-            prog.setLabelText(QString("Exporting trace %1 / %2…").arg(ti + 1).arg(n_traces));
+            prog.setLabelText(QString("Exporting trace %1 / %2…").arg(ti + 1).arg(n_src_traces));
             prog.setValue(ti);
             QApplication::processEvents();
 
-            // Auxiliary data bytes
-            if (h.data_length > 0) {
-                auto data = activeDs().file->readData(ti);
-                std::fwrite(data.data(), 1, data.size(), fp);
-            }
+            std::vector<uint8_t> data;
+            if (h.data_length > 0) data = activeDs().file->readData(ti);
 
-            // Concatenate each range
-            for (const auto& r : ranges) {
-                int64_t s   = r.first;
-                int64_t end = r.second;
-                while (s < end) {
-                    int64_t chunk = std::min(CHUNK, end - s);
-                    int64_t read  = activeDs().file->readSamples(ti, s, chunk, buf.data());
-                    if (read <= 0) {
-                        // Fill remainder with zeros if read fails
-                        int64_t remain = end - s;
-                        std::fill(buf.begin(), buf.begin() + remain, 0.0f);
-                        std::fwrite(buf.data(), sizeof(float),
-                                    static_cast<size_t>(remain), fp);
-                        break;
-                    }
-                    std::fwrite(buf.data(), sizeof(float),
-                                static_cast<size_t>(read), fp);
-                    s += read;
+            if (separate) {
+                // One output trace per range: aux data (if any) is repeated
+                // for each range copy, since every output trace needs its own.
+                for (const auto& r : ranges) {
+                    if (h.data_length > 0) std::fwrite(data.data(), 1, data.size(), fp);
+                    writeSampleRange(ti, r.first, r.second);
                 }
+            } else {
+                // Concatenate each range into one output trace.
+                if (h.data_length > 0) std::fwrite(data.data(), 1, data.size(), fp);
+                for (const auto& r : ranges) writeSampleRange(ti, r.first, r.second);
             }
         }
 
-        prog.setValue(n_traces);
+        prog.setValue(n_src_traces);
         std::fclose(fp);
 
         if (cancelled) {
             QFile::remove(path);
             QMessageBox::information(dlg, "Cancelled", "Export was cancelled.");
+        } else if (separate) {
+            QMessageBox::information(dlg, "Export complete",
+                QString("Saved %1 trace(s) (%2 source × %3 ranges), %4 samples each, to:\n%5")
+                    .arg(n_out_traces).arg(n_src_traces).arg(ranges.size()).arg(out_samples).arg(path));
         } else {
             QMessageBox::information(dlg, "Export complete",
                 QString("Saved %1 trace(s) with %2 samples each to:\n%3")
-                    .arg(n_traces).arg(total_samples).arg(path));
+                    .arg(n_out_traces).arg(out_samples).arg(path));
         }
     });
 
@@ -3725,6 +3910,14 @@ void MainWindow::onRunXCorr() {
     const TrsHeader& h = activeDs().file->header();
     int n_total   = h.num_traces;
     int n_samples = h.num_samples;
+
+    // Reference/template window pickers below are pipeline-processed sample
+    // units, same rationale and conversion helpers as onAlignTraces() — see
+    // the comment there. Only the small "match this pattern" windows
+    // (Two-Window's reference, Template Match's template) get this
+    // treatment; the general "Samples" range shared by every method (matrix
+    // size, search region) stays raw since it isn't a search/template window.
+    const int64_t proc_total_xcorr = processedCountForRaw(activeDs().pipeline, h.num_samples);
 
     struct TemplateSpec { int32_t trace; int64_t first; int64_t len; };
     // Heap-allocated (like draw_target below): cfg is non-modal, so onRunXCorr()
@@ -3856,10 +4049,16 @@ void MainWindow::onRunXCorr() {
     // Reference window (Two-Window mode only)
     auto* grp_ref   = new QGroupBox("Reference Window (Two-Window mode)");
     auto* fl_ref    = new QFormLayout(grp_ref);
-    auto* sp_r_first = new QSpinBox; sp_r_first->setRange(0, std::max(0, n_samples - 1)); sp_r_first->setValue(0);
-    auto* sp_r_count = new QSpinBox; sp_r_count->setRange(1, n_samples); sp_r_count->setValue(std::min(512, n_samples));
-    fl_ref->addRow("Ref first sample:", sp_r_first);
-    fl_ref->addRow("Ref count:",        sp_r_count);
+    auto* sp_r_first = new QSpinBox;
+    sp_r_first->setRange(0, static_cast<int>(std::max<int64_t>(0, proc_total_xcorr - 1)));
+    sp_r_first->setValue(0);
+    sp_r_first->setToolTip("Pipeline-processed sample index.");
+    auto* sp_r_count = new QSpinBox;
+    sp_r_count->setRange(1, static_cast<int>(std::max<int64_t>(1, proc_total_xcorr)));
+    sp_r_count->setValue(static_cast<int>(std::min<int64_t>(512, proc_total_xcorr)));
+    sp_r_count->setToolTip("Length in pipeline-processed samples.");
+    fl_ref->addRow("Ref first sample (pipeline samples):", sp_r_first);
+    fl_ref->addRow("Ref count (pipeline samples):",        sp_r_count);
     grp_ref->setVisible(false);
     connect(rb_twowin, &QRadioButton::toggled, grp_ref, &QWidget::setVisible);
 
@@ -3874,14 +4073,23 @@ void MainWindow::onRunXCorr() {
     sp_tmpl_trace->setRange(0, std::max(0, n_total - 1));
     sp_tmpl_trace->setValue(spin_first_->value());
     sp_tmpl_trace->setToolTip("Absolute trace index the template pattern is extracted from.");
-    auto* sp_tmpl_first = new QSpinBox; sp_tmpl_first->setRange(0, std::max(0, n_samples - 1)); sp_tmpl_first->setValue(0);
-    auto* sp_tmpl_len   = new QSpinBox; sp_tmpl_len->setRange(2, n_samples); sp_tmpl_len->setValue(std::min(512, n_samples));
+    auto* sp_tmpl_first = new QSpinBox;
+    sp_tmpl_first->setRange(0, static_cast<int>(std::max<int64_t>(0, proc_total_xcorr - 1)));
+    sp_tmpl_first->setValue(0);
+    sp_tmpl_first->setToolTip("Pipeline-processed sample index.");
+    auto* sp_tmpl_len   = new QSpinBox;
+    sp_tmpl_len->setRange(2, static_cast<int>(std::max<int64_t>(2, proc_total_xcorr)));
+    sp_tmpl_len->setValue(static_cast<int>(std::min<int64_t>(512, proc_total_xcorr)));
+    sp_tmpl_len->setToolTip("Length in pipeline-processed samples.");
 
-    // Seed from first crop range if one exists
+    // Seed from first crop range if one exists (crop ranges are always raw —
+    // the plot's own coordinate system — so convert to processed here).
     if (!plotWidget()->cropRanges().empty()) {
         auto [cs, ce] = plotWidget()->cropRanges()[0];
-        sp_tmpl_first->setValue(static_cast<int>(cs));
-        sp_tmpl_len->setValue(static_cast<int>(std::max<int64_t>(2, ce - cs)));
+        int64_t pcs = processedCountForRaw(activeDs().pipeline, cs);
+        int64_t pce = processedCountForRaw(activeDs().pipeline, ce);
+        sp_tmpl_first->setValue(static_cast<int>(pcs));
+        sp_tmpl_len->setValue(static_cast<int>(std::max<int64_t>(2, pce - pcs)));
     }
 
     auto* btn_draw_tmpl = new QPushButton("Draw on plot →");
@@ -3900,7 +4108,7 @@ void MainWindow::onRunXCorr() {
     tmpl_region_hl->addStretch();
 
     fl_tmpl->addRow("Template trace:",  sp_tmpl_trace);
-    fl_tmpl->addRow("Template region:", tmpl_region_row);
+    fl_tmpl->addRow("Template region (pipeline samples):", tmpl_region_row);
 
     // Queued templates — each drawn region is appended here automatically;
     // "Add to list" lets you queue the current spin-box values without drawing.
@@ -3931,9 +4139,15 @@ void MainWindow::onRunXCorr() {
         btn_tmpl_remove->setEnabled(row >= 0);
     });
     connect(btn_tmpl_add, &QPushButton::clicked, cfg, [=]() {
+        // sp_tmpl_first/sp_tmpl_len are pipeline-processed; TemplateSpec (and
+        // everything that consumes it) expects raw sample positions/counts.
+        const auto& pl = activeDs().pipeline;
+        int64_t proc_first = static_cast<int64_t>(sp_tmpl_first->value());
+        int64_t proc_end    = proc_first + static_cast<int64_t>(sp_tmpl_len->value());
+        int64_t raw_first  = rawCountForProcessedCount(pl, proc_first, h.num_samples);
+        int64_t raw_end     = rawCountForProcessedCount(pl, proc_end,   h.num_samples);
         addTemplateToList({ static_cast<int32_t>(sp_tmpl_trace->value()),
-                            static_cast<int64_t>(sp_tmpl_first->value()),
-                            static_cast<int64_t>(sp_tmpl_len->value()) });
+                            raw_first, std::max<int64_t>(1, raw_end - raw_first) });
     });
     connect(btn_tmpl_remove, &QPushButton::clicked, cfg, [=]() {
         int row = lw_templates->currentRow();
@@ -4019,8 +4233,9 @@ void MainWindow::onRunXCorr() {
         int st = sp_stride->value();
         double mem_mb;
         if (rb_template->isChecked()) {
+            // sp_tmpl_len is already pipeline-processed — unlike ns above,
+            // it must NOT be run through transformedCount() again.
             int64_t tmpl_ns = static_cast<int64_t>(sp_tmpl_len->value());
-            for (const auto& t : activeDs().pipeline) tmpl_ns = t->transformedCount(tmpl_ns);
             int64_t n_lags = std::max<int64_t>(1, (ns - tmpl_ns) / std::max(1, st) + 1);
             lbl_M->setText(QString("%1 lags").arg(n_lags));
             mem_mb = static_cast<double>(sp_count->value()) * static_cast<double>(n_lags) * 4.0
@@ -4089,10 +4304,17 @@ void MainWindow::onRunXCorr() {
     std::vector<TemplateSpec> template_specs;
     if (is_template) {
         for (const auto& s : *template_list) template_specs.push_back(s);
-        if (template_specs.empty())
+        if (template_specs.empty()) {
+            // sp_tmpl_first/sp_tmpl_len are pipeline-processed; convert to
+            // raw, same as the "Add to list" button does.
+            const auto& pl = activeDs().pipeline;
+            int64_t proc_first = static_cast<int64_t>(sp_tmpl_first->value());
+            int64_t proc_end    = proc_first + static_cast<int64_t>(sp_tmpl_len->value());
+            int64_t raw_first  = rawCountForProcessedCount(pl, proc_first, h.num_samples);
+            int64_t raw_end     = rawCountForProcessedCount(pl, proc_end,   h.num_samples);
             template_specs.push_back({ static_cast<int32_t>(sp_tmpl_trace->value()),
-                                       static_cast<int64_t>(sp_tmpl_first->value()),
-                                       static_cast<int64_t>(sp_tmpl_len->value()) });
+                                       raw_first, std::max<int64_t>(1, raw_end - raw_first) });
+        }
     }
 
     // Memory warning for large matrices (effective M accounts for pipeline).
@@ -4630,8 +4852,13 @@ void MainWindow::onRunXCorr() {
         XCorrResult result;
         bool ok;
         if (is_twowin) {
-            int64_t ref_first = static_cast<int64_t>(sp_r_first->value());
-            int64_t ref_count = static_cast<int64_t>(sp_r_count->value());
+            // sp_r_first/sp_r_count are pipeline-processed; convert to raw.
+            const auto& pl = activeDs().pipeline;
+            int64_t proc_ref_first = static_cast<int64_t>(sp_r_first->value());
+            int64_t proc_ref_end    = proc_ref_first + static_cast<int64_t>(sp_r_count->value());
+            int64_t ref_first = rawCountForProcessedCount(pl, proc_ref_first, h.num_samples);
+            int64_t ref_end    = rawCountForProcessedCount(pl, proc_ref_end,   h.num_samples);
+            int64_t ref_count = std::max<int64_t>(1, ref_end - ref_first);
             int64_t ns = (num_samples_req == 0) ? (h.num_samples - first_sample) : num_samples_req;
             ok = computeTwoWindowCorr(
                 activeDs().file.get(), first_trace, num_traces,
@@ -4683,7 +4910,7 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
         auto* sp_win = new QSpinBox; sp_win->setRange(2, 1'000'000); sp_win->setValue(64);
         sp_win->setToolTip("Samples averaged into each output point.");
         auto* sp_overlap = new QDoubleSpinBox;
-        sp_overlap->setRange(0.0, 0.99);
+        sp_overlap->setRange(0.0, 1.0);
         sp_overlap->setSingleStep(0.05);
         sp_overlap->setDecimals(2);
         sp_overlap->setValue(0.0);
@@ -4768,7 +4995,7 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
         auto* sp_win = new QSpinBox; sp_win->setRange(4, 1<<20); sp_win->setValue(256);
         sp_win->setToolTip("Samples per FFT window. Powers of 2 are fastest.");
         auto* sp_overlap = new QDoubleSpinBox;
-        sp_overlap->setRange(0.0, 0.99);
+        sp_overlap->setRange(0.0, 1.0);
         sp_overlap->setSingleStep(0.05);
         sp_overlap->setDecimals(2);
         sp_overlap->setValue(0.5);
@@ -4832,6 +5059,54 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
         if (!ok) return nullptr;
         return std::make_shared<GaussianNoiseTransform>(static_cast<float>(ns));
     }
+    case 10: {
+        QDialog d(this);
+        d.setWindowTitle("Filter — parameters");
+        auto* fl = new QFormLayout(&d);
+
+        auto* cmb_type = new QComboBox;
+        cmb_type->addItems({ "Lowpass", "Highpass", "Bandpass", "Notch" });
+        fl->addRow("Type:", cmb_type);
+
+        auto* sp_cutoff = new QDoubleSpinBox;
+        sp_cutoff->setRange(0.001, 0.999);
+        sp_cutoff->setSingleStep(0.01);
+        sp_cutoff->setDecimals(3);
+        sp_cutoff->setValue(0.1);
+        sp_cutoff->setToolTip("Fraction of Nyquist (half the sample rate) — TRS files "
+                              "don't reliably carry a real sample rate, so cutoff is "
+                              "expressed relative to it instead of Hz.\n"
+                              "0.1 = 10% of Nyquist. Lower = more smoothing (lowpass) "
+                              "or more high-frequency content removed (highpass).");
+        fl->addRow("Cutoff (× Nyquist, 0-1):", sp_cutoff);
+
+        auto* sp_q = new QDoubleSpinBox;
+        sp_q->setRange(0.05, 20.0);
+        sp_q->setSingleStep(0.1);
+        sp_q->setDecimals(2);
+        sp_q->setValue(0.707);
+        sp_q->setToolTip("Lowpass/Highpass: 0.707 (1/√2) is the maximally-flat "
+                         "response; higher peaks near the cutoff.\n"
+                         "Bandpass/Notch: higher Q = narrower band/notch.");
+        fl->addRow("Q:", sp_q);
+
+        auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        fl->addRow(bb);
+        connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+        connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+        if (d.exec() != QDialog::Accepted) return nullptr;
+
+        using FT = BiquadFilterTransform::FilterType;
+        FT type = FT::Lowpass;
+        switch (cmb_type->currentIndex()) {
+            case 1: type = FT::Highpass; break;
+            case 2: type = FT::Bandpass; break;
+            case 3: type = FT::Notch;    break;
+            default: break;
+        }
+        return std::make_shared<BiquadFilterTransform>(
+            type, static_cast<float>(sp_cutoff->value()), static_cast<float>(sp_q->value()));
+    }
     default: return nullptr;
     }
 }
@@ -4846,6 +5121,17 @@ void MainWindow::onAlignTraces()
         return;
     }
     const TrsHeader& h = activeDs().file->header();
+
+    // Every range control below (reference region, search window, drag-to-
+    // select) is expressed in *pipeline-processed* sample units, not raw —
+    // with a decimating pipeline stage active, that's the domain the user
+    // actually cares about, and it lets the raw window read+processed per
+    // candidate trace stay as small as the request needs instead of the
+    // caller having to over-provision a raw count "just in case". Converted
+    // back to raw right before calling alignByPeak/alignByXCorr, which still
+    // take raw sample positions/counts (see rawCountForProcessedCount()).
+    // Identity when there's no pipeline, so this is a no-op in the common case.
+    const int64_t proc_total = processedCountForRaw(activeDs().pipeline, h.num_samples);
 
     auto* dlg = new QDialog(this);
     dlg->setWindowTitle("Align Traces");
@@ -4862,28 +5148,35 @@ void MainWindow::onAlignTraces()
     sp_ref->setValue(spin_first_->value());
     sp_ref->setToolTip("Absolute trace index used as the alignment template.");
 
-    // Reference region
+    // Reference region — in pipeline-processed sample units (see note above).
     auto* sp_ref_first = new QSpinBox;
-    sp_ref_first->setRange(0, h.num_samples - 1);
+    sp_ref_first->setRange(0, static_cast<int>(std::max<int64_t>(0, proc_total - 1)));
+    sp_ref_first->setToolTip("Pipeline-processed sample index (after any active pipeline stages).");
     auto* sp_ref_len = new QSpinBox;
-    sp_ref_len->setRange(2, h.num_samples);
-    sp_ref_len->setValue(std::min(200, h.num_samples));
+    sp_ref_len->setRange(2, static_cast<int>(std::max<int64_t>(2, proc_total)));
+    sp_ref_len->setValue(static_cast<int>(std::min<int64_t>(200, proc_total)));
+    sp_ref_len->setToolTip("Length in pipeline-processed samples.");
 
-    // Seed from first crop range if one exists
+    // Seed from first crop range if one exists (crop ranges are always raw —
+    // the plot's own coordinate system — so convert to processed here).
     if (!plotWidget()->cropRanges().empty()) {
         auto [cs, ce] = plotWidget()->cropRanges()[0];
-        sp_ref_first->setValue(static_cast<int>(cs));
-        sp_ref_len->setValue(static_cast<int>(std::max<int64_t>(2, ce - cs)));
+        int64_t pcs = processedCountForRaw(activeDs().pipeline, cs);
+        int64_t pce = processedCountForRaw(activeDs().pipeline, ce);
+        sp_ref_first->setValue(static_cast<int>(pcs));
+        sp_ref_len->setValue(static_cast<int>(std::max<int64_t>(2, pce - pcs)));
     }
 
     // "Draw on plot" button — puts the main plot into CropSelect mode;
     // when the user draws a region the spinboxes update automatically.
     auto* btn_draw = new QPushButton("Draw on plot →");
     btn_draw->setToolTip("Switch the main plot to crop-select mode.\n"
-                         "Drag to mark the reference region, then come back here.");
+                         "Drag to mark the reference region — releasing the "
+                         "mouse confirms it immediately, no Enter needed.");
 
     connect(btn_draw, &QPushButton::clicked, dlg, [=]() {
         plotWidget()->clearCropRanges();
+        plotWidget()->setCropAutoConfirm(true);
         plotWidget()->setMode(InteractionMode::CropSelect);
         btn_draw->setText("Drawing… (drag on plot)");
         btn_draw->setEnabled(false);
@@ -4896,9 +5189,12 @@ void MainWindow::onAlignTraces()
         const auto& ranges = plotWidget()->cropRanges();
         if (ranges.empty()) return;
         auto [s, e] = ranges.back();
-        sp_ref_first->setValue(static_cast<int>(s));
-        sp_ref_len->setValue(static_cast<int>(std::max<int64_t>(2, e - s)));
+        int64_t ps = processedCountForRaw(activeDs().pipeline, s);
+        int64_t pe = processedCountForRaw(activeDs().pipeline, e);
+        sp_ref_first->setValue(static_cast<int>(ps));
+        sp_ref_len->setValue(static_cast<int>(std::max<int64_t>(2, pe - ps)));
         // Restore normal mode and re-enable button
+        plotWidget()->setCropAutoConfirm(false);
         plotWidget()->setMode(InteractionMode::Pan);
         btn_draw->setText("Draw on plot →");
         btn_draw->setEnabled(true);
@@ -4906,6 +5202,7 @@ void MainWindow::onAlignTraces()
 
     // Restore Pan mode if the dialog is closed mid-draw
     connect(dlg, &QDialog::finished, dlg, [=](int) {
+        plotWidget()->setCropAutoConfirm(false);
         if (plotWidget()->mode() == InteractionMode::CropSelect)
             plotWidget()->setMode(InteractionMode::Pan);
     });
@@ -4930,11 +5227,12 @@ void MainWindow::onAlignTraces()
         "Cross-correlation: the reference region is used as a template; "
         "the lag with maximum normalised correlation is used.");
 
-    // Search window
+    // Search window — also in pipeline-processed sample units.
     auto* sp_search = new QSpinBox;
-    sp_search->setRange(1, h.num_samples / 2);
-    sp_search->setValue(50);
-    sp_search->setToolTip("Maximum shift to consider (± samples around the reference position).");
+    sp_search->setRange(1, static_cast<int>(std::max<int64_t>(1, proc_total / 2)));
+    sp_search->setValue(static_cast<int>(std::min<int64_t>(50, std::max<int64_t>(1, proc_total / 2))));
+    sp_search->setToolTip("Maximum shift to consider (± pipeline-processed samples "
+                          "around the reference position).");
 
     // Peak mode row (hidden for XCorr)
     auto* peak_row = new QWidget;
@@ -4993,16 +5291,26 @@ void MainWindow::onAlignTraces()
     tr_hl->addStretch();
 
     fl->addRow("Reference trace:",   sp_ref);
-    fl->addRow("Reference region:",  region_row);
+    fl->addRow("Reference region (pipeline samples):", region_row);
     fl->addRow("Method:",            combo_method);
-    fl->addRow("Search window ±:",   sp_search);
+    fl->addRow("Search window ± (pipeline samples):", sp_search);
     fl->addRow(peak_row);
     fl->addRow(corr_row);
     fl->addRow("Traces:",            tr_row);
     vl->addWidget(grp);
 
+    auto* run_row = new QWidget;
+    auto* run_hl  = new QHBoxLayout(run_row);
+    run_hl->setContentsMargins(0, 0, 0, 0);
     auto* btn_run = new QPushButton("Run");
-    vl->addWidget(btn_run);
+    auto* btn_load_shifts = new QPushButton("Load Shifts from File…");
+    btn_load_shifts->setToolTip(
+        "Load a previously-exported (trace,offset) shift table instead of "
+        "running a search — e.g. shifts computed elsewhere, or with some "
+        "traces manually omitted.");
+    run_hl->addWidget(btn_run);
+    run_hl->addWidget(btn_load_shifts);
+    vl->addWidget(run_row);
 
     // ── Results (shown after a successful run) ────────────────────────────────
     auto* tbl = new QTableWidget(0, 3);
@@ -5033,14 +5341,66 @@ void MainWindow::onAlignTraces()
     auto* btn_show  = new QPushButton("Show in New Window…");
     auto* btn_apply = new QPushButton("Apply to Main View");
     btn_apply->setToolTip("Replace the main plot with the aligned traces.");
+    auto* btn_export_shifts = new QPushButton("Export Shifts…");
+    btn_export_shifts->setToolTip(
+        "Save the (trace,offset) table shown above to a text file — omitted/"
+        "discarded traces are left out, so it can later be reloaded with "
+        "some traces intentionally excluded.");
     output_hl->addWidget(combo_output);
     output_hl->addWidget(btn_show);
     output_hl->addWidget(btn_apply);
+    output_hl->addWidget(btn_export_shifts);
     output_row->hide();
     vl->addWidget(output_row);
 
     // Shared mutable state between Run and Show
     auto result_ptr = std::make_shared<AlignResult>();
+
+    // Populates the results table + reveals the output controls from
+    // whatever's currently in result_ptr — shared by a live Run and by
+    // loading a shift table from a file, so both end up in the same state.
+    auto showResults = [=](int32_t first_tr) {
+        int32_t num_tr = static_cast<int32_t>(result_ptr->shifts.size());
+        const auto& scores = result_ptr->scores;
+        int n_discarded = 0;
+        tbl->setRowCount(0);
+        for (int i = 0; i < num_tr; i++) {
+            int row = tbl->rowCount();
+            tbl->insertRow(row);
+            const int32_t shift = result_ptr->shifts[static_cast<size_t>(i)];
+            const bool discarded = (shift == kAlignDiscardShift);
+            if (discarded) n_discarded++;
+
+            auto* item_trace = new QTableWidgetItem(QString::number(first_tr + i));
+            auto* item_shift = new QTableWidgetItem(
+                discarded ? QString("discarded") : QString::number(shift));
+            auto* item_score = new QTableWidgetItem(
+                (i < static_cast<int>(scores.size()))
+                    ? QString::number(scores[static_cast<size_t>(i)], 'f', 3)
+                    : QString());
+            if (discarded) {
+                for (auto* item : {item_trace, item_shift, item_score}) {
+                    item->setBackground(QColor(255, 200, 200));
+                    item->setForeground(QColor(150, 0, 0));
+                }
+            }
+            tbl->setItem(row, 0, item_trace);
+            tbl->setItem(row, 1, item_shift);
+            tbl->setItem(row, 2, item_score);
+        }
+        tbl->show();
+
+        if (n_discarded > 0) {
+            lbl_discard_summary->setText(
+                QString("%1 of %2 traces discarded/omitted.").arg(n_discarded).arg(num_tr));
+            lbl_discard_summary->show();
+        } else {
+            lbl_discard_summary->hide();
+        }
+
+        output_row->show();
+        dlg->adjustSize();
+    };
 
     // ── Run ──────────────────────────────────────────────────────────────────
     connect(btn_run, &QPushButton::clicked, dlg, [=]() {
@@ -5061,9 +5421,19 @@ void MainWindow::onAlignTraces()
             return;
         }
 
-        int64_t ref_first = static_cast<int64_t>(sp_ref_first->value());
-        int64_t ref_len   = static_cast<int64_t>(sp_ref_len->value());
-        int32_t shalf     = sp_search->value();
+        // sp_ref_first/sp_ref_len/sp_search are pipeline-processed sample
+        // units (see comment at the top of onAlignTraces); convert to raw
+        // sample positions/counts here, right before calling into align.cpp,
+        // which — like the rest of the app — works in raw terms and applies
+        // the pipeline itself.
+        const auto& pipeline_now = activeDs().pipeline;
+        int64_t proc_ref_first = static_cast<int64_t>(sp_ref_first->value());
+        int64_t proc_ref_end   = proc_ref_first + static_cast<int64_t>(sp_ref_len->value());
+        int64_t ref_first = rawCountForProcessedCount(pipeline_now, proc_ref_first, h.num_samples);
+        int64_t ref_end   = rawCountForProcessedCount(pipeline_now, proc_ref_end,   h.num_samples);
+        int64_t ref_len   = std::max<int64_t>(1, ref_end - ref_first);
+        int32_t shalf     = static_cast<int32_t>(std::max<int64_t>(1,
+            rawCountForProcessedCount(pipeline_now, sp_search->value(), h.num_samples)));
         bool    use_abs   = (combo_peak->currentIndex() == 0);
         bool    is_peak   = (combo_method->currentIndex() == 0);
 
@@ -5107,47 +5477,95 @@ void MainWindow::onAlignTraces()
             return;
         }
 
-        // Populate results table
-        const auto& scores = result_ptr->scores;
-        int n_discarded = 0;
-        tbl->setRowCount(0);
-        for (int i = 0; i < num_tr; i++) {
-            int row = tbl->rowCount();
-            tbl->insertRow(row);
-            const int32_t shift = result_ptr->shifts[static_cast<size_t>(i)];
-            const bool discarded = (shift == kAlignDiscardShift);
-            if (discarded) n_discarded++;
+        showResults(first_tr);
+    });
 
-            auto* item_trace = new QTableWidgetItem(QString::number(first_tr + i));
-            auto* item_shift = new QTableWidgetItem(
-                discarded ? QString("discarded") : QString::number(shift));
-            auto* item_score = new QTableWidgetItem(
-                (i < static_cast<int>(scores.size()))
-                    ? QString::number(scores[static_cast<size_t>(i)], 'f', 3)
-                    : QString());
-            if (discarded) {
-                for (auto* item : {item_trace, item_shift, item_score}) {
-                    item->setBackground(QColor(255, 200, 200));
-                    item->setForeground(QColor(150, 0, 0));
-                }
+    // ── Load shifts from file ───────────────────────────────────────────────
+    // File format: one "trace,offset" pair per line (blank lines and lines
+    // starting with '#' are ignored). Trace numbers not present in the file
+    // are treated as discarded/omitted, same as a live run's threshold
+    // filter — so a hand-edited or filtered export can leave traces out.
+    connect(btn_load_shifts, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getOpenFileName(dlg, "Load alignment shifts",
+                                                     MainWindow::recentDir("align_shifts"),
+                                                     "Shift tables (*.csv *.txt);;All files (*)");
+        if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("align_shifts", path);
+
+        QFile f(path);
+        if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QMessageBox::critical(dlg, "Load failed", "Cannot open file:\n" + path);
+            return;
+        }
+
+        std::map<int32_t, int32_t> pairs;
+        QTextStream in(&f);
+        int bad_lines = 0;
+        while (!in.atEnd()) {
+            QString line = in.readLine().trimmed();
+            if (line.isEmpty() || line.startsWith('#')) continue;
+            QStringList parts = line.split(',');
+            bool ok1 = false, ok2 = false;
+            if (parts.size() >= 2) {
+                int32_t tr  = parts[0].trimmed().toInt(&ok1);
+                int32_t off = parts[1].trimmed().toInt(&ok2);
+                if (ok1 && ok2) { pairs[tr] = off; continue; }
             }
-            tbl->setItem(row, 0, item_trace);
-            tbl->setItem(row, 1, item_shift);
-            tbl->setItem(row, 2, item_score);
+            bad_lines++;
         }
-        tbl->show();
+        f.close();
 
-        if (discard_enabled) {
-            lbl_discard_summary->setText(
-                QString("%1 of %2 traces discarded (correlation below %3).")
-                    .arg(n_discarded).arg(num_tr).arg(min_corr, 0, 'f', 2));
-            lbl_discard_summary->show();
-        } else {
-            lbl_discard_summary->hide();
+        if (pairs.empty()) {
+            QMessageBox::critical(dlg, "Load failed",
+                "No valid \"trace,offset\" rows found in:\n" + path);
+            return;
         }
 
-        output_row->show();
-        dlg->adjustSize();
+        int32_t first_tr = pairs.begin()->first;
+        int32_t last_tr  = pairs.rbegin()->first;
+        result_ptr->shifts.assign(static_cast<size_t>(last_tr - first_tr + 1), kAlignDiscardShift);
+        result_ptr->scores.clear();   // not available from a file — table shows blank scores
+        for (const auto& kv : pairs)
+            result_ptr->shifts[static_cast<size_t>(kv.first - first_tr)] = kv.second;
+
+        sp_tr_first->setValue(first_tr);
+        sp_tr_count->setValue(static_cast<int>(result_ptr->shifts.size()));
+        showResults(first_tr);
+
+        if (bad_lines > 0)
+            QMessageBox::warning(dlg, "Load shifts",
+                QString("Loaded %1 trace(s); skipped %2 unparseable line(s).")
+                    .arg(pairs.size()).arg(bad_lines));
+    });
+
+    // ── Export shifts to file ───────────────────────────────────────────────
+    connect(btn_export_shifts, &QPushButton::clicked, dlg, [=]() {
+        if (result_ptr->shifts.empty()) return;
+        QString path = QFileDialog::getSaveFileName(dlg, "Export alignment shifts",
+                                                     MainWindow::recentDir("align_shifts"),
+                                                     "CSV files (*.csv);;All files (*)");
+        if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("align_shifts", path);
+
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::critical(dlg, "Export failed", "Cannot create file:\n" + path);
+            return;
+        }
+        QTextStream out(&f);
+        out << "# trs-viewer alignment shifts (trace,offset) — omitted traces were "
+               "discarded/excluded\n";
+        int32_t first_tr = static_cast<int32_t>(sp_tr_first->value());
+        int32_t n_written = 0;
+        for (int i = 0; i < static_cast<int>(result_ptr->shifts.size()); i++) {
+            int32_t shift = result_ptr->shifts[static_cast<size_t>(i)];
+            if (shift == kAlignDiscardShift) continue;   // omit — matches the threshold filter
+            out << (first_tr + i) << ',' << shift << '\n';
+            n_written++;
+        }
+        f.close();
+        QMessageBox::information(dlg, "Export complete",
+            QString("Saved %1 trace shift(s) to:\n%2").arg(n_written).arg(path));
     });
 
     // ── Show aligned traces ───────────────────────────────────────────────────
@@ -5330,6 +5748,7 @@ void MainWindow::onAlignTraces()
         plotWidget()->setTransforms({});
         plotWidget()->resetView();
         activeDs().plot_file_backed = false;
+        updateUndoButton();   // also refreshes btn_unapply_'s enabled state
         dlg->accept();
     });
 
