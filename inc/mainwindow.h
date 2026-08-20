@@ -110,6 +110,7 @@ private slots:
     void onDragAlignChanged();
     void onUndoAction();
     void onToggleTile(bool on);
+    void onTabMoved(int from, int to);
 
 private:
     void setupMenuBar();
@@ -122,6 +123,13 @@ private:
     void saveSnapshot();
     void restoreSnapshot(DatasetSnapshot snap);
     void updateUndoButton();
+
+    // Warms a freshly-opened (lazily memory-mapped) file's page cache with a
+    // cancellable, byte-progress QProgressDialog. Only shows the dialog if
+    // warming actually takes a while (small files finish before the dialog's
+    // minimum duration elapses) — cancelling just stops early, the file is
+    // already fully usable via on-demand page faults either way.
+    void prefetchWithProgress(TrsFile* file, const QString& label);
 
     // Opens a new tab holding a derived, pre-computed 1-D result (t-test/
     // SNR/... curve) — same mechanism as opening another trace file, just
@@ -140,6 +148,15 @@ private:
     // — does not touch any plot's content) so state-changing signals from a
     // tiled, non-selected panel land on the right dataset.
     void activateDatasetForWidget(PlotWidget* pw);
+
+    // Re-applies the *current* pipeline to a tab's stored alignment (shifts +
+    // window) and redraws it. Called whenever the pipeline changes on a tab
+    // that is showing a static baked-in alignment result (plot_file_backed
+    // == false, e.g. after Align Traces -> Apply to Main View) so pipeline
+    // edits keep taking visible effect there instead of freezing at whatever
+    // the pipeline was when alignment was applied. No-op for file-backed or
+    // unaligned/result tabs.
+    void rebakeAlignedView();
 
     // Multi-dataset state
     std::vector<Dataset> datasets_;
@@ -191,6 +208,7 @@ private:
     QPushButton*  btn_zoom_out_     = nullptr;
     QPushButton*  btn_reset_        = nullptr;
     QPushButton*  btn_undo_         = nullptr;
+    QPushButton*  btn_unapply_      = nullptr;
     QComboBox*    combo_theme_      = nullptr;
     QButtonGroup* mode_group_       = nullptr;
 
