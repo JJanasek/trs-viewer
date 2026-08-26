@@ -15,10 +15,12 @@
 #include <QTabBar>
 
 #include <deque>
+#include <functional>
 #include <memory>
 #include <vector>
 
 class QVBoxLayout;
+struct ChainStep;
 
 // ---------------------------------------------------------------------------
 // Snapshot of mutable per-dataset state, used for undo.
@@ -111,6 +113,7 @@ private slots:
     void onUndoAction();
     void onToggleTile(bool on);
     void onTabMoved(int from, int to);
+    void onChainEditor();
 
 private:
     void setupMenuBar();
@@ -123,6 +126,13 @@ private:
     void saveSnapshot();
     void restoreSnapshot(DatasetSnapshot snap);
     void updateUndoButton();
+
+    // Switches the active plot's interaction mode back to Pan and re-checks
+    // the "Pan" toolbar button (unchecking "↔ Align"/Measure/Box Zoom via
+    // their shared exclusive QButtonGroup) — called by both "⟳ Reset" and
+    // "Load / Refresh"/"Un-apply Shifts" so a leftover Align/Measure/Box
+    // Zoom mode from before doesn't silently carry over into the fresh view.
+    void resetInteractionModeToPan();
 
     // Warms a freshly-opened (lazily memory-mapped) file's page cache with a
     // cancellable, byte-progress QProgressDialog. Only shows the dialog if
@@ -157,6 +167,40 @@ private:
     // the pipeline was when alignment was applied. No-op for file-backed or
     // unaligned/result tabs.
     void rebakeAlignedView();
+
+    // Builds and shows the Align Traces dialog — the actual implementation
+    // behind the onAlignTraces() slot. Split out so the Chain Editor's
+    // "Align Traces…" add-step action can open the very same interactive
+    // dialog (drag-on-plot region, Run, results table) instead of a blind
+    // parameter form: pass a non-null onAddToChain and "Apply to Main View"
+    // additionally captures its just-used parameters into a ChainStep and
+    // hands it to the callback, on top of its normal behavior. Passing
+    // nullptr (the plain onAlignTraces() case) leaves that button unchanged.
+    void showAlignDialog(std::function<void(const ChainStep&)> onAddToChain = nullptr);
+
+    // Reads `shifts` into `count` (up to `max_display`) baked, aligned
+    // traces on `pw` — raw sample window per shifts[i]/output_mode
+    // (0=avg-pad,1=zero-pad,2=crop), pipeline applied same as the rest of
+    // the app. Shared by Align Traces' "Show in New Window"/"Apply to Main
+    // View" and the Chain "Align" step. Returns false (and shows a warning
+    // on msg_parent) if crop mode leaves no common range, or the user
+    // declines a large-allocation warning.
+    bool buildAlignedTraces(PlotWidget* pw, const std::vector<int32_t>& shifts,
+                             int32_t first_tr, int output_mode, int max_display,
+                             QWidget* msg_parent);
+
+    // Commits an already-computed shifts vector as the active dataset's
+    // alignment (saveSnapshot + align_first_trace/align_shifts/etc.) and
+    // bakes a NUM_COLORS-trace preview into the main plot — exactly what
+    // Align Traces' "Apply to Main View" button does, factored out so the
+    // Chain "Align" step can reuse it after running alignByPeak/alignByXCorr
+    // itself. Returns false (with err set) if buildAlignedTraces fails.
+    bool computeAndStoreAlignment(const std::vector<int32_t>& shifts, int32_t first_tr,
+                                   int output_mode, QWidget* msg_parent, QString& err);
+
+    // Executes one Chain step against the active dataset. Returns false
+    // (with err set) on failure; the Chain Editor's Run loop stops there.
+    bool runChainStep(const ChainStep& step, QWidget* msg_parent, QString& err);
 
     // Multi-dataset state
     std::vector<Dataset> datasets_;
