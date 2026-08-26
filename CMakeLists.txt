@@ -62,6 +62,8 @@ set(SOURCES
     src/ttest.cpp
     src/xcorr.cpp
     src/align.cpp
+    src/chain.cpp
+    inc/chain.h
     src/heatmap_widget.cpp
     inc/mainwindow.h
     inc/plot_widget.h
@@ -90,6 +92,7 @@ target_include_directories(trs-viewer PRIVATE src inc ${Python3_NumPy_INCLUDE_DI
 
 target_compile_options(trs-viewer PRIVATE
     -O2
+    -g
     -Wall
     -Wextra
     -Wno-unused-parameter

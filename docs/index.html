@@ -1,0 +1,646 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>trs-viewer — Documentation</title>
+<meta name="description" content="Interactive power-trace viewer and side-channel analysis toolkit for Riscure .trs files and NumPy trace sets.">
+<link rel="icon" type="image/svg+xml" href="logo.svg">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="topbar">
+  <img src="logo.svg" alt="">
+  <strong>trs-viewer</strong>
+  <button id="navToggle" aria-label="Toggle navigation">☰ Menu</button>
+</div>
+
+<div class="layout">
+  <aside class="sidebar" id="sidebar">
+    <div class="brand">
+      <img src="logo.svg" alt="">
+      <strong>trs-viewer</strong>
+    </div>
+    <p class="brand-tagline">Power-trace viewer &amp; side-channel analysis toolkit</p>
+
+    <button class="theme-toggle" id="themeToggle">🌗 Toggle theme</button>
+
+    <nav class="toc">
+      <div class="group-title">Features</div>
+      <ul>
+        <li><a href="#trace-viewing">Trace Viewing</a></li>
+        <li><a href="#signal-processing-pipeline">Processing Pipeline</a></li>
+        <li><a href="#trace-alignment">Trace Alignment</a></li>
+        <li><a href="#welch-t-test">Welch T-Test</a></li>
+        <li><a href="#cross-correlation-matrix">Cross-Correlation Matrix</a></li>
+        <li><a href="#cpa">Correlation Power Analysis</a></li>
+        <li><a href="#snr">Signal-to-Noise Ratio</a></li>
+        <li><a href="#static-snr">Static SNR</a></li>
+        <li><a href="#fft-spectrum">FFT Spectrum</a></li>
+        <li><a href="#heatmap-viewer">Heatmap Viewer</a></li>
+        <li><a href="#export-trs-npy-npz">Export TRS / NPY / NPZ</a></li>
+        <li><a href="#export-dataset">Export Dataset</a></li>
+        <li><a href="#range-editor">Range Editor</a></li>
+        <li><a href="#chain-editor">Chain Editor</a></li>
+        <li><a href="#npy-npz-support">NPY / NPZ Support</a></li>
+      </ul>
+
+      <div class="group-title">File Formats</div>
+      <ul>
+        <li><a href="#trs-format">TRS (Riscure Trace Set)</a></li>
+        <li><a href="#npy-format">NPY</a></li>
+        <li><a href="#npz-format">NPZ</a></li>
+      </ul>
+
+      <div class="group-title">Setup</div>
+      <ul>
+        <li><a href="#dependencies">Dependencies</a></li>
+        <li><a href="#installation">Installation</a></li>
+        <li class="sub"><a href="#linux">— Linux</a></li>
+        <li class="sub"><a href="#windows-wsl">— Windows (WSL)</a></li>
+        <li class="sub"><a href="#macos">— macOS</a></li>
+      </ul>
+
+      <div class="group-title">Usage</div>
+      <ul>
+        <li><a href="#opening-a-file">Opening a file</a></li>
+        <li><a href="#navigating-traces">Navigating traces</a></li>
+        <li><a href="#interaction-modes">Interaction modes</a></li>
+        <li><a href="#usage-pipeline">Processing pipeline</a></li>
+        <li><a href="#exporting">Exporting</a></li>
+      </ul>
+
+      <div class="group-title">Reference</div>
+      <ul>
+        <li><a href="#project-layout">Project Layout</a></li>
+      </ul>
+    </nav>
+
+    <a class="gh-link" href="https://github.com/JJanasek/trs-viewer" target="_blank" rel="noopener">↗ Source on GitHub</a>
+  </aside>
+
+  <main>
+    <div class="content">
+
+      <div class="hero">
+        <h1>trs-viewer</h1>
+        <p class="lead">Interactive power-trace viewer and side-channel analysis toolkit for Riscure <code>.trs</code> files and NumPy trace sets.</p>
+        <div class="badges">
+          <img src="https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-blue" alt="Platform: Linux | macOS | Windows">
+          <img src="https://img.shields.io/badge/C%2B%2B-17-blue" alt="C++17">
+          <img src="https://img.shields.io/badge/Qt-6%20%7C%205-green" alt="Qt 6 | 5">
+        </div>
+      </div>
+
+      <h2 id="trace-viewing">Trace Viewing</h2>
+      <ul>
+        <li>Load <code>.trs</code> power-trace files (Riscure format) <strong>or</strong> NumPy <code>.npy</code> / <code>.npz</code> trace matrices</li>
+        <li>Multi-trace overlay with 8 distinct colours</li>
+        <li>Pan · box-zoom · distance-measurement interaction modes</li>
+        <li><strong>Y-axis zoom</strong> — Ctrl+scroll (or Shift+scroll) to compress/expand amplitude</li>
+        <li>Dark and light themes</li>
+        <li><strong>Multiple datasets at once</strong> — every opened file gets its own tab. Drag tabs to reorder them, or hit <strong>⬒ Tile Tabs</strong> to show them side by side and compare traces across files</li>
+        <li><strong>Stacked view</strong> (<strong>☰ Stack</strong>) — draw each trace in its own non-overlapping lane instead of overlaying them all; independent of the interaction mode</li>
+        <li><strong>Undo</strong> (Ctrl+Z) — steps back through pipeline edits, alignment and trace-range changes</li>
+        <li>Crop ranges — mark sample regions and export as a new <code>.trs</code> file (see <a href="#range-editor">Range Editor</a>)</li>
+      </ul>
+      <p>The side panel shows file metadata (trace count, samples/trace, sample type, data bytes/trace) and a <strong>per-trace data inspector</strong> — use the spin box to step through traces and see their auxiliary data bytes as a hex dump. If no data bytes are present, the inspector shows <code>(no data)</code>. When the file carries the optional <code>LEGACY_DATA</code> parameter (see below), the bytes are decoded automatically as <code>PT</code> / <code>CT</code> pairs.</p>
+      <img class="shot" src="trace_browser.gif" alt="Trace browser and pipeline" loading="lazy">
+
+      <h2 id="signal-processing-pipeline">Signal Processing Pipeline</h2>
+      <p>Transforms stack in order and are applied live on every render and on all SCA computations:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Transform</th><th>Parameters</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td>Absolute Value</td><td>—</td><td><code>|x|</code> point-wise</td></tr>
+            <tr><td>Negate</td><td>—</td><td><code>-x</code> point-wise</td></tr>
+            <tr><td>Offset</td><td>constant</td><td>Add a constant to every sample</td></tr>
+            <tr><td>Scale</td><td>factor</td><td>Multiply every sample</td></tr>
+            <tr><td>Moving Average</td><td>window size</td><td>Causal sliding-window mean. The first <code>window − 1</code> output samples are a startup transient and are skipped when resetting the view</td></tr>
+            <tr><td>Window Resample</td><td>window size, overlap</td><td>Sliding-window mean advancing by <code>hop = window × (1 − overlap)</code>. <code>overlap = 0</code> is plain non-overlapping block decimation; <code>overlap → 1</code> makes consecutive windows nearly identical (hop is clamped to ≥ 1)</td></tr>
+            <tr><td>Stride Resample</td><td>stride</td><td>Keep every N-th sample — output is <code>ceil(N / stride)</code> samples</td></tr>
+            <tr><td>FFT Magnitude</td><td>window function</td><td>One-sided amplitude spectrum, <code>N/2 + 1</code> bins. Normalised by <code>N</code> with non-DC/Nyquist bins doubled, so the output is in the same amplitude units as the input</td></tr>
+            <tr><td>STFT Magnitude</td><td>window size, hop <em>or</em> overlap, window function</td><td>Short-Time Fourier Transform — each window's spectrum concatenated, giving <code>num_windows × (window/2 + 1)</code> samples. Intended for frequency-domain CPA</td></tr>
+            <tr><td>Gaussian Noise</td><td>relative σ</td><td>Adds i.i.d. <code>N(0, (σ × trace_std)²)</code>. σ is <em>relative</em> to each trace's own standard deviation, so the effect is scale-independent across trace sets</td></tr>
+            <tr><td>Biquad Filter</td><td>type, cutoff, Q</td><td>2nd-order IIR filter (RBJ "Audio EQ Cookbook" formulas, Direct Form II Transposed). Types: lowpass · highpass · bandpass · notch</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p><strong>Window functions</strong> (FFT and STFT): Rectangular · Hann · Hamming · Blackman.</p>
+      <div class="callout"><strong>Biquad cutoff is normalised</strong> — it is a fraction of Nyquist in <code>(0, 1)</code>, not Hz, because TRS files do not reliably carry a real sample rate. <code>0.1</code> means "10&nbsp;% of Nyquist"; on a 1&nbsp;GS/s capture that is 50&nbsp;MHz, but the filter only ever sees the ratio. For lowpass/highpass, <code>Q ≈ 0.707</code> is the maximally-flat Butterworth response; for bandpass/notch, higher Q means a narrower band.</div>
+      <p>Transforms that carry state between samples (moving average, both resamplers, the filter, FFT/STFT) are marked <em>sequential</em> internally and force the renderer to read samples in order rather than striding.</p>
+
+      <h2 id="trace-alignment">Trace Alignment</h2>
+      <div class="menu-path">SCA → Align Traces…</div>
+      <p>Align a set of traces to a reference using one of two methods:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Method</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Cross-correlation</strong></td><td>Finds the shift that maximises the normalised cross-correlation with the reference trace</td></tr>
+            <tr><td><strong>Peak alignment</strong></td><td>Aligns the highest-amplitude peak of each trace to the reference peak</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Configure:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Setting</th><th>Meaning</th></tr></thead>
+          <tbody>
+            <tr><td><strong>First trace / Count</strong></td><td>The set of traces to align</td></tr>
+            <tr><td><strong>Reference trace</strong></td><td>Absolute trace index used as the alignment template</td></tr>
+            <tr><td><strong>Reference region first / length</strong></td><td>The window <em>within</em> the reference that is matched against, in pipeline-processed samples</td></tr>
+            <tr><td><strong>Search half-window ±</strong></td><td>How far each trace may be shifted while searching</td></tr>
+            <tr><td><strong>Peak mode</strong></td><td>For peak alignment: absolute max <code>|v|</code> or signed max</td></tr>
+            <tr><td><strong>Discard below correlation</strong></td><td>Optionally drop traces whose best correlation falls under a threshold</td></tr>
+            <tr><td><strong>Output mode</strong></td><td>Full trace padded with the trace average · full trace padded with zeros · crop to the common range</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Results are shown in a table and previewed in a separate plot. Click <strong>Apply to Main View</strong> to bake the aligned traces into the main display, or <strong>Un-apply Shifts</strong> to return to the live file-backed view — the computed shifts are kept for later reuse either way.</p>
+      <p>Alternatively, use the <strong>↔ Align</strong> drag mode in the main toolbar — drag any trace left or right to manually shift it one sample at a time.</p>
+      <p>Once alignment is applied (either method), the stored shifts are available to all SCA tools. Every SCA dialog shows an <strong>"Apply last alignment shifts"</strong> checkbox (pre-ticked when shifts are available) that locks the trace/sample range to the aligned values and applies per-trace shifts during analysis. Alignment state is automatically cleared when a new file is loaded or the trace set is changed.</p>
+
+      <h2 id="welch-t-test">Welch T-Test</h2>
+      <div class="menu-path">SCA → Run Welch T-Test…</div>
+      <p>Computes the per-sample Welch t-statistic between two trace groups. No special header fields are required — group assignment is configured in the dialog by choosing which data byte to use as the group label (0 = group 0, non-zero = group 1). If the file's parameter map contains a <code>ttest</code> entry, its <code>offset</code> field is used automatically and the byte selector is hidden.</p>
+      <p><strong>Result dialog features:</strong></p>
+      <ul>
+        <li>Adjustable ±threshold line (orange dashed)</li>
+        <li><strong>One-sided mode</strong> — show only the positive threshold (for abs-preprocessed signals)</li>
+        <li><strong>Calc TH…</strong> — significance-threshold calculator. The per-sample level for an overall type-I error rate α over <code>n_L</code> samples uses the <strong>Šidák</strong> correction <code>α_TH = 1 − (1 − α)^(1/n_L)</code>, and the threshold is <code>TH = CDF_t⁻¹(1 − α_TH/2, ν̂)</code> with Welch–Satterthwaite degrees of freedom computed from the trace data. The dialog reports both the median and approximate ν̂. Follows Zhang, Ding, Durvaux, Standaert &amp; Fei, <em>Towards Sound and Optimal Leakage Detection Procedure</em> (IACR ePrint 2017/287, EuroS&amp;P 2018)</li>
+        <li><strong>Style…</strong> — set plot title, line width, trace colour, dark/light theme</li>
+        <li><strong>Export PDF…</strong> — A4 landscape vector PDF</li>
+        <li>Export result as <code>.npy</code> or <code>.trs</code></li>
+      </ul>
+      <p><strong>SCA → Load T-Test NPY…</strong> — load a pre-computed 1-D <code>float32</code> t-statistic vector.</p>
+      <img class="shot" src="ttest_export.gif" alt="T-test result and PDF export" loading="lazy">
+
+      <h2 id="cross-correlation-matrix">Cross-Correlation Matrix</h2>
+      <div class="menu-path">SCA → Cross-Correlation…</div>
+      <p>Computes the M×M normalised Pearson correlation matrix <code>C[i,j] = Corr(sᵢ, sⱼ)</code>, or a rectangular search×ref matrix for template matching.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Method</th><th>Description</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Baseline</strong></td><td>Streaming rank-1 outer-product updates</td></tr>
+            <tr><td><strong>Dual Matrix</strong></td><td>Gram <code>G = AᵀA / M</code> → eigen-reconstruction</td></tr>
+            <tr><td><strong>MP-Cleaned</strong></td><td>Dual Matrix + zeroes eigenvalues ≤ λ₊ (Marchenko-Pastur noise edge)</td></tr>
+            <tr><td><strong>Two-Window</strong></td><td>Rectangular search×ref cross-correlation for template matching</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>A <strong>stride</strong> parameter subsamples before computing (<code>M = ⌈samples / stride⌉</code>) to reduce memory and computation time.</p>
+      <img class="shot" src="heatmap.gif" alt="Cross-correlation heatmap" loading="lazy">
+
+      <h2 id="cpa">Correlation Power Analysis (CPA)</h2>
+      <div class="menu-path">SCA → CPA…</div>
+      <p>CPA correlates a user-defined leakage model with every sample column of the trace matrix and ranks the results across M hypotheses. The correlation engine uses an online accumulator — the full trace matrix is never held in RAM, making it practical for large trace sets.</p>
+      <p><strong>Configuration:</strong></p>
+      <ul>
+        <li>Trace range and sample range</li>
+        <li><strong>M (hypotheses)</strong> — number of key guesses to test (1–65536); for AES key byte attacks use 256, for direct data correlation set M to the data field length</li>
+        <li><strong>Alignment</strong> — apply stored alignment shifts</li>
+      </ul>
+      <p><strong>Leakage model editor:</strong></p>
+      <ul>
+        <li>Python code editor with syntax highlighting and boilerplate (AES S-box + Hamming weight)</li>
+        <li><strong>Test Model</strong> — runs the model against the loaded trace data and shows the output; CPA can only be launched after a successful test</li>
+        <li><strong>Load / Save</strong> — import or export <code>.py</code> model files</li>
+        <li><strong>Model library</strong> — persistent library at <code>~/.local/share/trs-viewer/models/</code>; use the <strong>Library</strong> drop-down to load saved models, <strong>Save to library…</strong> to store new ones</li>
+      </ul>
+      <p>Model function signature:</p>
+      <pre><code>def get_leakages(data: np.ndarray, hypothesis: int) -&gt; np.ndarray:
+    """
+    data       — uint8 array, shape (n_traces, data_length)
+    hypothesis — current key hypothesis (0 .. M-1)
+    returns    — float32 array, shape (n_traces,)
+    """</code></pre>
+      <p>For direct data correlation (no key model), set M to the data field length and use <code>hypothesis</code> as a byte index:</p>
+      <pre><code>def get_leakages(data, hypothesis):
+    return data[:, hypothesis].astype(np.float32)</code></pre>
+      <p>For LEGACY_DATA files (PT+CT in 32 bytes), correlate against plaintext byte <code>b</code> by setting M = 16 and indexing into the first half:</p>
+      <pre><code>def get_leakages(data, hypothesis):
+    # hypothesis = byte index 0..15 into plaintext
+    return data[:, hypothesis].astype(np.float32)</code></pre>
+      <p>Or against ciphertext (offset 16):</p>
+      <pre><code>def get_leakages(data, hypothesis):
+    return data[:, 16 + hypothesis].astype(np.float32)</code></pre>
+      <p><strong>Result window:</strong></p>
+      <ul>
+        <li>Heatmap of the M × N_samples correlation matrix</li>
+        <li><strong>Top candidates</strong> table — ranked by peak |r|, showing hypothesis value, hex (M ≤ 256), peak correlation, and sample index</li>
+      </ul>
+
+      <h2 id="snr">Signal-to-Noise Ratio</h2>
+      <div class="menu-path">SCA → SNR…</div>
+      <p>Per-sample SNR — <code>SNR[s] = Var(E[T[s] | class]) / E[Var(T[s] | class)]</code> — computed with an online accumulator, so trace count is not bounded by RAM.</p>
+      <p>Class labels are derived from one auxiliary data byte:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Class mode</th><th>Classes</th></tr></thead>
+          <tbody>
+            <tr><td>Raw byte value</td><td>256 (0–255)</td></tr>
+            <tr><td>Hamming weight</td><td>9 (0–8)</td></tr>
+            <tr><td>AES S-box output</td><td>256</td></tr>
+            <tr><td>AES S-box output — Hamming weight</td><td>9</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The two S-box modes take a <strong>key byte hypothesis</strong> and label each trace by <code>S-box(data_byte ⊕ key)</code>, so a correct hypothesis produces a sharper SNR peak. Requires a file with per-trace data bytes.</p>
+      <p>Accumulator memory is <code>2 × classes × samples × 8</code> bytes; the dialog estimates it up front and asks before allocating anything large.</p>
+
+      <h2 id="static-snr">Static SNR</h2>
+      <div class="menu-path">SCA → Static SNR |μ/σ|…</div>
+      <p>Per-sample <code>|mean / standard deviation|</code> across the selected traces — no class labels and no data bytes required. A quick way to see which regions of a trace carry stable structure versus noise. The result window reports min/max/average and exports to <code>.npy</code> or PDF.</p>
+
+      <h2 id="fft-spectrum">FFT Spectrum</h2>
+      <div class="menu-path">SCA → FFT Spectrum…</div>
+      <p>Averaged one-sided spectrum over a range of traces.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Setting</th><th>Options</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Window function</strong></td><td>None (rectangular) · Hann · Hamming · Blackman</td></tr>
+            <tr><td><strong>Output</strong></td><td>Magnitude · Magnitude (dB) · Phase (rad)</td></tr>
+            <tr><td><strong>Min/max envelope</strong></td><td>Overlay the per-bin minimum and maximum alongside the average</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Unlike the <em>FFT Magnitude</em> pipeline transform — which replaces the traces themselves so downstream SCA runs in the frequency domain — this is a read-only measurement view.</p>
+
+      <h2 id="heatmap-viewer">Heatmap Viewer</h2>
+      <p>Interactive false-colour heatmap for correlation matrices:</p>
+      <ul>
+        <li>Pan (drag) · zoom (scroll wheel)</li>
+        <li>Adjustable colour range</li>
+        <li><strong>Colour schemes</strong>: RdBu · Grayscale · Hot · Viridis · Plasma · Lukasz</li>
+        <li><strong>Gaussian blur</strong> for pattern smoothing</li>
+        <li><strong>Abs value</strong> mode and <strong>binary threshold</strong> on <code>|v|</code></li>
+        <li>Export as PNG or <code>.npy</code></li>
+      </ul>
+
+      <h2 id="export-trs-npy-npz">Export TRS / NPY / NPZ</h2>
+      <div class="menu-path">Export → Export TRS… / Export traces as NPY… / Export traces as NPZ…</div>
+      <p>Each writes out the currently-configured pipeline applied to a chosen trace range:</p>
+      <ul>
+        <li><strong>Export TRS</strong> preserves the source file's original sample coding — an <code>int16</code> file re-exported after processing stays <code>int16</code> (rounded and clamped to range, rather than silently forced to <code>float32</code> and doubling in size). NPY/NPZ are always <code>float32</code>, per the format.</li>
+        <li><strong>Apply last alignment shifts</strong> — shown whenever the active dataset has a stored alignment (from <a href="#trace-alignment">Trace Alignment</a> or a Chain's Align step), ticked by default. Each trace is read with its stored shift applied and zero-padded at the boundary it introduces; traces marked discarded (below the alignment's correlation threshold) are dropped from the output entirely rather than exported unshifted.</li>
+      </ul>
+
+      <h2 id="export-dataset">Export Dataset</h2>
+      <div class="menu-path">Export → Export Dataset (NPZ)…</div>
+      <p>Writes an NPZ holding the processed trace matrix plus <strong>any number of named label arrays derived from the auxiliary data bytes</strong> — the machine-learning-friendly counterpart to plain NPZ export, which can only dump the raw data block.</p>
+      <p>Each label is defined by a byte offset, a byte count and an extraction type:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Label type</th><th>Produces</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Raw value</strong></td><td>The bytes read as an integer (endianness selectable)</td></tr>
+            <tr><td><strong>Hamming weight</strong></td><td>Popcount over the selected bytes</td></tr>
+            <tr><td><strong>Bit</strong></td><td>A single bit (0 = LSB) as 0/1</td></tr>
+            <tr><td><strong>Bit range</strong></td><td>An inclusive low–high bit slice, read as an integer</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>dtype is chosen automatically from the width — 1 byte → <code>uint8</code>, 2 → <code>uint16</code>, 3–4 → <code>uint32</code>, 5–8 → <code>uint64</code>; Hamming weight and single-bit labels are always <code>uint8</code>. Each label becomes an array named after the label inside the archive, alongside <code>traces</code>. Label definitions are pre-populated from the file's TRS parameter map where one is present, and the dialog estimates the output matrix size before writing.</p>
+
+      <h2 id="range-editor">Range Editor</h2>
+      <div class="menu-path">Crop → Range Editor…</div>
+      <p>Mark sample regions and write them out as a new <code>.trs</code>.</p>
+      <ul>
+        <li><strong>Enable drag-select on plot</strong>, then drag to add ranges — or click <strong>Add current view</strong> to capture whatever the plot is currently showing</li>
+        <li><strong>Repeat selected range</strong> — takes the selected range as a base window and stamps out <code>count − 1</code> further copies, <code>period</code> samples apart. Built for marking every occurrence of a repeating operation (AES rounds, say) after hand-picking one</li>
+        <li>Ranges are <strong>concatenated per trace</strong> on export by default. Tick <strong>Export ranges separately</strong> to emit one output trace per range instead — this requires every range to be the same length</li>
+        <li>The dialog keeps a running total of selected samples and ranges</li>
+      </ul>
+
+      <h2 id="chain-editor">Chain Editor</h2>
+      <div class="menu-path">Chain → Chain Editor…</div>
+      <p>A <strong>chain</strong> is a saved, ordered sequence of operations — build it once, then run it with one click instead of redoing the same dialogs by hand every time. Chains are stored as JSON and can be loaded back later, so a whole workflow (add helper transforms → align → strip the helper transforms → reload the raw traces with the shift still applied → export) becomes one button.</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Step kind</th><th>Effect</th></tr></thead>
+          <tbody>
+            <tr><td><strong>Add Transform</strong></td><td>Append a configured transform to the pipeline. Opens the same per-type parameter dialog as adding one normally</td></tr>
+            <tr><td><strong>Clear Pipeline</strong></td><td>Empty the transform pipeline</td></tr>
+            <tr><td><strong>Align</strong></td><td>Run alignment and store the result. Opens the real, interactive Align Traces dialog (drag-on-plot region, <strong>Run</strong>, results table) — its <strong>Apply to Main View + Add to Chain</strong> button bakes the alignment as usual <em>and</em> captures the exact parameters that just worked into the step</td></tr>
+            <tr><td><strong>Reload</strong></td><td>Re-read traces live from the file, over the stored alignment's own trace range if one exists — this is what makes "align on a processed view, then export the raw traces with the same shift" possible</td></tr>
+            <tr><td><strong>Export</strong></td><td>Write the current traces (TRS / NPY / NPZ), with the same range and <strong>Apply last alignment shifts</strong> option as the standalone export dialogs. Give it a fixed output path or leave it blank to be prompted each run</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The Align step is deliberately <em>not</em> a blind parameter form — remembering a good reference region or correlation threshold without seeing it applied is hard, so building the step means actually running alignment against the current view first, then capturing what worked.</p>
+      <div class="callout">Steps run against whichever dataset is active when you click <strong>Run</strong> — a chain has no "open file" step of its own (yet).</div>
+
+      <h2 id="npy-npz-support">NPY / NPZ Support</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Action</th><th>Menu</th></tr></thead>
+          <tbody>
+            <tr><td>Open <code>.npy</code> or <code>.npz</code> as traces</td><td><strong>File → Open NPY/NPZ as traces…</strong></td></tr>
+            <tr><td>Export traces (pipeline applied) to <code>.npy</code></td><td><strong>Export → Export traces as NPY…</strong></td></tr>
+            <tr><td>Export traces + data bytes to <code>.npz</code></td><td><strong>Export → Export traces as NPZ…</strong></td></tr>
+            <tr><td>Export traces + derived labels to <code>.npz</code></td><td><strong>Export → Export Dataset (NPZ)…</strong></td></tr>
+            <tr><td>Load pre-computed 1-D t-test vector</td><td><strong>SCA → Load T-Test NPY…</strong></td></tr>
+            <tr><td>Load pre-computed 2-D heatmap matrix</td><td><strong>SCA → Load Heatmap NPY…</strong></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="trs-format">TRS (Riscure Trace Set)</h2>
+      <p>Standard Riscure TRS v1 format. The file begins with a sequence of TLV header tags followed by the trace data. Each trace contains optional auxiliary data bytes followed by the sample block.</p>
+      <p>Supported sample types:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Type tag</th><th>C type</th><th>Bytes/sample</th></tr></thead>
+          <tbody>
+            <tr><td><code>0x01</code></td><td><code>int8_t</code></td><td>1</td></tr>
+            <tr><td><code>0x02</code></td><td><code>int16_t</code></td><td>2</td></tr>
+            <tr><td><code>0x04</code></td><td><code>int32_t</code></td><td>4</td></tr>
+            <tr><td><code>0x14</code></td><td><code>float32</code></td><td>4</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Traces are read on demand — the full file is never loaded into RAM.</p>
+      <p><strong>Auxiliary data bytes</strong> (per trace, optional): arbitrary bytes attached to each trace — typically plaintext, ciphertext, key material, or any other per-trace metadata. Their presence is not required; trs-viewer works fine without them. When present, they are used by the t-test for group assignment and fed as the <code>data</code> matrix to the CPA leakage model. If the header parameter map contains a <code>ttest</code> key, its <code>offset</code> field selects the group byte for the t-test automatically.</p>
+
+      <h3 id="legacy-data">LEGACY_DATA (optional)</h3>
+      <p>Riscure's older trace sets may store cryptographic I/O in a fixed 32-byte layout, advertised via a TRS parameter map entry with key <code>LEGACY_DATA</code>, <code>offset = 0</code>, <code>length = 32</code>. This field is entirely optional — trs-viewer auto-detects it and changes the data display, but will load and analyse any TRS file regardless of whether it is present.</p>
+      <pre><code>bytes  0–15   plaintext  (PT)
+bytes 16–31   ciphertext (CT)</code></pre>
+      <p>When trs-viewer detects this parameter, the data inspector in the side panel displays the bytes with <code>PT:</code> and <code>CT:</code> labels instead of a raw hex dump. The bytes are still passed as-is to the CPA leakage model — <code>data[:, 0:16]</code> is the plaintext, <code>data[:, 16:32]</code> is the ciphertext.</p>
+      <p>Generating a compatible TRS file in Python (e.g. with the <code>trsfile</code> library):</p>
+      <pre><code>import trsfile, numpy as np
+
+traces = np.random.randn(1000, 5000).astype(np.float32)
+keys   = np.random.randint(0, 256, (1000, 16), dtype=np.uint8)
+
+with trsfile.open("out.trs", "w", trs_version=1,
+                  num_samples=5000, sample_coding=trsfile.SampleCoding.FLOAT) as ts:
+    for t, k in zip(traces, keys):
+        ts.append(trsfile.Trace(trsfile.SampleCoding.FLOAT, t, data=bytes(k)))</code></pre>
+
+      <h2 id="npy-format">NPY</h2>
+      <p>A 2-D NumPy array file:</p>
+      <ul>
+        <li><strong>dtype</strong>: <code>float32</code> (<code>&lt;f4</code>, little-endian)</li>
+        <li><strong>shape</strong>: <code>(n_traces, n_samples)</code></li>
+      </ul>
+      <pre><code>import numpy as np
+traces = np.random.randn(1000, 5000).astype(np.float32)
+np.save("traces.npy", traces)</code></pre>
+
+      <h2 id="npz-format">NPZ</h2>
+      <p>A NumPy ZIP archive with one or two arrays:</p>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Array key</th><th>dtype</th><th>shape</th><th>Required</th></tr></thead>
+          <tbody>
+            <tr><td><code>traces</code></td><td><code>float32</code></td><td><code>(n_traces, n_samples)</code></td><td>Yes</td></tr>
+            <tr><td><code>data</code></td><td><code>uint8</code></td><td><code>(n_traces, data_length)</code></td><td>No — needed for CPA and t-test</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>The archive must use <strong>STORE</strong> compression (no deflate):</p>
+      <pre><code>import numpy as np
+traces = np.random.randn(1000, 5000).astype(np.float32)
+data   = np.random.randint(0, 256, (1000, 16), dtype=np.uint8)
+np.savez("traces.npz", traces=traces, data=data)
+# np.savez uses STORE by default — do NOT use np.savez_compressed</code></pre>
+      <p>The <code>data</code> array feeds the CPA leakage model and the t-test group assignment, equivalent to the auxiliary data bytes in a TRS file.</p>
+
+      <h2 id="dependencies">Dependencies</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Dependency</th><th>Version</th><th>Notes</th></tr></thead>
+          <tbody>
+            <tr><td>CMake</td><td>≥ 3.16</td><td>Build system</td></tr>
+            <tr><td>C++ compiler</td><td>C++17</td><td>GCC 9+, Clang 10+, MSVC 2019+</td></tr>
+            <tr><td>Qt</td><td>6.x (5.x fallback)</td><td>Core · Gui · Widgets · PrintSupport</td></tr>
+            <tr><td>OpenMP</td><td>any</td><td>Parallelises correlation computation</td></tr>
+            <tr><td>Eigen3</td><td>≥ 3.3</td><td>Linear algebra; auto-downloaded if not found</td></tr>
+            <tr><td>Python3</td><td>≥ 3.8</td><td>CPA leakage model evaluation</td></tr>
+            <tr><td>NumPy</td><td>any</td><td>Required for CPA model I/O</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="installation">Installation</h2>
+      <p>trs-viewer is built from source with CMake. Pick your platform below.</p>
+
+      <h3 id="linux">Linux</h3>
+      <p><strong>1 · Install dependencies</strong></p>
+      <p>Arch Linux:</p>
+      <pre><code>sudo pacman -S base-devel cmake qt6-base eigen python python-numpy</code></pre>
+      <p>Ubuntu / Debian (22.04+):</p>
+      <pre><code>sudo apt install build-essential cmake qt6-base-dev libeigen3-dev \
+                 python3-dev python3-numpy</code></pre>
+      <p>Fedora:</p>
+      <pre><code>sudo dnf install gcc-c++ cmake qt6-qtbase-devel qt6-qtsvg-devel eigen3-devel \
+                 python3-devel python3-numpy</code></pre>
+      <p><strong>2 · Clone and build</strong></p>
+      <pre><code>git clone &lt;repo-url&gt;
+cd trs-viewer
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)</code></pre>
+      <p>Binary is at <code>build/trs-viewer</code>.</p>
+      <p><strong>3 · Run</strong></p>
+      <pre><code>./build/trs-viewer                    # file picker on startup
+./build/trs-viewer path/to/file.trs   # open directly
+./build/trs-viewer traces.npz         # open NPZ directly</code></pre>
+
+      <h3 id="windows-wsl">Windows (via WSL)</h3>
+      <p>The project uses GCC-style compiler flags and is easiest to build on Windows through <strong>WSL</strong> (Windows Subsystem for Linux) — you get a real Linux userspace and can follow the Ubuntu instructions almost verbatim. GUI apps display on the Windows desktop automatically via <strong>WSLg</strong> (built into Windows 11 and recent Windows 10 updates).</p>
+      <p><strong>1 · Install WSL</strong></p>
+      <p>In an elevated (Administrator) PowerShell:</p>
+      <pre><code>wsl --install -d Ubuntu</code></pre>
+      <p>Reboot if prompted, then launch "Ubuntu" from the Start menu and finish the first-run setup (create a Unix username/password). If WSL is already installed but GUI apps don't appear, run <code>wsl --update</code> to make sure WSLg is current.</p>
+      <p><strong>2 · Install dependencies</strong></p>
+      <p>Inside the Ubuntu/WSL shell:</p>
+      <pre><code>sudo apt update
+sudo apt install build-essential cmake qt6-base-dev libeigen3-dev \
+                 python3-dev python3-numpy</code></pre>
+      <p><strong>3 · Clone and build</strong></p>
+      <pre><code>git clone &lt;repo-url&gt;
+cd trs-viewer
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)</code></pre>
+      <p>Binary is at <code>build/trs-viewer</code>.</p>
+      <p><strong>4 · Run</strong></p>
+      <pre><code>./build/trs-viewer</code></pre>
+      <p>The window opens on your Windows desktop via WSLg. Your Windows files are reachable from WSL under <code>/mnt/c/...</code> if you want to open <code>.trs</code> files stored outside the Linux filesystem.</p>
+
+      <h3 id="macos">macOS</h3>
+      <pre><code>brew install cmake qt@6 eigen python numpy
+export CMAKE_PREFIX_PATH="$(brew --prefix qt@6)"
+
+git clone &lt;repo-url&gt;
+cd trs-viewer
+
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(sysctl -n hw.ncpu)</code></pre>
+      <p>Binary is at <code>build/trs-viewer</code>.</p>
+
+      <h2 id="opening-a-file">Opening a file</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Method</th><th>How</th></tr></thead>
+          <tbody>
+            <tr><td>TRS file</td><td><strong>File → Open TRS file…</strong> (Ctrl+O) or command-line argument</td></tr>
+            <tr><td>NPY (2-D trace matrix)</td><td><strong>File → Open NPY/NPZ as traces…</strong></td></tr>
+            <tr><td>NPZ archive</td><td>same — looks for <code>traces</code> array + optional <code>data</code> array</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="navigating-traces">Navigating traces</h2>
+      <ol>
+        <li>Set <strong>First trace</strong> and <strong>Count</strong> in the side panel, click <strong>Load</strong>.</li>
+        <li>Scroll to zoom, drag to pan, <strong>R</strong> / <strong>Reset</strong> for full view.</li>
+        <li><strong>Ctrl+scroll</strong> or <strong>Shift+scroll</strong> — Y-axis amplitude zoom.</li>
+      </ol>
+
+      <h2 id="interaction-modes">Interaction modes</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>Button</th><th>Key</th><th>Action</th></tr></thead>
+          <tbody>
+            <tr><td>Pan</td><td>—</td><td>Drag to pan, scroll to zoom</td></tr>
+            <tr><td>Measure</td><td>P</td><td>Click two points — reads sample index, value, and delta</td></tr>
+            <tr><td>Box Zoom</td><td>Z</td><td>Drag a rectangle to zoom into it</td></tr>
+            <tr><td>Align</td><td>—</td><td>Drag a trace left/right to manually shift it</td></tr>
+            <tr><td>Crop Select</td><td>—</td><td>Drag to add a sample range to the crop list (enable from the Range Editor)</td></tr>
+            <tr><td>Stack</td><td>—</td><td>Toggle — draw each trace in its own lane rather than overlaid. Combines with any mode above</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Result windows (t-test, SNR, FFT, loaded NPY) carry their own smaller toolbar: <strong>Pan · Measure · ⬚ Zoom · ✂ Cut · Reset</strong>.</p>
+
+      <h2 id="usage-pipeline">Processing pipeline</h2>
+      <ol>
+        <li>Pick a transform from the drop-down and click <strong>+</strong>.</li>
+        <li>Reorder with <strong>↑ / ↓</strong>, remove with <strong>−</strong>.</li>
+        <li>Applied live on every render and on all SCA computations.</li>
+      </ol>
+
+      <h2 id="exporting">Exporting</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>What</th><th>Where</th></tr></thead>
+          <tbody>
+            <tr><td>Transformed traces → TRS</td><td><strong>Export → Export TRS…</strong></td></tr>
+            <tr><td>Trace matrix → NPY</td><td><strong>Export → Export traces as NPY…</strong></td></tr>
+            <tr><td>Trace matrix + data → NPZ</td><td><strong>Export → Export traces as NPZ…</strong></td></tr>
+            <tr><td>Trace matrix + named labels → NPZ</td><td><strong>Export → Export Dataset (NPZ)…</strong></td></tr>
+            <tr><td>Plot → PNG</td><td><strong>Export → Export plot as PNG…</strong> (Ctrl+Shift+S)</td></tr>
+            <tr><td>Plot → PDF</td><td><strong>Export → Export plot as PDF…</strong> or <strong>Export PDF…</strong> in result dialogs</td></tr>
+            <tr><td>Heatmap → PNG</td><td>"Export PNG…" in heatmap dialog</td></tr>
+            <tr><td>Heatmap → NPY</td><td>"Export .npy…" in heatmap dialog</td></tr>
+            <tr><td>T-test vector → NPY</td><td>"Export .npy…" in t-test dialog</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h2 id="project-layout">Project Layout</h2>
+      <pre><code>trs-viewer/
+├── CMakeLists.txt
+├── inc/
+│   ├── mainwindow.h
+│   ├── trs_file.h              # TRS + in-memory trace source
+│   ├── plot_widget.h           # Interactive trace plot
+│   ├── heatmap_widget.h        # Interactive correlation heatmap
+│   ├── processing.h            # ITransform pipeline
+│   ├── align.h                 # Trace alignment (xcorr + peak methods)
+│   ├── chain.h                 # Saveable/replayable operation chains
+│   ├── ttest.h                 # Welch t-test accumulator
+│   ├── snr.h                   # Online SNR accumulator
+│   ├── xcorr.h                 # Cross-correlation methods
+│   ├── cpa.h                   # Correlation Power Analysis
+│   ├── leakage_model.h         # Python leakage model wrapper
+│   └── leakage_model_dialog.h  # CPA model editor dialog
+└── src/
+    ├── main.cpp
+    ├── mainwindow.cpp          # Main window, dialogs, NPY/NPZ I/O
+    ├── trs_file.cpp            # TRS reader + openFromArray()
+    ├── plot_widget.cpp         # Rendering, interaction, PDF export
+    ├── heatmap_widget.cpp
+    ├── processing.cpp
+    ├── align.cpp
+    ├── chain.cpp               # Chain JSON persistence
+    ├── ttest.cpp
+    ├── snr.cpp
+    ├── xcorr.cpp               # Baseline · Dual · MP-Cleaned · Two-Window
+    ├── cpa.cpp                 # Online-accumulator CPA engine
+    ├── leakage_model.cpp       # Python C API wrapper
+    ├── leakage_model_dialog.cpp
+    └── cli/                    # Shared NPY I/O for the trs-cli front-end</code></pre>
+
+      <footer class="page-footer">
+        trs-viewer — built with Qt6 &amp; Eigen. <a href="https://github.com/JJanasek/trs-viewer" target="_blank" rel="noopener">Source on GitHub</a>.
+      </footer>
+
+    </div>
+  </main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // Theme toggle: cycles system → dark → light, persisted in localStorage.
+  var root = document.documentElement;
+  var stored = null;
+  try { stored = localStorage.getItem("trsviewer-docs-theme"); } catch (e) {}
+  if (stored === "dark" || stored === "light") root.setAttribute("data-theme", stored);
+
+  document.getElementById("themeToggle").addEventListener("click", function () {
+    var current = root.getAttribute("data-theme");
+    var next = current === "dark" ? "light" : (current === "light" ? null : "dark");
+    if (next) root.setAttribute("data-theme", next);
+    else root.removeAttribute("data-theme");
+    try {
+      if (next) localStorage.setItem("trsviewer-docs-theme", next);
+      else localStorage.removeItem("trsviewer-docs-theme");
+    } catch (e) {}
+  });
+
+  // Mobile nav toggle.
+  var sidebar = document.getElementById("sidebar");
+  document.getElementById("navToggle").addEventListener("click", function () {
+    sidebar.classList.toggle("open");
+  });
+  sidebar.querySelectorAll("a").forEach(function (a) {
+    a.addEventListener("click", function () { sidebar.classList.remove("open"); });
+  });
+
+  // Active-section highlighting.
+  var links = Array.prototype.slice.call(document.querySelectorAll("nav.toc a"));
+  var linkByHref = {};
+  links.forEach(function (a) { linkByHref[a.getAttribute("href").slice(1)] = a; });
+
+  var sections = Array.prototype.slice.call(document.querySelectorAll("main h2[id], main h3[id]"));
+  if ("IntersectionObserver" in window && sections.length) {
+    var current = null;
+    var observer = new IntersectionObserver(function (entries) {
+      entries.forEach(function (entry) {
+        if (!entry.isIntersecting) return;
+        var id = entry.target.getAttribute("id");
+        var link = linkByHref[id];
+        if (!link) return;
+        if (current) current.classList.remove("active");
+        link.classList.add("active");
+        current = link;
+      });
+    }, { rootMargin: "0px 0px -75% 0px", threshold: 0 });
+    sections.forEach(function (s) { observer.observe(s); });
+  }
+})();
+</script>
+
+</body>
+</html>
