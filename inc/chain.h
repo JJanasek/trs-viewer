@@ -25,7 +25,10 @@
 #include <vector>
 
 struct ChainStep {
-    enum class Kind { AddTransform, ClearPipeline, Align, Reload, Export };
+    enum class Kind {
+        AddTransform, ClearPipeline, Align, Reload, Export,
+        ExportShifts, LoadShifts, RunTTest,
+    };
     Kind kind = Kind::AddTransform;
 
     // --- AddTransform --------------------------------------------------
@@ -57,12 +60,22 @@ struct ChainStep {
     double  min_corr        = 0.5;   // XCorr only
     int     output_mode     = 0;     // 0 = avg-pad, 1 = zero-pad, 2 = crop
 
-    // --- Export ---------------------------------------------------------
+    // --- Export -----------------------------------------------------------
     int     export_format      = 0;  // 0 = TRS, 1 = NPY, 2 = NPZ
     int32_t exp_first          = 0;
     int32_t exp_count          = 0;
     bool    use_last_alignment = true;
     QString path;                    // empty => prompt via QFileDialog when this step runs
+    // ExportShifts/LoadShifts also use `path` (same empty-means-prompt rule);
+    // ExportShifts writes activeDs().align_shifts, LoadShifts sets it.
+
+    // --- RunTTest (mirrors onRunTTest()'s parameter set; reuses
+    //     first_trace/trace_count above for the trace range, and
+    //     use_last_alignment above for its own alignment checkbox) --------
+    int64_t ttest_first_sample = 0;
+    int64_t ttest_n_samples    = 0;  // 0 = all
+    int32_t ttest_byte_idx     = 0;  // ignored when the file has a "ttest" param
+    bool    ttest_abs          = false; // report |t| instead of the signed t-statistic
 
     // One-line label for the Chain Editor's step list.
     QString summary() const;
