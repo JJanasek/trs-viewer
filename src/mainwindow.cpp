@@ -3329,7 +3329,176 @@ void MainWindow::onExportNpz() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Parallelised Welch t-test accumulation + compute — shared by
+// showTTestDialog() and the Chain "Run T-test" step. shifts empty => no
+// alignment; shift == kAlignDiscardShift excludes that trace. Returns false
+// on failure: err == "Cancelled." for a user cancel or a declined memory
+// warning (not worth reporting as an error), otherwise a real failure
+// message from TTestAccumulator::compute().
+// ---------------------------------------------------------------------------
+bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
+                               int64_t eff_first_sample, int64_t eff_n_samples,
+                               int32_t byte_idx, const std::vector<int32_t>& shifts, bool abs_value,
+                               QWidget* msg_parent, std::shared_ptr<TTestAccumulator>& acc_out,
+                               std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
+                               QString& err)
+{
+    const TrsHeader& h = activeDs().file->header();
+    const std::vector<int32_t>& use_shifts = shifts;
+
+    // Effective raw sample count for the window
+    const int64_t raw_ns = (eff_n_samples == 0)
+        ? (h.num_samples - eff_first_sample)
+        : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
+
+    // Effective sample count after pipeline
+    int64_t effective_samples = raw_ns;
+    for (const auto& t : activeDs().pipeline)
+        effective_samples = t->transformedCount(effective_samples);
+
+    // Accumulation is parallelised across traces, one TTestAccumulator + one
+    // cloned pipeline per worker thread (merged together at the end) — the
+    // shared activeDs().pipeline transforms aren't safe to call apply() on
+    // concurrently since they may cache internal state (e.g. FFT plans).
+    // Capped at 8 threads since each accumulator costs 4×effective_samples
+    // doubles; see the memory estimate below.
+#ifdef _OPENMP
+    const int n_threads = std::clamp(omp_get_max_threads(), 1, 8);
+#else
+    const int n_threads = 1;
+#endif
+
+    // Memory estimate warning (one accumulator per worker thread)
+    int64_t mem_bytes = effective_samples * 4LL * static_cast<int64_t>(sizeof(double))
+                      * n_threads;
+    if (mem_bytes > 2LL * 1024 * 1024 * 1024) {
+        if (QMessageBox::warning(msg_parent, "Memory warning",
+                QString("Accumulators will require ~%1 GB across %2 worker thread(s).\nContinue?")
+                    .arg(double(mem_bytes) / (1024.0*1024*1024), 0, 'f', 1).arg(n_threads),
+                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
+            err = "Cancelled.";
+            return false;
+        }
+    }
+
+    // --- Accumulation ---
+    auto acc_ptr = std::make_shared<TTestAccumulator>(static_cast<int32_t>(effective_samples));
+
+    QProgressDialog prog("Accumulating traces…", "Cancel", 0, eff_count, msg_parent);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(400);
+
+    std::vector<TTestAccumulator> thread_accs(
+        static_cast<size_t>(n_threads), TTestAccumulator(static_cast<int32_t>(effective_samples)));
+    std::vector<std::vector<std::shared_ptr<ITransform>>> thread_pipelines(
+        static_cast<size_t>(n_threads));
+    for (auto& tp : thread_pipelines)
+        for (const auto& t : activeDs().pipeline) tp.push_back(t->clone());
+    std::vector<std::vector<float>> thread_bufs(
+        static_cast<size_t>(n_threads),
+        std::vector<float>(static_cast<size_t>(std::max(raw_ns, effective_samples))));
+    std::vector<int32_t> thread_skipped(static_cast<size_t>(n_threads), 0);
+    std::vector<int32_t> thread_discarded(static_cast<size_t>(n_threads), 0);
+
+    // Process in batches so the GUI thread can update the progress bar and
+    // check for cancellation between parallel regions (Qt calls are only
+    // ever made from the main thread, never from inside the omp for below).
+    // Capped at 256 for parallel efficiency, but also capped so there are at
+    // least ~20 progress updates regardless of trace count — otherwise a run
+    // with fewer traces than the batch size reports progress exactly once,
+    // at the very end, which looks indistinguishable from a hang.
+    const int32_t kBatchSize = std::clamp(eff_count / 20, 1, 256);
+    bool cancelled = false;
+
+    for (int32_t batch_start = 0; batch_start < eff_count && !cancelled; batch_start += kBatchSize) {
+        int32_t batch_end = std::min(batch_start + kBatchSize, eff_count);
+
+        #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
+        for (int32_t ti = batch_start; ti < batch_end; ti++) {
+#ifdef _OPENMP
+            const size_t tid = static_cast<size_t>(omp_get_thread_num());
+#else
+            const size_t tid = 0;
+#endif
+            TTestAccumulator&                        acc_local  = thread_accs[tid];
+            std::vector<std::shared_ptr<ITransform>>& pipeline_local = thread_pipelines[tid];
+            std::vector<float>&                      trace_buf  = thread_bufs[tid];
+
+            int32_t src_idx = eff_first + ti;
+            auto data_bytes = activeDs().file->readData(src_idx);
+            if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
+            int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
+
+            // Read window with per-trace shift, zero-pad out of bounds
+            int32_t shift = (ti < static_cast<int32_t>(use_shifts.size())) ? use_shifts[ti] : 0;
+            if (shift == kAlignDiscardShift) { thread_discarded[tid]++; continue; }
+            const int64_t adj_start = eff_first_sample + shift;
+            std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+            if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
+                int64_t src_start = std::max<int64_t>(0, adj_start);
+                int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
+                int64_t dst_off   = src_start - adj_start;
+                int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
+                                                      trace_buf.data() + dst_off);
+                if (got <= 0) { thread_skipped[tid]++; continue; }
+            }
+            for (const auto& t : pipeline_local) t->reset();
+            int64_t n_out = raw_ns;
+            for (const auto& t : pipeline_local)
+                n_out = t->apply(trace_buf.data(), n_out, 0);
+            acc_local.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
+        }
+
+        prog.setLabelText(QString("Accumulating trace %1 / %2…").arg(batch_end).arg(eff_count));
+        prog.setValue(batch_end);
+        QApplication::processEvents();
+        if (prog.wasCanceled()) cancelled = true;
+    }
+    if (cancelled) { err = "Cancelled."; return false; }
+
+    TTestAccumulator& acc = *acc_ptr;
+    int32_t skipped = 0, discarded_by_align = 0;
+    for (int t = 0; t < n_threads; t++) {
+        acc.mergeFrom(thread_accs[static_cast<size_t>(t)]);
+        skipped            += thread_skipped[static_cast<size_t>(t)];
+        discarded_by_align += thread_discarded[static_cast<size_t>(t)];
+    }
+    prog.setValue(eff_count);
+
+    if (skipped > 0 || discarded_by_align > 0) {
+        QStringList msg;
+        if (skipped > 0)
+            msg << QString("%1 traces skipped (data byte out of range).").arg(skipped);
+        if (discarded_by_align > 0)
+            msg << QString("%1 traces excluded (below alignment correlation threshold).")
+                       .arg(discarded_by_align);
+        QMessageBox::warning(msg_parent, "T-test", msg.join("\n"));
+    }
+
+    // --- Compute ---
+    std::vector<float> tstat;
+    std::string cerr;
+    if (!acc.compute(tstat, cerr)) {
+        err = QString::fromStdString(cerr);
+        return false;
+    }
+    if (abs_value)
+        for (float& v : tstat) v = std::fabs(v);
+
+    acc_out   = acc_ptr;
+    tstat_out = std::move(tstat);
+    n0_out    = acc.countGroup(0);
+    n1_out    = acc.countGroup(1);
+    return true;
+}
+
 void MainWindow::onRunTTest() {
+    showTTestDialog(nullptr);
+}
+
+void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToChain)
+{
     if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "T-test", "No file loaded.");
         return;
@@ -3413,6 +3582,21 @@ void MainWindow::onRunTTest() {
         fl->addRow("Group byte index:", sp_byte);
     }
 
+    auto* chk_abs = new QCheckBox("Absolute value |t|");
+    chk_abs->setToolTip("Report |t| instead of the signed t-statistic — only magnitude "
+                        "matters against the significance threshold, so this makes peaks "
+                        "symmetric and comparable regardless of leakage direction.");
+    fl->addRow(chk_abs);
+
+    QCheckBox* chk_add_chain = nullptr;
+    if (onAddToChain) {
+        chk_add_chain = new QCheckBox("Add to Chain");
+        chk_add_chain->setChecked(true);
+        chk_add_chain->setToolTip("Also capture these exact parameters as a Run T-test step "
+                                  "in the chain being built.");
+        fl->addRow(chk_add_chain);
+    }
+
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
@@ -3431,157 +3615,64 @@ void MainWindow::onRunTTest() {
     const int64_t eff_n_samples    = static_cast<int64_t>(sp_s_count->value()); // 0 = all
     const std::vector<int32_t> use_shifts = use_alignment ? activeDs().align_shifts : std::vector<int32_t>{};
 
-    // Effective raw sample count for the window
-    const int64_t raw_ns = (eff_n_samples == 0)
-        ? (h.num_samples - eff_first_sample)
-        : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
+    const bool abs_value = chk_abs->isChecked();
 
-    // Effective sample count after pipeline
-    int64_t effective_samples = raw_ns;
-    for (const auto& t : activeDs().pipeline)
-        effective_samples = t->transformedCount(effective_samples);
-
-    // Accumulation is parallelised across traces, one TTestAccumulator + one
-    // cloned pipeline per worker thread (merged together at the end) — the
-    // shared activeDs().pipeline transforms aren't safe to call apply() on
-    // concurrently since they may cache internal state (e.g. FFT plans).
-    // Capped at 8 threads since each accumulator costs 4×effective_samples
-    // doubles; see the memory estimate below.
-#ifdef _OPENMP
-    const int n_threads = std::clamp(omp_get_max_threads(), 1, 8);
-#else
-    const int n_threads = 1;
-#endif
-
-    // Memory estimate warning (one accumulator per worker thread)
-    int64_t mem_bytes = effective_samples * 4LL * static_cast<int64_t>(sizeof(double))
-                      * n_threads;
-    if (mem_bytes > 2LL * 1024 * 1024 * 1024) {
-        if (QMessageBox::warning(this, "Memory warning",
-                QString("Accumulators will require ~%1 GB across %2 worker thread(s).\nContinue?")
-                    .arg(double(mem_bytes) / (1024.0*1024*1024), 0, 'f', 1).arg(n_threads),
-                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
-            return;
+    if (onAddToChain && chk_add_chain->isChecked()) {
+        // first/count (not eff_first/eff_count) so a step authored without
+        // alignment yet still has a sensible fallback trace range recorded —
+        // runTTestChainStep() re-derives eff_first/eff_count itself from
+        // use_last_alignment + whatever alignment exists when it actually runs.
+        ChainStep s;
+        s.kind                = ChainStep::Kind::RunTTest;
+        s.first_trace          = first;
+        s.trace_count           = count;
+        s.use_last_alignment      = use_alignment;
+        s.ttest_first_sample        = eff_first_sample;
+        s.ttest_n_samples             = eff_n_samples;
+        s.ttest_byte_idx                = byte_idx;
+        s.ttest_abs                       = abs_value;
+        onAddToChain(s);
     }
 
-    // --- Accumulation ---
-    auto acc_ptr = std::make_shared<TTestAccumulator>(static_cast<int32_t>(effective_samples));
-
-    QProgressDialog prog("Accumulating traces…", "Cancel", 0, eff_count, this);
-    prog.setWindowModality(Qt::WindowModal);
-    prog.setMinimumDuration(400);
-
-    std::vector<TTestAccumulator> thread_accs(
-        static_cast<size_t>(n_threads), TTestAccumulator(static_cast<int32_t>(effective_samples)));
-    std::vector<std::vector<std::shared_ptr<ITransform>>> thread_pipelines(
-        static_cast<size_t>(n_threads));
-    for (auto& tp : thread_pipelines)
-        for (const auto& t : activeDs().pipeline) tp.push_back(t->clone());
-    std::vector<std::vector<float>> thread_bufs(
-        static_cast<size_t>(n_threads),
-        std::vector<float>(static_cast<size_t>(std::max(raw_ns, effective_samples))));
-    std::vector<int32_t> thread_skipped(static_cast<size_t>(n_threads), 0);
-    std::vector<int32_t> thread_discarded(static_cast<size_t>(n_threads), 0);
-
-    // Process in batches so the GUI thread can update the progress bar and
-    // check for cancellation between parallel regions (Qt calls are only
-    // ever made from the main thread, never from inside the omp for below).
-    // Capped at 256 for parallel efficiency, but also capped so there are at
-    // least ~20 progress updates regardless of trace count — otherwise a run
-    // with fewer traces than the batch size reports progress exactly once,
-    // at the very end, which looks indistinguishable from a hang.
-    const int32_t kBatchSize = std::clamp(eff_count / 20, 1, 256);
-    bool cancelled = false;
-
-    for (int32_t batch_start = 0; batch_start < eff_count && !cancelled; batch_start += kBatchSize) {
-        int32_t batch_end = std::min(batch_start + kBatchSize, eff_count);
-
-        #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
-        for (int32_t ti = batch_start; ti < batch_end; ti++) {
-#ifdef _OPENMP
-            const size_t tid = static_cast<size_t>(omp_get_thread_num());
-#else
-            const size_t tid = 0;
-#endif
-            TTestAccumulator&                        acc_local  = thread_accs[tid];
-            std::vector<std::shared_ptr<ITransform>>& pipeline_local = thread_pipelines[tid];
-            std::vector<float>&                      trace_buf  = thread_bufs[tid];
-
-            int32_t src_idx = eff_first + ti;
-            auto data_bytes = activeDs().file->readData(src_idx);
-            if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
-            int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
-
-            // Read window with per-trace shift, zero-pad out of bounds
-            int32_t shift = (ti < static_cast<int32_t>(use_shifts.size())) ? use_shifts[ti] : 0;
-            if (shift == kAlignDiscardShift) { thread_discarded[tid]++; continue; }
-            const int64_t adj_start = eff_first_sample + shift;
-            std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
-            if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
-                int64_t src_start = std::max<int64_t>(0, adj_start);
-                int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
-                int64_t dst_off   = src_start - adj_start;
-                int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
-                                                      trace_buf.data() + dst_off);
-                if (got <= 0) { thread_skipped[tid]++; continue; }
-            }
-            for (const auto& t : pipeline_local) t->reset();
-            int64_t n_out = raw_ns;
-            for (const auto& t : pipeline_local)
-                n_out = t->apply(trace_buf.data(), n_out, 0);
-            acc_local.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
-        }
-
-        prog.setLabelText(QString("Accumulating trace %1 / %2…").arg(batch_end).arg(eff_count));
-        prog.setValue(batch_end);
-        QApplication::processEvents();
-        if (prog.wasCanceled()) cancelled = true;
-    }
-    if (cancelled) return;
-
-    TTestAccumulator& acc = *acc_ptr;
-    int32_t skipped = 0, discarded_by_align = 0;
-    for (int t = 0; t < n_threads; t++) {
-        acc.mergeFrom(thread_accs[static_cast<size_t>(t)]);
-        skipped            += thread_skipped[static_cast<size_t>(t)];
-        discarded_by_align += thread_discarded[static_cast<size_t>(t)];
-    }
-    prog.setValue(eff_count);
-
-    if (skipped > 0 || discarded_by_align > 0) {
-        QStringList msg;
-        if (skipped > 0)
-            msg << QString("%1 traces skipped (data byte out of range).").arg(skipped);
-        if (discarded_by_align > 0)
-            msg << QString("%1 traces excluded (below alignment correlation threshold).")
-                       .arg(discarded_by_align);
-        QMessageBox::warning(this, "T-test", msg.join("\n"));
-    }
-
-    // --- Compute ---
+    std::shared_ptr<TTestAccumulator> acc_ptr;
     std::vector<float> tstat;
-    std::string err;
-    if (!acc.compute(tstat, err)) {
-        QMessageBox::critical(this, "T-test failed", QString::fromStdString(err));
+    int64_t n0 = 0, n1 = 0;
+    QString compute_err;
+    if (!computeTTest(eff_first, eff_count, eff_first_sample, eff_n_samples, byte_idx, use_shifts,
+                       abs_value, this, acc_ptr, tstat, n0, n1, compute_err)) {
+        if (!compute_err.isEmpty() && compute_err != "Cancelled.")
+            QMessageBox::critical(this, "T-test failed", compute_err);
         return;
     }
 
-    int64_t n0 = acc.countGroup(0), n1 = acc.countGroup(1);
+    buildTTestResultTab(acc_ptr, std::move(tstat), n0, n1, eff_count, abs_value);
+}
 
-    // --- Result tab ---
+// ---------------------------------------------------------------------------
+// The full interactive t-test result view (threshold line, Calc TH, Style,
+// Export PDF/PNG/NPY/TRS, trim controls) built from an already-computed
+// result — the second half of showTTestDialog(), split out so the Chain
+// "Run T-test" step gets the exact same rich result tab as the menu action.
+// ---------------------------------------------------------------------------
+void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& acc_ptr,
+                                      std::vector<float> tstat, int64_t n0, int64_t n1,
+                                      int32_t eff_count, bool abs_value)
+{
     auto tstat_ptr  = std::make_shared<std::vector<float>>(std::move(tstat));
     auto current_ptr = std::make_shared<std::vector<float>>(*tstat_ptr);
     auto df_orig    = std::make_shared<std::vector<double>>();
     acc_ptr->computeWelchDf(*df_orig);
     auto current_df = std::make_shared<std::vector<double>>(*df_orig);
 
-    QString tab_title = QString("Welch t-test — %1 traces (G0:%2  G1:%3)")
-                            .arg(eff_count).arg(n0).arg(n1);
-    addResultTab(*current_ptr, tab_title, QColor("#1f77b4"), "t-value");
+    const QString value_label = abs_value ? "|t|-value" : "t-value";
+    QString tab_title = QString("Welch t-test — %1 traces (G0:%2  G1:%3)%4")
+                            .arg(eff_count).arg(n0).arg(n1)
+                            .arg(abs_value ? QString(" |t|") : QString());
+    addResultTab(*current_ptr, tab_title, QColor("#1f77b4"), value_label);
     PlotWidget* pw = plotWidget();
     pw->setTheme(PlotTheme::light());
     pw->setTraceFilled(0, true);
-    pw->setAxisLabels("Sample Index", "t-value");
+    pw->setAxisLabels("Sample Index", value_label);
     pw->setThresholds(true, 4.5, -4.5);
     pw->resetView();
 
@@ -3604,6 +3695,9 @@ void MainWindow::onRunTTest() {
         pw->setThresholdOneSided(on);
         lbl_thr->setText(on ? "Threshold +:" : "Threshold ±:");
     });
+    // |t| is never negative, so the lower threshold half is meaningless —
+    // default to one-sided display when the result was rectified.
+    if (abs_value) chk_onesided->setChecked(true);
 
     auto* btn_exp_trs = new QPushButton("Export TRS…");
     auto* btn_exp_npy = new QPushButton("Export .npz…");
@@ -5616,6 +5710,77 @@ bool MainWindow::computeAndStoreAlignment(const std::vector<int32_t>& shifts, in
 }
 
 // ---------------------------------------------------------------------------
+// Writes the (trace,offset) shift table for [first_trace, first_trace +
+// shifts.size()) to a CSV file, skipping entries marked kAlignDiscardShift.
+// Same format as Align Traces' "Export Shifts…" button (and read back by
+// loadShiftsCsv() below / "Load Shifts from File…"). Shared by that button
+// and the Chain "Export Shifts" step. Returns false and sets err_out on
+// failure.
+// ---------------------------------------------------------------------------
+static bool saveShiftsCsv(const QString& path, int32_t first_trace,
+                           const std::vector<int32_t>& shifts, QString& err_out)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        err_out = "Cannot create file:\n" + path;
+        return false;
+    }
+    QTextStream out(&f);
+    out << "# trs-viewer alignment shifts (trace,offset) — omitted traces were "
+           "discarded/excluded\n";
+    for (int i = 0; i < static_cast<int>(shifts.size()); i++) {
+        int32_t shift = shifts[static_cast<size_t>(i)];
+        if (shift == kAlignDiscardShift) continue;   // omit — matches the threshold filter
+        out << (first_trace + i) << ',' << shift << '\n';
+    }
+    f.close();
+    return true;
+}
+
+// Reads a (trace,offset) shift table written by saveShiftsCsv() above (or by
+// hand) — trace numbers missing from the file become kAlignDiscardShift
+// within the resulting [min,max] range. Shared by "Load Shifts from File…"
+// and the Chain "Load Shifts" step. Returns false and sets err_out on
+// failure, including "no valid rows found".
+static bool loadShiftsCsv(const QString& path, int32_t& first_trace_out,
+                           std::vector<int32_t>& shifts_out, QString& err_out,
+                           int* bad_lines_out = nullptr)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        err_out = "Cannot open file:\n" + path;
+        return false;
+    }
+    std::map<int32_t, int32_t> pairs;
+    QTextStream in(&f);
+    int bad_lines = 0;
+    while (!in.atEnd()) {
+        QString line = in.readLine().trimmed();
+        if (line.isEmpty() || line.startsWith('#')) continue;
+        QStringList parts = line.split(',');
+        bool ok1 = false, ok2 = false;
+        if (parts.size() >= 2) {
+            int32_t tr  = parts[0].trimmed().toInt(&ok1);
+            int32_t off = parts[1].trimmed().toInt(&ok2);
+            if (ok1 && ok2) { pairs[tr] = off; continue; }
+        }
+        bad_lines++;
+    }
+    f.close();
+    if (bad_lines_out) *bad_lines_out = bad_lines;
+    if (pairs.empty()) {
+        err_out = "No valid \"trace,offset\" rows found in:\n" + path;
+        return false;
+    }
+    int32_t first_tr = pairs.begin()->first;
+    int32_t last_tr  = pairs.rbegin()->first;
+    shifts_out.assign(static_cast<size_t>(last_tr - first_tr + 1), kAlignDiscardShift);
+    for (const auto& kv : pairs) shifts_out[static_cast<size_t>(kv.first - first_tr)] = kv.second;
+    first_trace_out = first_tr;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Trace alignment dialog
 // ---------------------------------------------------------------------------
 void MainWindow::onAlignTraces() {
@@ -6005,41 +6170,14 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("align_shifts", path);
 
-        QFile f(path);
-        if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
-            QMessageBox::critical(dlg, "Load failed", "Cannot open file:\n" + path);
-            return;
-        }
-
-        std::map<int32_t, int32_t> pairs;
-        QTextStream in(&f);
+        int32_t first_tr = 0;
         int bad_lines = 0;
-        while (!in.atEnd()) {
-            QString line = in.readLine().trimmed();
-            if (line.isEmpty() || line.startsWith('#')) continue;
-            QStringList parts = line.split(',');
-            bool ok1 = false, ok2 = false;
-            if (parts.size() >= 2) {
-                int32_t tr  = parts[0].trimmed().toInt(&ok1);
-                int32_t off = parts[1].trimmed().toInt(&ok2);
-                if (ok1 && ok2) { pairs[tr] = off; continue; }
-            }
-            bad_lines++;
-        }
-        f.close();
-
-        if (pairs.empty()) {
-            QMessageBox::critical(dlg, "Load failed",
-                "No valid \"trace,offset\" rows found in:\n" + path);
+        QString err;
+        if (!loadShiftsCsv(path, first_tr, result_ptr->shifts, err, &bad_lines)) {
+            QMessageBox::critical(dlg, "Load failed", err);
             return;
         }
-
-        int32_t first_tr = pairs.begin()->first;
-        int32_t last_tr  = pairs.rbegin()->first;
-        result_ptr->shifts.assign(static_cast<size_t>(last_tr - first_tr + 1), kAlignDiscardShift);
         result_ptr->scores.clear();   // not available from a file — table shows blank scores
-        for (const auto& kv : pairs)
-            result_ptr->shifts[static_cast<size_t>(kv.first - first_tr)] = kv.second;
 
         sp_tr_first->setValue(first_tr);
         sp_tr_count->setValue(static_cast<int>(result_ptr->shifts.size()));
@@ -6048,7 +6186,7 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
         if (bad_lines > 0)
             QMessageBox::warning(dlg, "Load shifts",
                 QString("Loaded %1 trace(s); skipped %2 unparseable line(s).")
-                    .arg(pairs.size()).arg(bad_lines));
+                    .arg(result_ptr->shifts.size()).arg(bad_lines));
     });
 
     // ── Export shifts to file ───────────────────────────────────────────────
@@ -6060,23 +6198,15 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("align_shifts", path);
 
-        QFile f(path);
-        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
-            QMessageBox::critical(dlg, "Export failed", "Cannot create file:\n" + path);
+        int32_t first_tr = static_cast<int32_t>(sp_tr_first->value());
+        int32_t n_written = static_cast<int32_t>(std::count_if(
+            result_ptr->shifts.begin(), result_ptr->shifts.end(),
+            [](int32_t s) { return s != kAlignDiscardShift; }));
+        QString err;
+        if (!saveShiftsCsv(path, first_tr, result_ptr->shifts, err)) {
+            QMessageBox::critical(dlg, "Export failed", err);
             return;
         }
-        QTextStream out(&f);
-        out << "# trs-viewer alignment shifts (trace,offset) — omitted traces were "
-               "discarded/excluded\n";
-        int32_t first_tr = static_cast<int32_t>(sp_tr_first->value());
-        int32_t n_written = 0;
-        for (int i = 0; i < static_cast<int>(result_ptr->shifts.size()); i++) {
-            int32_t shift = result_ptr->shifts[static_cast<size_t>(i)];
-            if (shift == kAlignDiscardShift) continue;   // omit — matches the threshold filter
-            out << (first_tr + i) << ',' << shift << '\n';
-            n_written++;
-        }
-        f.close();
         QMessageBox::information(dlg, "Export complete",
             QString("Saved %1 trace shift(s) to:\n%2").arg(n_written).arg(path));
     });
@@ -6145,6 +6275,46 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
 
     dlg->resize(480, 220);
     dlg->show();
+}
+
+// ---------------------------------------------------------------------------
+// Chain "Run T-test" step: resolves the trace range from the last
+// alignment (if step.use_last_alignment and one exists) or the step's own
+// first_trace/trace_count, then computeTTest() + buildTTestResultTab() —
+// same two calls showTTestDialog() makes after its config dialog closes.
+// ---------------------------------------------------------------------------
+bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, QString& err) {
+    const TrsHeader& h = activeDs().file->header();
+    if (h.data_length <= 0) {
+        err = "This TRS file has no per-trace data bytes.";
+        return false;
+    }
+
+    bool have_ttest_param = h.param_map.count("ttest") > 0;
+    int32_t byte_idx = have_ttest_param
+        ? static_cast<int32_t>(h.param_map.at("ttest").offset)
+        : step.ttest_byte_idx;
+
+    const bool use_alignment = step.use_last_alignment && activeDs().align_n_samples > 0;
+    const int32_t eff_first = use_alignment ? activeDs().align_first_trace : step.first_trace;
+    const int32_t eff_count = use_alignment ? static_cast<int32_t>(activeDs().align_shifts.size())
+                                              : step.trace_count;
+    if (eff_count < 2) {
+        err = "Not enough traces in range (need at least 2).";
+        return false;
+    }
+    const std::vector<int32_t> use_shifts = use_alignment ? activeDs().align_shifts
+                                                             : std::vector<int32_t>{};
+
+    std::shared_ptr<TTestAccumulator> acc_ptr;
+    std::vector<float> tstat;
+    int64_t n0 = 0, n1 = 0;
+    if (!computeTTest(eff_first, eff_count, step.ttest_first_sample, step.ttest_n_samples,
+                       byte_idx, use_shifts, step.ttest_abs, msg_parent, acc_ptr, tstat, n0, n1, err))
+        return false;
+
+    buildTTestResultTab(acc_ptr, std::move(tstat), n0, n1, eff_count, step.ttest_abs);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -6292,6 +6462,45 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         }
         return ok;
     }
+
+    case ChainStep::Kind::ExportShifts: {
+        if (activeDs().align_shifts.empty()) {
+            err = "No alignment shifts to export — run an Align step first.";
+            return false;
+        }
+        QString path = step.path;
+        if (path.isEmpty()) {
+            path = QFileDialog::getSaveFileName(msg_parent, "Export alignment shifts",
+                                                 recentDir("chain"), "CSV files (*.csv)");
+            if (path.isEmpty()) { err = "Export cancelled."; return false; }
+            updateRecentDir("chain", path);
+        }
+        return saveShiftsCsv(path, activeDs().align_first_trace, activeDs().align_shifts, err);
+    }
+
+    case ChainStep::Kind::LoadShifts: {
+        QString path = step.path;
+        if (path.isEmpty()) {
+            path = QFileDialog::getOpenFileName(msg_parent, "Load alignment shifts",
+                recentDir("chain"), "Shift tables (*.csv *.txt);;All files (*)");
+            if (path.isEmpty()) { err = "Load cancelled."; return false; }
+            updateRecentDir("chain", path);
+        }
+        int32_t first_tr = 0;
+        std::vector<int32_t> shifts;
+        if (!loadShiftsCsv(path, first_tr, shifts, err)) return false;
+
+        saveSnapshot();
+        activeDs().align_first_trace  = first_tr;
+        activeDs().align_first_sample = 0;
+        activeDs().align_n_samples    = activeDs().file->header().num_samples;
+        activeDs().align_shifts       = std::move(shifts);
+        updateUndoButton();
+        return true;
+    }
+
+    case ChainStep::Kind::RunTTest:
+        return runTTestChainStep(step, msg_parent, err);
     }
     err = "Unknown step kind.";
     return false;
@@ -6348,10 +6557,7 @@ void MainWindow::onChainEditor() {
         refreshList();
     };
 
-    // ── Align sub-dialog: parameter-only clone of Align Traces' fields (no
-    // drag-on-plot / run-preview — by the time you're building a chain you
-    // already know good numbers from having run it manually once). ───────
-    // Opens the real, interactive Align Traces dialog (drag-on-plot region,
+    // ── Align: opens the real, interactive Align Traces dialog (drag-on-plot region,
     // Run, results table) instead of a blind parameter form — remembering
     // good region/threshold numbers without seeing them applied is hard, so
     // adding an Align step means actually running alignment against the
@@ -6435,6 +6641,55 @@ void MainWindow::onChainEditor() {
         refreshList();
     };
 
+    // ── Export Shifts / Load Shifts sub-dialog: just a path field + browse
+    // button, same "blank = prompt at run time" convention as Export. ─────
+    auto addShiftsStep = [=](bool is_export) {
+        QDialog d(dlg);
+        d.setWindowTitle(is_export ? "Add Step — Export Shifts" : "Add Step — Load Shifts");
+        auto* fl = new QFormLayout(&d);
+
+        auto* le_path = new QLineEdit;
+        le_path->setPlaceholderText("(leave blank to prompt for a path each run)");
+        auto* btn_browse = new QPushButton("Browse…");
+        auto* path_row = new QWidget;
+        auto* path_hl  = new QHBoxLayout(path_row);
+        path_hl->setContentsMargins(0, 0, 0, 0);
+        path_hl->addWidget(le_path);
+        path_hl->addWidget(btn_browse);
+        fl->addRow("File:", path_row);
+        connect(btn_browse, &QPushButton::clicked, &d, [&]() {
+            QString p = is_export
+                ? QFileDialog::getSaveFileName(&d, "Shift table path", recentDir("chain"),
+                                                "CSV files (*.csv)")
+                : QFileDialog::getOpenFileName(&d, "Shift table path", recentDir("chain"),
+                                                "Shift tables (*.csv *.txt);;All files (*)");
+            if (!p.isEmpty()) le_path->setText(p);
+        });
+
+        auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        fl->addRow(bb);
+        connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+        connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+        if (d.exec() != QDialog::Accepted) return;
+
+        ChainStep s;
+        s.kind = is_export ? ChainStep::Kind::ExportShifts : ChainStep::Kind::LoadShifts;
+        s.path = le_path->text();
+        steps->push_back(s);
+        refreshList();
+    };
+
+    // ── Run T-test: reuses the real, interactive config dialog (see
+    // showAlignDialog()'s "Apply to Main View + Add to Chain" for why) — its
+    // own "Add to Chain" checkbox captures the parameters and actually runs
+    // the t-test, showing the same result tab as the menu action. ─────────
+    auto addRunTTestStep = [=]() {
+        showTTestDialog([=](const ChainStep& s) {
+            steps->push_back(s);
+            refreshList();
+        });
+    };
+
     auto* btn_add_step = new QPushButton("Add step ▾");
     auto* btn_remove   = new QPushButton("Remove");
     auto* btn_up       = new QPushButton("↑");
@@ -6450,6 +6705,9 @@ void MainWindow::onChainEditor() {
         QAction* act_align   = menu.addAction("Align Traces…");
         QAction* act_reload  = menu.addAction("Reload (Load / Refresh)");
         QAction* act_export  = menu.addAction("Export…");
+        QAction* act_exp_sh  = menu.addAction("Export Shifts…");
+        QAction* act_load_sh = menu.addAction("Load Shifts…");
+        QAction* act_ttest   = menu.addAction("Run T-test…");
         QAction* chosen = menu.exec(btn_add_step->mapToGlobal(QPoint(0, btn_add_step->height())));
         if (chosen == act_tx) {
             addTransformStep();
@@ -6465,6 +6723,12 @@ void MainWindow::onChainEditor() {
             refreshList();
         } else if (chosen == act_export) {
             addExportStep();
+        } else if (chosen == act_exp_sh) {
+            addShiftsStep(true);
+        } else if (chosen == act_load_sh) {
+            addShiftsStep(false);
+        } else if (chosen == act_ttest) {
+            addRunTTestStep();
         }
     });
 

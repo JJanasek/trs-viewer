@@ -202,6 +202,44 @@ private:
     // (with err set) on failure; the Chain Editor's Run loop stops there.
     bool runChainStep(const ChainStep& step, QWidget* msg_parent, QString& err);
 
+    // Builds and shows the Welch t-test configuration dialog — the actual
+    // implementation behind the onRunTTest() slot, split out the same way
+    // showAlignDialog() is: a non-null onAddToChain adds an "Add to Chain"
+    // checkbox that, alongside running the t-test as normal, captures the
+    // just-used parameters into a ChainStep for the Chain Editor.
+    void showTTestDialog(std::function<void(const ChainStep&)> onAddToChain = nullptr);
+
+    // The parallelised accumulation + Welch computation core of the t-test,
+    // shared by showTTestDialog() and the Chain "Run T-test" step. shifts
+    // empty => no alignment. abs_value reports |t| instead of the signed
+    // t-statistic (each sample rectified after acc.compute() succeeds).
+    // Returns false (with err set — "Cancelled." on user cancel, empty on a
+    // declined memory warning) on failure.
+    bool computeTTest(int32_t eff_first, int32_t eff_count,
+                       int64_t eff_first_sample, int64_t eff_n_samples,
+                       int32_t byte_idx, const std::vector<int32_t>& shifts, bool abs_value,
+                       QWidget* msg_parent, std::shared_ptr<TTestAccumulator>& acc_out,
+                       std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
+                       QString& err);
+
+    // Opens a new result tab with the full interactive t-test view (threshold
+    // line, Calc TH, Style, Export PDF/PNG/NPY/TRS, trim controls) from an
+    // already-computed result — the second half of showTTestDialog(), shared
+    // with the Chain "Run T-test" step so a chain-driven run gets the same
+    // rich result tab as running it from the menu. abs_value should match
+    // what was passed to computeTTest(): it pre-checks "One-sided (+)" and
+    // labels the tab/axis "|t|-value", since the negative threshold half is
+    // meaningless once every value has been rectified to non-negative.
+    void buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& acc_ptr,
+                              std::vector<float> tstat, int64_t n0, int64_t n1,
+                              int32_t eff_count, bool abs_value);
+
+    // Chain "Run T-test" step: resolves the step's trace range (the last
+    // alignment's range if use_last_alignment and one exists, else the
+    // step's own first_trace/trace_count), then calls computeTTest() +
+    // buildTTestResultTab(). Returns false (with err set) on failure.
+    bool runTTestChainStep(const ChainStep& step, QWidget* msg_parent, QString& err);
+
     // Multi-dataset state
     std::vector<Dataset> datasets_;
     int                  active_idx_ = -1;

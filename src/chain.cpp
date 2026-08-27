@@ -61,6 +61,22 @@ QString ChainStep::summary() const {
         return QString("Export %1 → %2%3").arg(fmt).arg(dest)
             .arg(use_last_alignment ? QString(", apply alignment") : QString());
     }
+    case Kind::ExportShifts:
+        return QString("Export Shifts → %1").arg(path.isEmpty() ? QString("(prompt for path)") : path);
+    case Kind::LoadShifts:
+        return QString("Load Shifts ← %1").arg(path.isEmpty() ? QString("(prompt for path)") : path);
+    case Kind::RunTTest: {
+        QString range = trace_count > 0
+            ? QString("trace[%1,%2)").arg(first_trace).arg(first_trace + trace_count)
+            : QString("last alignment's range");
+        return QString("Run T-test — %1%2%3%4")
+            .arg(use_last_alignment ? QString("apply alignment, ") : QString())
+            .arg(range)
+            .arg(ttest_n_samples > 0
+                     ? QString(", sample[%1,%2)").arg(ttest_first_sample).arg(ttest_first_sample + ttest_n_samples)
+                     : QString())
+            .arg(ttest_abs ? QString(", |t|") : QString());
+    }
     }
     return QString("?");
 }
@@ -156,6 +172,9 @@ static QString kindToStr(ChainStep::Kind k) {
     case ChainStep::Kind::Align:         return "align";
     case ChainStep::Kind::Reload:        return "reload";
     case ChainStep::Kind::Export:        return "export";
+    case ChainStep::Kind::ExportShifts:  return "export_shifts";
+    case ChainStep::Kind::LoadShifts:    return "load_shifts";
+    case ChainStep::Kind::RunTTest:      return "run_ttest";
     }
     return QString();
 }
@@ -166,6 +185,9 @@ static bool kindFromStr(const QString& s, ChainStep::Kind& out) {
     if (s == "align")          { out = ChainStep::Kind::Align;         return true; }
     if (s == "reload")         { out = ChainStep::Kind::Reload;        return true; }
     if (s == "export")         { out = ChainStep::Kind::Export;        return true; }
+    if (s == "export_shifts")  { out = ChainStep::Kind::ExportShifts;  return true; }
+    if (s == "load_shifts")    { out = ChainStep::Kind::LoadShifts;    return true; }
+    if (s == "run_ttest")      { out = ChainStep::Kind::RunTTest;      return true; }
     return false;
 }
 
@@ -208,6 +230,19 @@ bool saveChain(const QString& path, const std::vector<ChainStep>& steps, QString
             o["exp_count"]          = s.exp_count;
             o["use_last_alignment"] = s.use_last_alignment;
             o["path"]                = s.path;
+            break;
+        case ChainStep::Kind::ExportShifts:
+        case ChainStep::Kind::LoadShifts:
+            o["path"] = s.path;
+            break;
+        case ChainStep::Kind::RunTTest:
+            o["first_trace"]        = s.first_trace;
+            o["trace_count"]        = s.trace_count;
+            o["use_last_alignment"] = s.use_last_alignment;
+            o["ttest_first_sample"] = static_cast<double>(s.ttest_first_sample);
+            o["ttest_n_samples"]    = static_cast<double>(s.ttest_n_samples);
+            o["ttest_byte_idx"]     = s.ttest_byte_idx;
+            o["ttest_abs"]          = s.ttest_abs;
             break;
         }
         arr.append(o);
@@ -287,6 +322,19 @@ bool loadChain(const QString& path, std::vector<ChainStep>& steps, QString& err)
             s.exp_count            = o.value("exp_count").toInt();
             s.use_last_alignment    = o.value("use_last_alignment").toBool(true);
             s.path                    = o.value("path").toString();
+            break;
+        case ChainStep::Kind::ExportShifts:
+        case ChainStep::Kind::LoadShifts:
+            s.path = o.value("path").toString();
+            break;
+        case ChainStep::Kind::RunTTest:
+            s.first_trace        = o.value("first_trace").toInt();
+            s.trace_count        = o.value("trace_count").toInt();
+            s.use_last_alignment = o.value("use_last_alignment").toBool(true);
+            s.ttest_first_sample = static_cast<int64_t>(o.value("ttest_first_sample").toDouble());
+            s.ttest_n_samples    = static_cast<int64_t>(o.value("ttest_n_samples").toDouble());
+            s.ttest_byte_idx     = o.value("ttest_byte_idx").toInt();
+            s.ttest_abs          = o.value("ttest_abs").toBool(false);
             break;
         }
         out.push_back(s);
