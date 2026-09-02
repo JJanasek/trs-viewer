@@ -52,6 +52,10 @@ struct ChainStep {
     int32_t first_trace     = 0;
     int32_t trace_count     = 0;
     int32_t ref_offset      = 0;     // reference trace index within [0, trace_count)
+    int32_t ref_count       = 1;     // >1 averages this many consecutive traces
+                                      // starting at ref_offset into the template
+                                      // instead of using ref_offset alone — see
+                                      // alignByPeak/alignByXCorr's ref_trace_count.
     int64_t ref_first       = 0;     // processed-sample units
     int64_t ref_len         = 0;     // processed-sample units
     int32_t search_half     = 0;     // processed-sample units
@@ -59,6 +63,11 @@ struct ChainStep {
     bool    discard_enabled = false; // XCorr only
     double  min_corr        = 0.5;   // XCorr only
     int     output_mode     = 0;     // 0 = avg-pad, 1 = zero-pad, 2 = crop
+    int32_t align_tile_size    = 0;  // 0 = untiled; >0 = per-(trace,tile) alignment,
+                                      // see Dataset::align_tile_size.
+    int32_t align_preview_tile = 0;  // which tile's preview to bake on Apply — there's
+                                      // no dialog at execution time to ask, unlike the
+                                      // interactive "Apply to Main View" button.
 
     // --- Export -----------------------------------------------------------
     int     export_format      = 0;  // 0 = TRS, 1 = NPY, 2 = NPZ
@@ -68,10 +77,15 @@ struct ChainStep {
     QString path;                    // empty => prompt via QFileDialog when this step runs
     // ExportShifts/LoadShifts also use `path` (same empty-means-prompt rule);
     // ExportShifts writes activeDs().align_shifts, LoadShifts sets it.
+    int32_t tile_idx           = -1; // Export/RunTTest only: which tile's shifts+window to
+                                      // use when use_last_alignment and the dataset's
+                                      // alignment is tiled. -1 = unset (JSON backward
+                                      // compat) — treated as tile 0 at run time.
 
     // --- RunTTest (mirrors onRunTTest()'s parameter set; reuses
-    //     first_trace/trace_count above for the trace range, and
-    //     use_last_alignment above for its own alignment checkbox) --------
+    //     first_trace/trace_count above for the trace range,
+    //     use_last_alignment above for its own alignment checkbox, and
+    //     tile_idx above for which tile to run when tiled) ----------------
     int64_t ttest_first_sample = 0;
     int64_t ttest_n_samples    = 0;  // 0 = all
     int32_t ttest_byte_idx     = 0;  // ignored when the file has a "ttest" param

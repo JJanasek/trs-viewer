@@ -4,6 +4,7 @@
 #include "processing.h"
 #include "plot_widget.h"
 #include "ttest.h"
+#include "align.h"
 
 #include <QButtonGroup>
 #include <QComboBox>
@@ -31,6 +32,8 @@ struct DatasetSnapshot {
     int32_t align_first_trace  = 0;
     int64_t align_first_sample = 0;
     int64_t align_n_samples    = 0;
+    int32_t align_tile_size    = 0;
+    int32_t align_baked_tile   = 0;
     PlotViewState view;
 };
 
@@ -60,6 +63,14 @@ struct Dataset {
     int32_t              align_first_trace  = 0;
     int64_t              align_first_sample = 0;
     int64_t              align_n_samples    = 0;
+    // 0 = untiled (align_shifts[local_trace], today's exact behavior).
+    // >0 = each trace is num_samples/align_tile_size independent tiles,
+    // align_shifts[local_trace*n_tiles+tile_idx] — see resolveAlignmentTile().
+    int32_t              align_tile_size    = 0;
+    // Which tile the current baked preview (align_shifts + "Apply to Main
+    // View") represents; used by rebakeAlignedView() on later pipeline
+    // edits. Ignored untiled.
+    int32_t              align_baked_tile   = 0;
 
     // Plot state
     int32_t              plot_first_trace   = 0;
@@ -69,6 +80,59 @@ struct Dataset {
     std::deque<DatasetSnapshot> undo_stack;
     static constexpr int kMaxUndo = 50;
 };
+
+// ---------------------------------------------------------------------------
+// Tile-aware alignment resolution — see Dataset::align_tile_size above.
+// ---------------------------------------------------------------------------
+
+// Result of slicing one tile's plain per-trace shifts + sample window out of
+// a (possibly tile-flattened) shifts array — see sliceAlignmentTile()/
+// resolveAlignmentTile() in mainwindow.cpp.
+struct ResolvedAlignment {
+    std::vector<int32_t> shifts;      // plain shifts[local_trace], untiled shape
+    int64_t first_sample = 0;         // this tile's (or the whole array's) own window start
+    int64_t n_samples    = 0;         // ...and length
+};
+
+// Extracts tile_idx's plain per-trace shifts + sample window out of `shifts`.
+// Untiled (tile_size <= 0): `shifts` is returned unchanged, with
+// first_sample/n_samples taken from fallback_first_sample/fallback_n_samples
+// (a dataset's own align_first_sample/align_n_samples, typically). Tiled:
+// `shifts` is the flattened shifts[local_trace*n_tiles+tile_idx] array (size
+// == num_traces*n_tiles, n_tiles == n_samples_total/tile_size); returns
+// tile_idx's own per-trace slice, with first_sample/n_samples set to that
+// tile's own [tile_idx*tile_size, +tile_size) window. Malformed/stale tiled
+// data (n_tiles<=0, or shifts.size() not divisible by n_tiles) degrades to
+// an empty shifts vector — the same "no alignment" fallback every consumer
+// already handles — rather than misindexing.
+ResolvedAlignment sliceAlignmentTile(const std::vector<int32_t>& shifts,
+                                      int32_t tile_size, int64_t n_samples_total,
+                                      int32_t tile_idx,
+                                      int64_t fallback_first_sample,
+                                      int64_t fallback_n_samples);
+
+// Thin Dataset-level wrapper around sliceAlignmentTile() — the form every
+// consumer (t-test, export, the baked preview) actually calls.
+ResolvedAlignment resolveAlignmentTile(const Dataset& ds, int32_t tile_idx);
+
+// Loops tile_idx over [0, n_samples_total/tile_size), calling alignByPeak/
+// alignByXCorr once per tile — unmodified, serially (alignByXCorr already
+// parallelises internally via OpenMP; nesting a parallel loop around this
+// would oversubscribe) — with ref_first_sample offset by tile_idx*tile_size,
+// assembling the per-tile results into one flattened
+// out.shifts[local_trace*n_tiles+tile_idx] array (out.scores likewise, for
+// XCorr). Requires file->header().num_samples % tile_size == 0 (clear error
+// otherwise). progress is called with combined
+// (tile_idx*num_traces+done, n_tiles*num_traces) so it spans the whole run;
+// returns false (with error set) and leaves `out` untouched — not partially
+// filled — on cancellation or a per-tile failure.
+bool runTiledAlignment(
+    TrsFile* file, const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    int32_t first_trace, int32_t num_traces, int32_t ref_trace_offset,
+    int32_t ref_trace_count,
+    int64_t ref_first_sample, int64_t ref_num_samples, int32_t search_half,
+    int32_t tile_size, bool is_peak, bool peak_use_abs, float min_correlation,
+    AlignResult& out, AlignProgress progress, std::string& error);
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -80,6 +144,8 @@ public:
 
 private slots:
     void onOpenFile();
+    void onImportTraceSubset();
+    void onWarmPageCache();
     void onCloseDataset();
     void onSwitchDataset(int idx);
     void onApplyTraces();
@@ -101,6 +167,7 @@ private slots:
     void onAlignTraces();
     void onLoadNpyTTest();
     void onLoadNpyHeatmap();
+    void onLoadSpectrumNpz();
     void onOpenNpyTraces();
     void onExportNpy();
     void onExportNpz();
@@ -181,22 +248,36 @@ private:
     // Reads `shifts` into `count` (up to `max_display`) baked, aligned
     // traces on `pw` — raw sample window per shifts[i]/output_mode
     // (0=avg-pad,1=zero-pad,2=crop), pipeline applied same as the rest of
-    // the app. Shared by Align Traces' "Show in New Window"/"Apply to Main
-    // View" and the Chain "Align" step. Returns false (and shows a warning
-    // on msg_parent) if crop mode leaves no common range, or the user
-    // declines a large-allocation warning.
+    // the app. base_sample/window_len (default 0/0, meaning "the whole
+    // trace") bound both the output window and the raw read: 0 for
+    // window_len means h.num_samples, otherwise the read is clamped to
+    // [base_sample, base_sample+window_len) instead of the whole file — so
+    // a tile's own bounds, passed by a tiled caller, stop a large shift from
+    // pulling in a neighboring tile's samples. "Crop to common range"
+    // (output_mode==2) is only honored when base_sample==0 and
+    // window_len==h.num_samples (untiled); a tiled caller requesting it
+    // silently falls back to the tile's own window instead. Shared by Align
+    // Traces' "Show in New Window"/"Apply to Main View" and the Chain
+    // "Align" step. Returns false (and shows a warning on msg_parent) if
+    // crop mode leaves no common range, or the user declines a
+    // large-allocation warning.
     bool buildAlignedTraces(PlotWidget* pw, const std::vector<int32_t>& shifts,
                              int32_t first_tr, int output_mode, int max_display,
-                             QWidget* msg_parent);
+                             QWidget* msg_parent,
+                             int64_t base_sample = 0, int64_t window_len = 0);
 
-    // Commits an already-computed shifts vector as the active dataset's
-    // alignment (saveSnapshot + align_first_trace/align_shifts/etc.) and
-    // bakes a NUM_COLORS-trace preview into the main plot — exactly what
+    // Commits an already-computed, possibly tile-flattened shifts vector as
+    // the active dataset's alignment (saveSnapshot + align_first_trace/
+    // align_shifts/align_tile_size/align_baked_tile) and bakes a
+    // NUM_COLORS-trace preview of tile_idx into the main plot — exactly what
     // Align Traces' "Apply to Main View" button does, factored out so the
     // Chain "Align" step can reuse it after running alignByPeak/alignByXCorr
-    // itself. Returns false (with err set) if buildAlignedTraces fails.
+    // (or runTiledAlignment) itself. tile_size==0/tile_idx==0 is the untiled
+    // case (today's exact behavior). Returns false (with err set) if
+    // buildAlignedTraces fails.
     bool computeAndStoreAlignment(const std::vector<int32_t>& shifts, int32_t first_tr,
-                                   int output_mode, QWidget* msg_parent, QString& err);
+                                   int output_mode, int32_t tile_size, int32_t tile_idx,
+                                   QWidget* msg_parent, QString& err);
 
     // Executes one Chain step against the active dataset. Returns false
     // (with err set) on failure; the Chain Editor's Run loop stops there.
@@ -211,13 +292,26 @@ private:
 
     // The parallelised accumulation + Welch computation core of the t-test,
     // shared by showTTestDialog() and the Chain "Run T-test" step. shifts
-    // empty => no alignment. abs_value reports |t| instead of the signed
-    // t-statistic (each sample rectified after acc.compute() succeeds).
-    // Returns false (with err set — "Cancelled." on user cancel, empty on a
-    // declined memory warning) on failure.
+    // empty => no alignment; when non-empty, shifts[i] applies to absolute
+    // trace index (shifts_first_trace + i) — eff_first need not equal
+    // shifts_first_trace, so the shift can be applied to any subset of the
+    // aligned traces, not just the whole aligned range starting at trace 0
+    // of the window. Traces whose absolute index falls outside
+    // [shifts_first_trace, shifts_first_trace + shifts.size()) are excluded
+    // (counted alongside kAlignDiscardShift-marked ones), not run unshifted.
+    // read_lo/read_hi bound the shift-adjusted raw-sample read — [0,
+    // h.num_samples) untiled, one tile's own [tile_idx*tile_size,
+    // +tile_size) when tiled, so a shift large enough to push the read past
+    // a tile's own edge zero-pads there instead of silently pulling in a
+    // neighboring tile's samples. abs_value reports |t| instead of the
+    // signed t-statistic (each sample rectified after acc.compute()
+    // succeeds). Returns false (with err set — "Cancelled." on user cancel,
+    // empty on a declined memory warning) on failure.
     bool computeTTest(int32_t eff_first, int32_t eff_count,
                        int64_t eff_first_sample, int64_t eff_n_samples,
-                       int32_t byte_idx, const std::vector<int32_t>& shifts, bool abs_value,
+                       int32_t byte_idx, const std::vector<int32_t>& shifts,
+                       int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
+                       bool abs_value,
                        QWidget* msg_parent, std::shared_ptr<TTestAccumulator>& acc_out,
                        std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
                        QString& err);

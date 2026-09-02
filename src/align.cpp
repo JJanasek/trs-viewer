@@ -57,6 +57,40 @@ static std::vector<float> loadProcessed(
     return buf;
 }
 
+// Loads and pipeline-processes ref_num_samples starting at ref_first_sample
+// from ref_trace_count consecutive traces starting at
+// first_trace+ref_trace_offset, and returns their elementwise average — the
+// same processed length loadProcessed() would give for a single trace, since
+// every one of them shares the same raw window and pipeline. A trace that
+// comes back empty (e.g. loadProcessed found nothing) is skipped rather than
+// corrupting the average. ref_trace_count == 1 degenerates to loadProcessed()
+// exactly, byte-for-byte (dividing by the single count of 1 changes nothing).
+static std::vector<float> loadProcessedAveraged(
+    TrsFile* file, const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    int32_t first_trace, int32_t ref_trace_offset, int32_t ref_trace_count,
+    int64_t ref_first_sample, int64_t ref_num_samples)
+{
+    std::vector<float> acc;
+    int32_t used = 0;
+    for (int32_t k = 0; k < ref_trace_count; k++) {
+        auto buf = loadProcessed(file, pipeline, first_trace + ref_trace_offset + k,
+                                  ref_first_sample, ref_num_samples);
+        if (buf.empty()) continue;
+        if (acc.empty()) {
+            acc.assign(buf.size(), 0.0f);
+        } else if (buf.size() != acc.size()) {
+            continue; // pipeline should never vary output length by trace; guard anyway
+        }
+        for (size_t i = 0; i < buf.size(); i++) acc[i] += buf[i];
+        used++;
+    }
+    if (used > 1) {
+        const float inv = 1.0f / static_cast<float>(used);
+        for (auto& v : acc) v *= inv;
+    }
+    return acc;
+}
+
 // Rounds num/den to the nearest integer (ties away from zero). den > 0.
 static int64_t roundedDiv(int64_t num, int64_t den)
 {
@@ -99,6 +133,7 @@ bool alignByPeak(
     int32_t        first_trace,
     int32_t        num_traces,
     int32_t        ref_trace_offset,
+    int32_t        ref_trace_count,
     int64_t        ref_first_sample,
     int64_t        ref_num_samples,
     int32_t        search_half,
@@ -114,6 +149,7 @@ bool alignByPeak(
         error = "Reference trace offset out of range.";
         return false;
     }
+    ref_trace_count = std::clamp(ref_trace_count, 1, num_traces - ref_trace_offset);
 
     ref_first_sample = std::max<int64_t>(0, ref_first_sample);
     ref_num_samples  = std::min(ref_num_samples,
@@ -123,10 +159,11 @@ bool alignByPeak(
         return false;
     }
 
-    // Find peak in reference trace
-    int32_t ref_abs = first_trace + ref_trace_offset;
-    auto    ref_buf = loadProcessed(file, pipeline, ref_abs,
-                                    ref_first_sample, ref_num_samples);
+    // Find peak in the reference template — a single trace, or the
+    // elementwise average of ref_trace_count consecutive traces starting at
+    // ref_trace_offset (see loadProcessedAveraged).
+    auto ref_buf = loadProcessedAveraged(file, pipeline, first_trace, ref_trace_offset,
+                                          ref_trace_count, ref_first_sample, ref_num_samples);
     if (ref_buf.empty()) {
         error = "Reference region produced no samples after the processing pipeline.";
         return false;
@@ -143,7 +180,12 @@ bool alignByPeak(
             return false;
         }
 
-        if (ti == ref_trace_offset) {
+        // With a single-trace reference, trace ref_trace_offset *is* the
+        // template — shift 0 by definition, no search needed. Once averaging
+        // more than one trace, no individual trace (including ones folded
+        // into the average) is guaranteed to already match it, so every
+        // trace is searched uniformly.
+        if (ref_trace_count == 1 && ti == ref_trace_offset) {
             out.shifts[static_cast<size_t>(ti)] = 0;
             continue;
         }
@@ -182,6 +224,7 @@ bool alignByXCorr(
     int32_t        first_trace,
     int32_t        num_traces,
     int32_t        ref_trace_offset,
+    int32_t        ref_trace_count,
     int64_t        ref_first_sample,
     int64_t        ref_num_samples,
     int32_t        search_half,
@@ -198,6 +241,7 @@ bool alignByXCorr(
         error = "Reference trace offset out of range.";
         return false;
     }
+    ref_trace_count = std::clamp(ref_trace_count, 1, num_traces - ref_trace_offset);
 
     ref_first_sample = std::max<int64_t>(0, ref_first_sample);
     ref_num_samples  = std::min(ref_num_samples,
@@ -209,10 +253,12 @@ bool alignByXCorr(
 
     const int64_t M = ref_num_samples;
 
-    // Build mean-centred reference template. `M_proc` is its length after the
-    // pipeline — may be shorter than M if the pipeline decimates.
-    int32_t ref_abs = first_trace + ref_trace_offset;
-    auto    ref_raw = loadProcessed(file, pipeline, ref_abs, ref_first_sample, M);
+    // Build mean-centred reference template — a single trace, or the
+    // elementwise average of ref_trace_count consecutive traces starting at
+    // ref_trace_offset (see loadProcessedAveraged). `M_proc` is its length
+    // after the pipeline — may be shorter than M if the pipeline decimates.
+    auto ref_raw = loadProcessedAveraged(file, pipeline, first_trace, ref_trace_offset,
+                                          ref_trace_count, ref_first_sample, M);
     const int64_t M_proc = static_cast<int64_t>(ref_raw.size());
     if (M_proc < 2) {
         error = "Reference region too short after the processing pipeline "
@@ -274,7 +320,10 @@ bool alignByXCorr(
 
         #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
         for (int32_t ti = batch_start; ti < batch_end; ti++) {
-            if (ti == ref_trace_offset) {
+            // See the matching comment in alignByPeak: only a true
+            // single-trace reference makes ref_trace_offset's own shift/score
+            // trivially known in advance.
+            if (ref_trace_count == 1 && ti == ref_trace_offset) {
                 out.shifts[static_cast<size_t>(ti)] = 0;
                 out.scores[static_cast<size_t>(ti)] = 1.0f;
                 continue;
