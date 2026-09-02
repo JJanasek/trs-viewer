@@ -47,12 +47,23 @@ struct AlignResult {
 // pipeline changes the sample count (decimation, stride, FFT/STFT, …),
 // positions found in the processed buffer are rescaled back to raw sample
 // offsets, so the returned shifts always apply to raw sample positions.
+//
+// ref_trace_count > 1 builds the reference from the elementwise average of
+// that many consecutive traces starting at ref_trace_offset (clamped to fit
+// within [0, num_traces)) instead of a single trace — a less noisy template,
+// but only an improvement if those traces are already close to aligned with
+// each other; averaging jittered traces blurs the very peak being searched
+// for. ref_trace_count == 1 is the plain single-trace template (unchanged
+// behavior), and every trace — including ones folded into the average — is
+// then searched/shifted against it normally (the ref_trace_offset trace no
+// longer gets an automatic shift-0 shortcut once averaging more than one).
 bool alignByPeak(
     TrsFile*       file,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
     int32_t        first_trace,
     int32_t        num_traces,
     int32_t        ref_trace_offset,   // index within [0, num_traces)
+    int32_t        ref_trace_count,    // traces to average into the template, >= 1
     int64_t        ref_first_sample,
     int64_t        ref_num_samples,
     int32_t        search_half,        // ±samples to search in each trace
@@ -67,7 +78,7 @@ bool alignByPeak(
 // Uses the reference region of the reference trace as a normalised template.
 // Each trace is searched over ±search_half lags for the lag that maximises the
 // normalised cross-correlation with that template.  See alignByPeak for the
-// `pipeline` contract.
+// `pipeline` and ref_trace_count (averaged-reference) contract.
 //
 // min_correlation: traces whose best NCC score is below this value get
 // out.shifts[i] = kAlignDiscardShift instead of the computed shift (their
@@ -79,6 +90,7 @@ bool alignByXCorr(
     int32_t        first_trace,
     int32_t        num_traces,
     int32_t        ref_trace_offset,
+    int32_t        ref_trace_count,
     int64_t        ref_first_sample,
     int64_t        ref_num_samples,
     int32_t        search_half,

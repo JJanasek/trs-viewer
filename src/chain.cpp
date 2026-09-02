@@ -48,8 +48,12 @@ QString ChainStep::summary() const {
             extra = peak_use_abs ? ", |peak|" : ", signed peak";
         else if (discard_enabled)
             extra = QString(", discard<%1").arg(min_corr, 0, 'f', 2);
-        return QString("Align — %1, ref#%2, region[%3,%4], search±%5%6")
-            .arg(method).arg(ref_offset).arg(ref_first).arg(ref_first + ref_len)
+        if (align_tile_size > 0)
+            extra += QString(", tile=%1 (preview tile %2)").arg(align_tile_size).arg(align_preview_tile);
+        QString ref = (ref_count > 1) ? QString("ref#%1 (avg×%2)").arg(ref_offset).arg(ref_count)
+                                       : QString("ref#%1").arg(ref_offset);
+        return QString("Align — %1, %2, region[%3,%4], search±%5%6")
+            .arg(method).arg(ref).arg(ref_first).arg(ref_first + ref_len)
             .arg(search_half).arg(extra);
     }
     case Kind::Reload:
@@ -58,8 +62,9 @@ QString ChainStep::summary() const {
         static const char* kFmt[3] = {"TRS", "NPY", "NPZ"};
         QString fmt = (export_format >= 0 && export_format < 3) ? kFmt[export_format] : QString("?");
         QString dest = path.isEmpty() ? QString("(prompt for path)") : path;
-        return QString("Export %1 → %2%3").arg(fmt).arg(dest)
-            .arg(use_last_alignment ? QString(", apply alignment") : QString());
+        return QString("Export %1 → %2%3%4").arg(fmt).arg(dest)
+            .arg(use_last_alignment ? QString(", apply alignment") : QString())
+            .arg(tile_idx >= 0 ? QString(", tile %1").arg(tile_idx) : QString());
     }
     case Kind::ExportShifts:
         return QString("Export Shifts → %1").arg(path.isEmpty() ? QString("(prompt for path)") : path);
@@ -69,13 +74,14 @@ QString ChainStep::summary() const {
         QString range = trace_count > 0
             ? QString("trace[%1,%2)").arg(first_trace).arg(first_trace + trace_count)
             : QString("last alignment's range");
-        return QString("Run T-test — %1%2%3%4")
+        return QString("Run T-test — %1%2%3%4%5")
             .arg(use_last_alignment ? QString("apply alignment, ") : QString())
             .arg(range)
             .arg(ttest_n_samples > 0
                      ? QString(", sample[%1,%2)").arg(ttest_first_sample).arg(ttest_first_sample + ttest_n_samples)
                      : QString())
-            .arg(ttest_abs ? QString(", |t|") : QString());
+            .arg(ttest_abs ? QString(", |t|") : QString())
+            .arg(tile_idx >= 0 ? QString(", tile %1").arg(tile_idx) : QString());
     }
     }
     return QString("?");
@@ -216,6 +222,7 @@ bool saveChain(const QString& path, const std::vector<ChainStep>& steps, QString
             o["first_trace"]     = s.first_trace;
             o["trace_count"]     = s.trace_count;
             o["ref_offset"]      = s.ref_offset;
+            o["ref_count"]       = s.ref_count;
             o["ref_first"]       = static_cast<double>(s.ref_first);
             o["ref_len"]         = static_cast<double>(s.ref_len);
             o["search_half"]     = s.search_half;
@@ -223,6 +230,8 @@ bool saveChain(const QString& path, const std::vector<ChainStep>& steps, QString
             o["discard_enabled"] = s.discard_enabled;
             o["min_corr"]        = s.min_corr;
             o["output_mode"]     = s.output_mode;
+            o["align_tile_size"]    = s.align_tile_size;
+            o["align_preview_tile"] = s.align_preview_tile;
             break;
         case ChainStep::Kind::Export:
             o["export_format"]      = s.export_format;
@@ -230,6 +239,7 @@ bool saveChain(const QString& path, const std::vector<ChainStep>& steps, QString
             o["exp_count"]          = s.exp_count;
             o["use_last_alignment"] = s.use_last_alignment;
             o["path"]                = s.path;
+            o["tile_idx"]             = s.tile_idx;
             break;
         case ChainStep::Kind::ExportShifts:
         case ChainStep::Kind::LoadShifts:
@@ -243,6 +253,7 @@ bool saveChain(const QString& path, const std::vector<ChainStep>& steps, QString
             o["ttest_n_samples"]    = static_cast<double>(s.ttest_n_samples);
             o["ttest_byte_idx"]     = s.ttest_byte_idx;
             o["ttest_abs"]          = s.ttest_abs;
+            o["tile_idx"]            = s.tile_idx;
             break;
         }
         arr.append(o);
@@ -308,6 +319,7 @@ bool loadChain(const QString& path, std::vector<ChainStep>& steps, QString& err)
             s.first_trace     = o.value("first_trace").toInt();
             s.trace_count     = o.value("trace_count").toInt();
             s.ref_offset      = o.value("ref_offset").toInt();
+            s.ref_count       = o.value("ref_count").toInt(1); // pre-averaging chains: 1 trace
             s.ref_first       = static_cast<int64_t>(o.value("ref_first").toDouble());
             s.ref_len         = static_cast<int64_t>(o.value("ref_len").toDouble());
             s.search_half     = o.value("search_half").toInt();
@@ -315,6 +327,8 @@ bool loadChain(const QString& path, std::vector<ChainStep>& steps, QString& err)
             s.discard_enabled = o.value("discard_enabled").toBool(false);
             s.min_corr        = o.value("min_corr").toDouble(0.5);
             s.output_mode     = o.value("output_mode").toInt();
+            s.align_tile_size    = o.value("align_tile_size").toInt(0);
+            s.align_preview_tile = o.value("align_preview_tile").toInt(0);
             break;
         case ChainStep::Kind::Export:
             s.export_format      = o.value("export_format").toInt();
@@ -322,6 +336,7 @@ bool loadChain(const QString& path, std::vector<ChainStep>& steps, QString& err)
             s.exp_count            = o.value("exp_count").toInt();
             s.use_last_alignment    = o.value("use_last_alignment").toBool(true);
             s.path                    = o.value("path").toString();
+            s.tile_idx                 = o.value("tile_idx").toInt(-1);
             break;
         case ChainStep::Kind::ExportShifts:
         case ChainStep::Kind::LoadShifts:
@@ -335,6 +350,7 @@ bool loadChain(const QString& path, std::vector<ChainStep>& steps, QString& err)
             s.ttest_n_samples    = static_cast<int64_t>(o.value("ttest_n_samples").toDouble());
             s.ttest_byte_idx     = o.value("ttest_byte_idx").toInt();
             s.ttest_abs          = o.value("ttest_abs").toBool(false);
+            s.tile_idx           = o.value("tile_idx").toInt(-1);
             break;
         }
         out.push_back(s);

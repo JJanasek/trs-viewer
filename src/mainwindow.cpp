@@ -42,6 +42,7 @@
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
+#include <QStandardItemModel>
 #include <QHeaderView>
 #include <QTableWidget>
 #include <QVBoxLayout>
@@ -158,6 +159,15 @@ MainWindow::MainWindow(QWidget* parent)
             this, [this](int v){ spin_data_idx_->setValue(v); });
     tfl->addRow("First trace:", spin_first_);
     tfl->addRow("Count:", spin_count_);
+    auto* btn_select_all = new QPushButton("Select All Traces");
+    btn_select_all->setToolTip("First trace = 0, Count = every trace in the file. "
+                               "Click \"Load / Refresh\" afterward to apply it.");
+    connect(btn_select_all, &QPushButton::clicked, this, [this]() {
+        if (!hasActiveDs() || !activeDs().file) return;
+        spin_first_->setValue(0);
+        spin_count_->setValue(activeDs().file->header().num_traces);
+    });
+    tfl->addRow(btn_select_all);
     tfl->addRow(btn_apply_);
 
     // View info
@@ -667,9 +677,31 @@ void MainWindow::setupMenuBar() {
     connect(act_open, &QAction::triggered, this, &MainWindow::onOpenFile);
     file_menu->addAction(act_open);
 
+    auto* act_import_subset = new QAction("Import Trace &Subset (TRS)…", this);
+    act_import_subset->setToolTip(
+        "Pick a trace range from a (possibly huge) source TRS file and open "
+        "only that range as a new file — writes it out first, same as Export "
+        "TRS with a range, then opens the result. Avoids working with the "
+        "whole file just to look at a slice of it.");
+    connect(act_import_subset, &QAction::triggered, this, &MainWindow::onImportTraceSubset);
+    file_menu->addAction(act_import_subset);
+
     auto* act_open_npy = new QAction("Open NPY/NPZ as &traces…", this);
     connect(act_open_npy, &QAction::triggered, this, &MainWindow::onOpenNpyTraces);
     file_menu->addAction(act_open_npy);
+
+    auto* act_warm_cache = new QAction("&Warm Page Cache", this);
+    act_warm_cache->setToolTip(
+        "Opening a file never reads its data up front — every trace is read "
+        "lazily, on demand, the first time something actually needs it. That "
+        "keeps Open instant regardless of file size, but the *first* scroll/"
+        "analysis afterward pays for reading whatever it touches from disk.\n\n"
+        "This walks the whole active file once, sequentially, to warm the OS "
+        "page cache ahead of time — optional, and only worth it on slow/"
+        "networked storage where you'd rather pay that cost up front, in one "
+        "predictable pass, than have it show up as stutter later. Cancellable.");
+    connect(act_warm_cache, &QAction::triggered, this, &MainWindow::onWarmPageCache);
+    file_menu->addAction(act_warm_cache);
 
     auto* act_close = new QAction("&Close Dataset", this);
     act_close->setShortcut(QKeySequence("Ctrl+W"));
@@ -751,6 +783,15 @@ void MainWindow::setupMenuBar() {
     connect(act_load_npy_heatmap, &QAction::triggered, this, &MainWindow::onLoadNpyHeatmap);
     sca_menu->addAction(act_load_npy_heatmap);
 
+    auto* act_load_spectrum = new QAction("Load &Spectrum NPZ…", this);
+    act_load_spectrum->setToolTip(
+        "Load an NPZ holding one or more precomputed 1-D curves (e.g. from "
+        "an external FFT/PSD comparison script) and overlay them — every "
+        "1-D array becomes a curve; one named freq/frequency/x/etc. (if "
+        "present) becomes the shared X axis instead of its own curve.");
+    connect(act_load_spectrum, &QAction::triggered, this, &MainWindow::onLoadSpectrumNpz);
+    sca_menu->addAction(act_load_spectrum);
+
     QMenu* crop_menu = menuBar()->addMenu("C&rop");
     auto* act_crop = new QAction("&Range Editor…", this);
     connect(act_crop, &QAction::triggered, this, &MainWindow::onCropEdit);
@@ -778,6 +819,8 @@ void MainWindow::saveSnapshot() {
     snap.align_first_trace  = ds.align_first_trace;
     snap.align_first_sample = ds.align_first_sample;
     snap.align_n_samples    = ds.align_n_samples;
+    snap.align_tile_size    = ds.align_tile_size;
+    snap.align_baked_tile   = ds.align_baked_tile;
     snap.view               = plotWidget()->captureViewState();
     ds.undo_stack.push_front(std::move(snap));
     if (static_cast<int>(ds.undo_stack.size()) > Dataset::kMaxUndo)
@@ -792,6 +835,8 @@ void MainWindow::restoreSnapshot(DatasetSnapshot snap) {
     ds.align_first_trace  = snap.align_first_trace;
     ds.align_first_sample = snap.align_first_sample;
     ds.align_n_samples    = snap.align_n_samples;
+    ds.align_tile_size    = snap.align_tile_size;
+    ds.align_baked_tile   = snap.align_baked_tile;
 
     rebuildTransformList();
     plotWidget()->setTransforms(ds.pipeline);
@@ -807,7 +852,12 @@ void MainWindow::restoreSnapshot(DatasetSnapshot snap) {
     {
         QSignalBlocker blocker(plotWidget());
         plotWidget()->clearTraceShifts();
-        if (!ds.align_shifts.empty() && ds.plot_file_backed) {
+        // plot_file_backed alone isn't a sufficient guard here: "Load /
+        // Refresh" (onApplyTraces()) can set it back to true even for a
+        // tiled dataset. See the tile_size==0 comment there — same reason
+        // applies: align_shifts is flattened per-tile and this loop has no
+        // tile to pick, so skip the live overlay entirely when tiled.
+        if (!ds.align_shifts.empty() && ds.plot_file_backed && ds.align_tile_size == 0) {
             int n = static_cast<int>(plotWidget()->traceShifts().size());
             for (int i = 0; i < n; i++) {
                 int shift_idx = ds.plot_first_trace + i - ds.align_first_trace;
@@ -866,9 +916,24 @@ void MainWindow::updateRecentDir(const QString& key, const QString& file_path) {
 }
 
 void MainWindow::onOpenFile() {
-    QString path = QFileDialog::getOpenFileName(
-        this, "Open TRS file", recentDir("trs"), "TRS files (*.trs);;All files (*)");
-    if (!path.isEmpty()) { updateRecentDir("trs", path); openFile(path); }
+    QStringList paths = QFileDialog::getOpenFileNames(
+        this, "Open TRS file(s)", recentDir("trs"), "TRS files (*.trs);;All files (*)");
+    if (paths.isEmpty()) return;
+    updateRecentDir("trs", paths.last());
+    // Each becomes its own tab (openFile() already handles that); loaded
+    // in the order the dialog returns them, mmap-backed so nothing here
+    // blocks on file size regardless of how many are picked at once — see
+    // openFile()'s own comment (no prefetch here, on-demand page faults only).
+    for (const QString& path : paths) openFile(path);
+}
+
+void MainWindow::onWarmPageCache() {
+    if (!hasActiveDs() || activeDs().is_result || !activeDs().file) {
+        QMessageBox::information(this, "Warm Page Cache", "No file loaded.");
+        return;
+    }
+    prefetchWithProgress(activeDs().file.get(),
+        "Warming page cache for " + activeDs().display_name + "…");
 }
 
 void MainWindow::prefetchWithProgress(TrsFile* file, const QString& label) {
@@ -893,7 +958,11 @@ void MainWindow::openFile(const QString& path) {
                               QString::fromStdString(err));
         return;
     }
-    prefetchWithProgress(f.get(), "Reading " + QFileInfo(path).fileName() + "…");
+    // No prefetch here: open() is just a header parse + mmap, so this
+    // returns as fast for a multi-GB file as a tiny one — pages fault in
+    // lazily wherever the app actually reads them. See onWarmPageCache()
+    // for the opt-in version of the up-front page-cache warm-up this used
+    // to always do unconditionally.
 
     Dataset ds;
     ds.file         = std::move(f);
@@ -1080,10 +1149,17 @@ void MainWindow::onApplyTraces() {
     // freshly-truncated array back out — collapsing align_shifts down to
     // just the first trace's shift, with every trace after it silently
     // un-shifted. Block signals for the whole re-apply so it's pure display.
+    // Tiled alignment (align_tile_size > 0) has no live-view representation:
+    // align_shifts is the flattened (trace*n_tiles+tile) array, not one
+    // shift per displayed trace, and this loop's shift_idx math has no way
+    // to know which tile to show. Rather than misindex into it (silently
+    // wrong, though bounds-checked so not a crash), just leave the raw
+    // traces unshifted here — the baked "Apply to Main View" preview is the
+    // only place tiled alignment is shown visually; see the plan notes.
     {
         QSignalBlocker blocker(plotWidget());
         plotWidget()->clearTraceShifts();
-        if (!activeDs().align_shifts.empty()) {
+        if (!activeDs().align_shifts.empty() && activeDs().align_tile_size == 0) {
             int n = static_cast<int>(plotWidget()->traceShifts().size());
             for (int i = 0; i < n; i++) {
                 int shift_idx = first + i - activeDs().align_first_trace;
@@ -1111,17 +1187,33 @@ void MainWindow::onDragAlignChanged() {
     activeDs().align_shifts       = std::move(shifts);
     activeDs().align_first_sample = 0;
     activeDs().align_n_samples    = activeDs().file->header().num_samples;
+    // traceShifts() is always a flat, one-per-trace array — reset in case a
+    // prior tiled alignment's leftover align_tile_size would otherwise make
+    // resolveAlignmentTile() misinterpret it via tiled indexing.
+    activeDs().align_tile_size    = 0;
 }
 
 void MainWindow::rebakeAlignedView() {
     Dataset& ds = activeDs();
     if (ds.plot_file_backed || ds.align_n_samples <= 0 || !ds.file) return;
 
-    const auto& shifts = ds.align_shifts;
+    const TrsHeader& h = ds.file->header();
+    // Resolve the tile the current baked preview represents
+    // (ds.align_baked_tile, ignored when untiled) into a plain per-trace
+    // shifts slice + its own sample window — same helper every other
+    // tile-aware consumer uses.
+    ResolvedAlignment resolved = resolveAlignmentTile(ds, ds.align_baked_tile);
+    const auto& shifts = resolved.shifts;
     int32_t first_tr    = ds.align_first_trace;
-    int64_t out_start    = ds.align_first_sample;
-    int64_t out_len       = ds.align_n_samples;
-    const TrsHeader& h  = ds.file->header();
+    int64_t out_start    = resolved.first_sample;
+    int64_t out_len       = resolved.n_samples;
+    // Valid raw-sample bounds for the shift-adjusted read below: the whole
+    // file untiled, one tile's own [start, +tile_size) when tiled — clamping
+    // to this (instead of [0, h.num_samples)) stops a large shift from
+    // silently pulling in a neighboring tile's samples instead of
+    // zero-padding.
+    int64_t read_lo = (ds.align_tile_size > 0) ? out_start : 0;
+    int64_t read_hi = (ds.align_tile_size > 0) ? out_start + out_len : h.num_samples;
 
     int64_t effective_len = out_len;
     for (const auto& t : ds.pipeline) effective_len = t->transformedCount(effective_len);
@@ -1143,8 +1235,8 @@ void MainWindow::rebakeAlignedView() {
 
         int64_t raw_start = out_start + shift;
         int64_t raw_end   = raw_start + out_len;
-        int64_t src_start = std::max<int64_t>(0, raw_start);
-        int64_t src_end   = std::min<int64_t>(h.num_samples, raw_end);
+        int64_t src_start = std::max<int64_t>(read_lo, raw_start);
+        int64_t src_end   = std::min<int64_t>(read_hi, raw_end);
         int64_t dst_off   = src_start - raw_start;
 
         if (src_start < src_end)
@@ -1302,22 +1394,80 @@ void MainWindow::rebuildTransformList() {
 
 // Fill out[0..raw_ns) with samples of trace `trace_idx` starting at
 // `dst_base + shift`, zero-padding wherever that falls outside
-// [0, n_samples_total). This is the same windowed/shifted read used by the
-// t-test and cross-correlation accumulators to make "aligned" traces
-// actually line up on export instead of the raw, un-shifted samples being
-// read every time. shift == 0 degenerates to a plain windowed read.
+// [n_samples_lo, n_samples_hi) — the caller's own read bounds: the whole
+// file, [0, h.num_samples), when untiled; one tile's own
+// [tile_idx*tile_size, +tile_size) when tiled, so a shift that would
+// otherwise read past a tile's edge zero-pads there instead of silently
+// pulling in a neighboring tile's samples. This is the same windowed/
+// shifted read used by the t-test and cross-correlation accumulators to
+// make "aligned" traces actually line up on export instead of the raw,
+// un-shifted samples being read every time. shift == 0 degenerates to a
+// plain windowed read.
 static void readAlignedWindow(TrsFile* src, int32_t trace_idx, int64_t dst_base,
-                               int64_t raw_ns, int32_t shift, int32_t n_samples_total,
+                               int64_t raw_ns, int32_t shift,
+                               int64_t n_samples_lo, int64_t n_samples_hi,
                                float* out)
 {
     std::fill(out, out + raw_ns, 0.0f);
     int64_t adj_start = dst_base + shift;
-    if (adj_start >= n_samples_total || adj_start + raw_ns <= 0) return;
-    int64_t src_start = std::max<int64_t>(0, adj_start);
-    int64_t src_end   = std::min<int64_t>(n_samples_total, adj_start + raw_ns);
+    if (adj_start >= n_samples_hi || adj_start + raw_ns <= n_samples_lo) return;
+    int64_t src_start = std::max<int64_t>(n_samples_lo, adj_start);
+    int64_t src_end   = std::min<int64_t>(n_samples_hi, adj_start + raw_ns);
     int64_t dst_off    = src_start - adj_start;
     if (src_start < src_end)
         src->readSamples(trace_idx, src_start, src_end - src_start, out + dst_off);
+}
+
+// ---------------------------------------------------------------------------
+// Tile-aware alignment resolution — see Dataset::align_tile_size in
+// mainwindow.h. sliceAlignmentTile() is a free function operating on a raw
+// shifts vector (not Dataset) so it works both pre-Apply (the Align dialog's
+// own results/table/preview, which operate on result_ptr->shifts before
+// anything is written to Dataset) and post-Apply, via the
+// resolveAlignmentTile() wrapper below.
+// ---------------------------------------------------------------------------
+ResolvedAlignment sliceAlignmentTile(const std::vector<int32_t>& shifts,
+                                      int32_t tile_size, int64_t n_samples_total,
+                                      int32_t tile_idx,
+                                      int64_t fallback_first_sample,
+                                      int64_t fallback_n_samples)
+{
+    ResolvedAlignment out;
+    if (tile_size <= 0 || n_samples_total <= 0) {
+        // Untiled: shifts is already the plain per-trace array — pass it
+        // through unchanged, window comes from the caller's own fallback
+        // (a dataset's align_first_sample/align_n_samples, typically).
+        out.shifts       = shifts;
+        out.first_sample = fallback_first_sample;
+        out.n_samples    = fallback_n_samples;
+        return out;
+    }
+
+    int32_t n_tiles = static_cast<int32_t>(n_samples_total / tile_size);
+    if (n_tiles <= 0 || shifts.empty() || shifts.size() % static_cast<size_t>(n_tiles) != 0) {
+        // Malformed/stale tiled data — degrade to "no shifts" rather than
+        // misindex; every consumer already treats an empty shifts vector as
+        // "no alignment", the same safe fallback used everywhere else.
+        out.first_sample = fallback_first_sample;
+        out.n_samples    = fallback_n_samples;
+        return out;
+    }
+
+    tile_idx = std::clamp(tile_idx, 0, n_tiles - 1);
+    int32_t num_traces = static_cast<int32_t>(shifts.size() / static_cast<size_t>(n_tiles));
+    out.shifts.resize(static_cast<size_t>(num_traces));
+    for (int32_t lt = 0; lt < num_traces; lt++)
+        out.shifts[static_cast<size_t>(lt)] =
+            shifts[static_cast<size_t>(lt) * static_cast<size_t>(n_tiles) + static_cast<size_t>(tile_idx)];
+    out.first_sample = static_cast<int64_t>(tile_idx) * tile_size;
+    out.n_samples    = tile_size;
+    return out;
+}
+
+ResolvedAlignment resolveAlignmentTile(const Dataset& ds, int32_t tile_idx) {
+    const TrsHeader& h = ds.file->header();
+    return sliceAlignmentTile(ds.align_shifts, ds.align_tile_size, h.num_samples, tile_idx,
+                               ds.align_first_sample, ds.align_n_samples);
 }
 
 // Convert `n` float samples to the file's native sample coding and write
@@ -1368,39 +1518,64 @@ static void writeSamplesAs(FILE* fp, SampleType type, const float* data, int64_t
 }
 
 // Write a TRS file, preserving the source file's sample coding (int8/16/32/
-// float32) instead of forcing float32, and applying `shifts[i]` (if
-// non-empty) to trace `first_trace + i` the same way the t-test/xcorr
-// accumulators do — traces marked kAlignDiscardShift are dropped from the
-// output entirely. Streams in 256 K-sample chunks to keep RAM usage low.
-// Returns false and sets err_out on failure. On success, *n_written_out (if
-// non-null) receives the actual number of traces written, which can be less
-// than `count` when shifts marks some traces discarded.
+// float32) instead of forcing float32, and applying a shift to each trace
+// the same way the t-test accumulator does — shift is looked up by the
+// trace's *absolute* index (first_trace + i) against shifts_first_trace, not
+// by its position within [first_trace, first_trace+count), so first_trace
+// doesn't need to equal the alignment's own starting trace: exporting a
+// subset of the aligned range (or a range that only partly overlaps it)
+// works correctly. A trace whose absolute index falls outside
+// [shifts_first_trace, shifts_first_trace+shifts.size()), or whose shift is
+// kAlignDiscardShift, is dropped from the output entirely — never exported
+// unshifted. base_sample/window_len (default 0/0, meaning "the whole
+// trace") select a raw sample window to export instead of the whole trace —
+// a tile's own bounds, from resolveAlignmentTile(), when exporting one tile
+// of a tiled alignment; reads clamp to that window rather than the whole
+// file, so a shift can't pull in a neighboring tile's samples. Streams in
+// 256 K-sample chunks to keep RAM usage low. Returns false and sets err_out
+// on failure. On success, *n_written_out (if non-null) receives the actual
+// number of traces written, which can be less than `count` when shifts
+// marks some traces discarded or out of its own range.
 static bool exportTracesToTrs(
     const QString& out_path,
     TrsFile* src,
     int32_t first_trace, int32_t count,
-    const std::vector<int32_t>& shifts,
+    const std::vector<int32_t>& shifts, int32_t shifts_first_trace,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
     QProgressDialog* progress,
     QString& err_out,
-    int32_t* n_written_out = nullptr)
+    int32_t* n_written_out = nullptr,
+    int64_t base_sample = 0, int64_t window_len = 0)
 {
     const TrsHeader& h = src->header();
     int32_t n_req  = std::min(count, h.num_traces - first_trace);
     if (n_req <= 0) { err_out = "No traces to export."; return false; }
-    int32_t n_samples = h.num_samples;
+    if (window_len <= 0) window_len = h.num_samples;
+    int64_t n_samples = window_len;   // this window's own raw sample count
 
-    // Drop discarded traces up front so NUMBER_TRACES is correct in the
-    // header, which is written before the trace loop below.
+    // Drop discarded/out-of-alignment-range traces up front so NUMBER_TRACES
+    // is correct in the header, which is written before the trace loop below.
+    auto lookupShift = [&](int32_t src_idx, int32_t& shift_out) -> bool {
+        if (shifts.empty()) { shift_out = 0; return true; }
+        int64_t shift_idx = static_cast<int64_t>(src_idx) - shifts_first_trace;
+        if (shift_idx < 0 || shift_idx >= static_cast<int64_t>(shifts.size())) return false;
+        int32_t s = shifts[static_cast<size_t>(shift_idx)];
+        if (s == kAlignDiscardShift) return false;
+        shift_out = s;
+        return true;
+    };
     std::vector<int32_t> keep;
     keep.reserve(static_cast<size_t>(n_req));
     for (int32_t i = 0; i < n_req; i++) {
-        int32_t shift = (i < static_cast<int32_t>(shifts.size())) ? shifts[i] : 0;
-        if (shift == kAlignDiscardShift) continue;
+        int32_t unused_shift;
+        if (!lookupShift(first_trace + i, unused_shift)) continue;
         keep.push_back(i);
     }
     int32_t n_traces = static_cast<int32_t>(keep.size());
-    if (n_traces <= 0) { err_out = "No traces to export (all discarded by alignment)."; return false; }
+    if (n_traces <= 0) {
+        err_out = "No traces to export (all discarded by alignment, or outside its range).";
+        return false;
+    }
     if (n_written_out) *n_written_out = n_traces;
 
     // Compute effective output sample count after pipeline transforms.
@@ -1465,7 +1640,8 @@ static bool exportTracesToTrs(
 
         int32_t i       = keep[static_cast<size_t>(ki)];
         int32_t src_idx = first_trace + i;
-        int32_t shift   = (i < static_cast<int32_t>(shifts.size())) ? shifts[i] : 0;
+        int32_t shift   = 0;
+        lookupShift(src_idx, shift);   // already validated in the keep pass above
 
         // Auxiliary data bytes (plaintext / key)
         if (h.data_length > 0) {
@@ -1479,7 +1655,8 @@ static bool exportTracesToTrs(
         int64_t written = 0;
         while (written < n_samples) {
             int64_t chunk = std::min(CHUNK, n_samples - written);
-            readAlignedWindow(src, src_idx, written, chunk, shift, n_samples, buf.data());
+            readAlignedWindow(src, src_idx, base_sample + written, chunk, shift,
+                               base_sample, base_sample + window_len, buf.data());
             int64_t out_count = chunk;
             for (auto& t : pipeline) out_count = t->apply(buf.data(), out_count, written);
             writeSamplesAs(fp, h.sample_type, buf.data(), out_count, &clipped);
@@ -1497,44 +1674,95 @@ static bool exportTracesToTrs(
     return true;
 }
 
+// Adds a small "Select All Traces" button after First trace/Count in `fl`,
+// wired to set sp_first to 0 and sp_count to n_total in one click — so
+// picking "every trace" doesn't mean typing the exact count by hand. Safe
+// to call even if sp_count's range doesn't go up to n_total (e.g. an
+// alignment-derived cap) — setValue() clamps.
+static void addSelectAllTracesButton(QFormLayout* fl, QSpinBox* sp_first,
+                                      QSpinBox* sp_count, int32_t n_total)
+{
+    auto* btn_all = new QPushButton("Select All Traces");
+    btn_all->setToolTip("First trace = 0, Count = every trace in the file.");
+    QObject::connect(btn_all, &QPushButton::clicked, sp_count,
+        [sp_first, sp_count, n_total]() {
+            sp_first->setValue(0);
+            sp_count->setValue(n_total);
+        });
+    fl->addRow(btn_all);
+}
+
 // Adds an "Alignment" group box with an "Apply last alignment shifts"
-// checkbox to `fl`, wired so that checking it fills sp_first/sp_count with
-// the last computed alignment's range and disables manual entry — mirrors
-// the pattern already used by the t-test/xcorr configuration dialogs, so
-// export can apply the same alignment instead of silently ignoring it.
+// checkbox to `fl`, wired so that checking it *seeds* sp_first/sp_count with
+// the last computed alignment's range as a convenient starting point — not a
+// lock: they stay editable so the shifts can be applied to only a subset of
+// the aligned traces (or a range that starts somewhere else entirely)
+// instead of forcing the full aligned range. exportTracesToTrs/Npy/Npz all
+// look up each trace's shift by its absolute index against
+// shifts_first_trace, so any subset works correctly; a trace outside the
+// alignment's own range is simply excluded from the export, never exported
+// unshifted. raw_shift_count is align_shifts.size() as stored on Dataset —
+// the flattened, tile-aware size when align_tile_size > 0, in which case a
+// "Tile:" spinbox is also added inside the group box (enabled together with
+// the checkbox) and written to *sp_tile_out, and sp_first/sp_count are
+// seeded with the true per-trace count instead of the flattened one.
 // Returns the checkbox so the caller can read isChecked() after accept.
 static QCheckBox* addAlignmentGroup(QFormLayout* fl, bool has_alignment,
-                                     int32_t align_first_trace, int align_shift_count,
+                                     int32_t align_first_trace, int raw_shift_count,
                                      int discarded_count,
-                                     QSpinBox* sp_first, QSpinBox* sp_count)
+                                     int32_t align_tile_size, int64_t num_samples_total,
+                                     int32_t align_baked_tile,
+                                     QSpinBox* sp_first, QSpinBox* sp_count,
+                                     QSpinBox** sp_tile_out = nullptr)
 {
+    const bool tiled = has_alignment && (align_tile_size > 0);
+    const int32_t n_tiles = tiled
+        ? static_cast<int32_t>(num_samples_total / align_tile_size) : 1;
+    const int align_trace_count = tiled
+        ? raw_shift_count / std::max(1, n_tiles) : raw_shift_count;
+
     auto* grp  = new QGroupBox("Alignment");
     auto* fl_a = new QFormLayout(grp);
     auto* chk  = new QCheckBox("Apply last alignment shifts");
     chk->setChecked(has_alignment);
     chk->setEnabled(has_alignment);
     chk->setToolTip(has_alignment
-        ? QString("Use shifts from the last alignment run (%1 traces).%2")
-              .arg(align_shift_count)
+        ? QString("Use shifts from the last alignment run (%1 traces%2). "
+                   "First trace/Count above still narrow the export to a subset if you "
+                   "want — traces outside the alignment's own range are simply excluded "
+                   "(counted as skipped) rather than exported unshifted.%3")
+              .arg(align_trace_count)
+              .arg(tiled ? QString(", %1 tiles of %2 samples each").arg(n_tiles).arg(align_tile_size)
+                         : QString())
               .arg(discarded_count > 0
                        ? QString(" %1 of those are marked discarded and will be skipped.").arg(discarded_count)
                        : QString())
         : "No alignment has been applied to the main view yet.");
     fl_a->addRow(chk);
+
+    QSpinBox* sp_tile = nullptr;
+    if (tiled) {
+        sp_tile = new QSpinBox;
+        sp_tile->setRange(0, std::max(0, n_tiles - 1));
+        sp_tile->setValue(std::clamp(align_baked_tile, 0, std::max(0, n_tiles - 1)));
+        sp_tile->setToolTip(QString("Which of the %1 tiles to export — the alignment was "
+                                    "computed independently per (trace, tile).").arg(n_tiles));
+        sp_tile->setEnabled(chk->isChecked());
+        QObject::connect(chk, &QCheckBox::toggled, sp_tile, &QSpinBox::setEnabled);
+        fl_a->addRow("Tile:", sp_tile);
+    }
+    if (sp_tile_out) *sp_tile_out = sp_tile;
+
     QObject::connect(chk, &QCheckBox::toggled, chk,
         [=](bool on) {
             if (on) {
                 sp_first->setValue(align_first_trace);
-                sp_count->setValue(align_shift_count);
+                sp_count->setValue(align_trace_count);
             }
-            sp_first->setEnabled(!on);
-            sp_count->setEnabled(!on);
         });
     if (has_alignment) {
         sp_first->setValue(align_first_trace);
-        sp_count->setValue(align_shift_count);
-        sp_first->setEnabled(false);
-        sp_count->setEnabled(false);
+        sp_count->setValue(align_trace_count);
     }
     fl->addRow(grp);
     return chk;
@@ -1547,7 +1775,8 @@ void MainWindow::onExportTrs() {
     }
 
     // Ask which traces to export (default: all).
-    int n = activeDs().file->header().num_traces;
+    const TrsHeader& h = activeDs().file->header();
+    int n = h.num_traces;
 
     QDialog range_dlg(this);
     range_dlg.setWindowTitle("Export TRS — select range");
@@ -1560,13 +1789,16 @@ void MainWindow::onExportTrs() {
     sp_count->setValue(n);
     fl->addRow("First trace:", sp_first);
     fl->addRow("Count:",       sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, n);
 
     const bool has_alignment = (activeDs().align_n_samples > 0);
     const int  n_discarded = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
+    QSpinBox* sp_tile = nullptr;
     QCheckBox* chk_align = addAlignmentGroup(fl, has_alignment,
         activeDs().align_first_trace, static_cast<int>(activeDs().align_shifts.size()),
-        n_discarded, sp_first, sp_count);
+        n_discarded, activeDs().align_tile_size, h.num_samples, activeDs().align_baked_tile,
+        sp_first, sp_count, &sp_tile);
 
     auto* bb = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
@@ -1578,8 +1810,14 @@ void MainWindow::onExportTrs() {
     int32_t first = static_cast<int32_t>(sp_first->value());
     int32_t count = static_cast<int32_t>(sp_count->value());
     const bool use_alignment = chk_align->isChecked();
-    const std::vector<int32_t> shifts = use_alignment ? activeDs().align_shifts
-                                                        : std::vector<int32_t>{};
+    std::vector<int32_t> shifts;
+    int64_t base_sample = 0, window_len = 0;
+    if (use_alignment) {
+        ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
+        shifts      = resolved.shifts;
+        base_sample = resolved.first_sample;
+        window_len  = resolved.n_samples;
+    }
 
     QString path = QFileDialog::getSaveFileName(
         this, "Export processed TRS", recentDir("trs"), "TRS files (*.trs)");
@@ -1593,8 +1831,10 @@ void MainWindow::onExportTrs() {
 
     QString err;
     int32_t n_written = 0;
-    bool ok = exportTracesToTrs(path, activeDs().file.get(), first, count, shifts,
-                                activeDs().pipeline, &progress, err, &n_written);
+    bool ok = exportTracesToTrs(path, activeDs().file.get(), first, count,
+                                shifts, activeDs().align_first_trace,
+                                activeDs().pipeline, &progress, err, &n_written,
+                                base_sample, window_len);
     progress.setValue(count);
 
     if (!ok)
@@ -1603,6 +1843,78 @@ void MainWindow::onExportTrs() {
         QMessageBox::information(this, "Export complete",
             QString("Saved %1 trace(s) to:\n%2%3").arg(n_written).arg(path)
                 .arg(err.isEmpty() ? QString() : "\n\n" + err));
+}
+
+// Picks a trace range out of a (possibly huge) source TRS file and opens
+// only that range as a brand-new dataset, without ever making the full
+// source file the active dataset. Reuses exportTracesToTrs() — the same
+// raw-copy path "Export TRS" uses (no alignment/pipeline applied, since a
+// subset should be exactly the source's own samples) — to write the range
+// out, then opens the result through the normal openFile() flow. The source
+// TrsFile is only opened long enough to read its header (for the range
+// spinboxes) and stream the requested traces; unlike openFile(), it's never
+// prefetched, so picking a small range out of a huge file never touches more
+// of it than the requested traces actually need.
+void MainWindow::onImportTraceSubset() {
+    QString src_path = QFileDialog::getOpenFileName(
+        this, "Import Trace Subset — source TRS file",
+        recentDir("trs"), "TRS files (*.trs);;All files (*)");
+    if (src_path.isEmpty()) return;
+    updateRecentDir("trs", src_path);
+
+    TrsFile src;
+    std::string open_err;
+    if (!src.open(src_path.toStdString(), open_err)) {
+        QMessageBox::critical(this, "Error opening TRS file",
+                              QString::fromStdString(open_err));
+        return;
+    }
+    const TrsHeader& h = src.header();
+
+    QDialog range_dlg(this);
+    range_dlg.setWindowTitle("Import Trace Subset — select range");
+    auto* fl       = new QFormLayout(&range_dlg);
+    auto* sp_first = new QSpinBox;
+    auto* sp_count = new QSpinBox;
+    sp_first->setRange(0, std::max(0, h.num_traces - 1));
+    sp_first->setValue(0);
+    sp_count->setRange(1, h.num_traces);
+    sp_count->setValue(h.num_traces);
+    fl->addRow("First trace:", sp_first);
+    fl->addRow("Count:",       sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, h.num_traces);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow(bb);
+    connect(bb, &QDialogButtonBox::accepted, &range_dlg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &range_dlg, &QDialog::reject);
+    if (range_dlg.exec() != QDialog::Accepted) return;
+
+    int32_t first = static_cast<int32_t>(sp_first->value());
+    int32_t count = static_cast<int32_t>(sp_count->value());
+
+    QString out_path = QFileDialog::getSaveFileName(
+        this, "Import Trace Subset — save as", recentDir("trs"), "TRS files (*.trs)");
+    if (out_path.isEmpty()) return;
+    updateRecentDir("trs", out_path);
+
+    QProgressDialog progress("Writing subset…", "Cancel", 0, count, this);
+    progress.setWindowModality(Qt::WindowModal);
+    progress.setMinimumDuration(500);
+
+    QString err;
+    int32_t n_written = 0;
+    bool ok = exportTracesToTrs(out_path, &src, first, count, {}, 0, {}, &progress, err, &n_written);
+    progress.setValue(count);
+
+    if (!ok) {
+        QMessageBox::critical(this, "Import failed", err);
+        return;
+    }
+    if (!err.isEmpty())   // non-fatal clipping warning from exportTracesToTrs
+        QMessageBox::information(this, "Import Trace Subset", err);
+
+    openFile(out_path);
 }
 
 void MainWindow::onExportPng() {
@@ -2249,6 +2561,40 @@ static bool parseNpyRaw(const std::vector<uint8_t>& buf,
     return true;
 }
 
+// Best-effort scalar read from a raw NPY entry — used for optional metadata
+// (sample rate, window length, ...) that a spectrum/analysis NPZ often
+// carries as 0-D arrays alongside its real 1-D curves. Unlike
+// parseNpyBytes(), an empty (scalar) shape is exactly what this expects, not
+// an error. Accepts float64/float32/int64/int32; returns false (leaving out
+// untouched) for anything else.
+static bool readNpyScalar(const std::vector<uint8_t>& bytes, double& out) {
+    if (bytes.size() < 10 || bytes[0] != 0x93) return false;
+    uint8_t ver = bytes[6];
+    size_t  hdr_start = (ver == 1) ? 10 : 12;
+    if (bytes.size() < hdr_start) return false;
+    uint32_t hlen = (ver == 1)
+        ? static_cast<uint32_t>(bytes[8] | (bytes[9] << 8))
+        : static_cast<uint32_t>(bytes[8] | (bytes[9]<<8) | (bytes[10]<<16) | (bytes[11]<<24));
+    size_t data_start = hdr_start + hlen;
+    if (data_start > bytes.size()) return false;
+    std::string hdr(bytes.begin() + static_cast<ptrdiff_t>(hdr_start),
+                     bytes.begin() + static_cast<ptrdiff_t>(data_start));
+    size_t n = bytes.size() - data_start;
+    if (hdr.find("<f8") != std::string::npos && n >= 8) {
+        double v; std::memcpy(&v, bytes.data() + data_start, 8); out = v; return true;
+    }
+    if (hdr.find("<f4") != std::string::npos && n >= 4) {
+        float v; std::memcpy(&v, bytes.data() + data_start, 4); out = v; return true;
+    }
+    if (hdr.find("<i8") != std::string::npos && n >= 8) {
+        int64_t v; std::memcpy(&v, bytes.data() + data_start, 8); out = static_cast<double>(v); return true;
+    }
+    if (hdr.find("<i4") != std::string::npos && n >= 4) {
+        int32_t v; std::memcpy(&v, bytes.data() + data_start, 4); out = static_cast<double>(v); return true;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Load NPY helpers
 // ---------------------------------------------------------------------------
@@ -2839,6 +3185,227 @@ void MainWindow::onLoadNpyHeatmap() {
 }
 
 // ---------------------------------------------------------------------------
+// Load Spectrum NPZ — overlays every 1-D curve found in an NPZ archive (e.g.
+// an externally computed FFT/PSD comparison script's output) instead of
+// assuming a fixed set of array names: every 1-D numeric entry becomes a
+// curve, and one whose name matches a common frequency/x-axis convention (if
+// present) becomes the shared X axis instead of a curve of its own.
+// ---------------------------------------------------------------------------
+void MainWindow::onLoadSpectrumNpz() {
+    QString path = QFileDialog::getOpenFileName(
+        this, "Load Spectrum NPZ", recentDir("npy"), "NumPy archives (*.npz);;All files (*)");
+    if (path.isEmpty()) return;
+    updateRecentDir("npy", path);
+
+    std::map<std::string, std::vector<uint8_t>> entries;
+    QString err;
+    if (!loadNpz(path, entries, err)) {
+        QMessageBox::critical(this, "Load failed", err); return;
+    }
+
+    // Every 1-D numeric entry becomes a curve; scalars (shape=(), e.g. a
+    // sample rate or window length some capture scripts store alongside
+    // their curves) are rejected by parseNpyBytes() itself — picked back up
+    // below via readNpyScalar() as informational metadata instead.
+    struct Curve { QString name; std::vector<float> data; };
+    std::vector<Curve> curves;
+    for (const auto& [key, bytes] : entries) {
+        std::vector<float> data;
+        std::vector<int64_t> shape;
+        QString perr;
+        if (!parseNpyBytes(bytes, data, shape, perr)) continue;
+        if (shape.size() != 1 || data.empty()) continue;
+        QString name = QString::fromStdString(key);
+        if (name.endsWith(".npy", Qt::CaseInsensitive)) name.chop(4);
+        curves.push_back({name, std::move(data)});
+    }
+    if (curves.empty()) {
+        QMessageBox::critical(this, "Load failed",
+            "No 1-D numeric arrays found in this NPZ."); return;
+    }
+
+    // Pick the shared x-axis curve by name (common conventions) — everything
+    // else with a matching length becomes an overlaid curve against it. No
+    // match: fall back to plotting every curve against its own sample index.
+    static const char* kXNames[] = {
+        "freq", "frequency", "frequencies", "x", "xaxis", "bins", nullptr};
+    int x_idx = -1;
+    for (int k = 0; kXNames[k] && x_idx < 0; k++)
+        for (size_t i = 0; i < curves.size(); i++)
+            if (curves[i].name.compare(kXNames[k], Qt::CaseInsensitive) == 0) {
+                x_idx = static_cast<int>(i);
+                break;
+            }
+
+    QString x_label = "Index";
+    double  x_scale = 1.0, x_offset = 0.0;
+    size_t  x_len = 0;
+    if (x_idx >= 0) {
+        const auto& xdata = curves[static_cast<size_t>(x_idx)].data;
+        x_len = xdata.size();
+        const QString lname = curves[static_cast<size_t>(x_idx)].name.toLower();
+        const bool is_freq = (lname == "freq" || lname == "frequency" || lname == "frequencies");
+        if (is_freq && xdata.size() >= 2) {
+            // xdata is assumed evenly spaced (true by construction for any
+            // FFT-bin frequency axis, which this naming convention implies)
+            // — fit a straight line through its two endpoints rather than
+            // plotting arbitrary (x,y) pairs, matching how onRunFFT()'s own
+            // frequency axis and every other PlotWidget trace works: data at
+            // a fixed sample index, with setXScale() only affecting what the
+            // axis *labels* say. Picks one consistent unit (Hz/kHz/MHz/GHz)
+            // for the whole axis the same way onRunFFT() does.
+            const double x0 = xdata.front(), x1 = xdata.back();
+            const double step = (x1 - x0) / static_cast<double>(xdata.size() - 1);
+            const double top  = std::max(std::abs(x0), std::abs(x1));
+            double  unit_scale = 1.0;
+            QString unit_name  = "Hz";
+            if      (top >= 1e9) { unit_scale = 1e9; unit_name = "GHz"; }
+            else if (top >= 1e6) { unit_scale = 1e6; unit_name = "MHz"; }
+            else if (top >= 1e3) { unit_scale = 1e3; unit_name = "kHz"; }
+            x_scale  = step / unit_scale;
+            x_offset = x0   / unit_scale;
+            x_label  = QString("Frequency (%1)").arg(unit_name);
+        } else {
+            x_label = curves[static_cast<size_t>(x_idx)].name;
+        }
+    }
+
+    // Owns copies (not pointers into `curves`, which is a local that won't
+    // outlive this function) — rebuild() below is a lambda invoked later,
+    // from checkbox toggles, long after onLoadSpectrumNpz() has returned.
+    std::vector<Curve> y_curves;
+    for (size_t i = 0; i < curves.size(); i++) {
+        if (static_cast<int>(i) == x_idx) continue;
+        if (x_idx >= 0 && curves[i].data.size() != x_len) continue;
+        y_curves.push_back(curves[i]);
+    }
+    if (y_curves.empty()) {
+        QMessageBox::critical(this, "Load failed",
+            x_idx >= 0 ? "No curves the same length as the x-axis array were found."
+                       : "No curves found.");
+        return;
+    }
+
+    // Optional metadata (sample rate, window length, segment count, ...)
+    // some capture scripts store as 0-D scalars alongside the curves — shown
+    // for context only, never used in any computation here.
+    QStringList meta;
+    for (const auto& [key, bytes] : entries) {
+        QString name = QString::fromStdString(key);
+        if (!name.endsWith(".npy", Qt::CaseInsensitive)) continue;
+        name.chop(4);
+        bool is_curve = false;
+        for (const auto& c : curves) if (c.name == name) { is_curve = true; break; }
+        if (is_curve) continue;
+        double v;
+        if (readNpyScalar(bytes, v))
+            meta << QString("%1=%2").arg(name).arg(v, 0, 'g', 10);
+    }
+
+    // Heuristic default for the dB toggle below: spectrum/PSD data commonly
+    // spans many orders of magnitude, unreadable on a linear axis.
+    double max_abs = 0.0, min_pos = std::numeric_limits<double>::max();
+    bool   has_nonpositive = false;
+    for (const auto& c : y_curves)
+        for (float v : c.data) {
+            if (v <= 0.0f) { has_nonpositive = true; continue; }
+            double av = static_cast<double>(v);
+            max_abs = std::max(max_abs, av);
+            min_pos = std::min(min_pos, av);
+        }
+    const bool suggest_db = !has_nonpositive && min_pos < std::numeric_limits<double>::max()
+                             && max_abs > 0.0 && (max_abs / min_pos) > 1e4;
+
+    // --- Result window ---
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle(QString("Spectrum — %1%2")
+                             .arg(QFileInfo(path).fileName())
+                             .arg(meta.isEmpty() ? QString() : " — " + meta.join(", ")));
+    dlg->resize(1200, 560);
+
+    auto* pw = new PlotWidget(dlg);
+    if (x_idx >= 0) pw->setXScale(x_scale, x_offset);
+
+    auto* chk_norm = new QCheckBox("Normalize (divide by sum)");
+    chk_norm->setToolTip(
+        "Divide each curve by its own sum, independently, before anything "
+        "else — puts every curve on the same relative scale so you're "
+        "comparing spectral *shape*, not which capture happened to measure "
+        "a bigger absolute number. A curve whose sum is ~0 is left alone "
+        "(dividing by ~0 would blow up rather than normalize).");
+    auto* chk_db = new QCheckBox("Show in dB (10·log10)");
+    chk_db->setChecked(suggest_db);
+    chk_db->setToolTip("Applied after normalization (if also on). Non-positive "
+                       "values map to -400 dB rather than being dropped, so "
+                       "the trace stays continuous.");
+
+    // Rebuilds all traces from scratch (either toggle changes every curve's
+    // actual values, not just a display setting) while preserving pan/zoom
+    // across the rebuild — same pattern rebakeAlignedView()/onApplyTraces()
+    // use. Normalization is applied first (in the curve's native, linear
+    // domain) so a subsequent dB conversion is a straightforward per-curve
+    // shift by -10*log10(sum), not a mix of the two.
+    auto rebuild = [=]() {
+        const bool db   = chk_db->isChecked();
+        const bool norm = chk_norm->isChecked();
+        const bool had_view = pw->totalSamples() > 0;
+        PlotViewState saved_view = pw->captureViewState();
+        pw->clearTraces();
+        for (size_t i = 0; i < y_curves.size(); i++) {
+            auto data = std::make_shared<std::vector<float>>(y_curves[i].data);
+            if (norm) {
+                double sum = 0.0;
+                for (float v : *data) sum += v;
+                if (std::abs(sum) > 1e-30) {
+                    const float inv = static_cast<float>(1.0 / sum);
+                    for (float& v : *data) v *= inv;
+                }
+            }
+            if (db)
+                for (float& v : *data) v = (v > 0.0f) ? 10.0f * std::log10(v) : -400.0f;
+            pw->addTrace(data, TRACE_COLORS[i % NUM_COLORS], y_curves[i].name);
+        }
+        pw->setAxisLabels(x_label, db ? "Magnitude (dB)" : (norm ? "Value (normalized)" : "Value"));
+        if (had_view) pw->restoreViewState(saved_view);
+        else          pw->resetView();
+    };
+    rebuild();
+
+    connect(chk_db,   &QCheckBox::toggled, dlg, [=](bool) { rebuild(); });
+    connect(chk_norm, &QCheckBox::toggled, dlg, [=](bool) { rebuild(); });
+
+    auto* btn_exp_pdf = new QPushButton("Export PDF…");
+    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
+        QString p = QFileDialog::getSaveFileName(dlg, "Export spectrum as PDF",
+                                                 MainWindow::recentDir("export"), "PDF files (*.pdf)");
+        if (p.isEmpty()) return;
+        MainWindow::updateRecentDir("export", p);
+        QPixmap px = pw->grab();
+        QPdfWriter writer(p);
+        writer.setResolution(150);
+        writer.setPageSize(QPageSize(QPageSize::A4));
+        writer.setPageOrientation(QPageLayout::Landscape);
+        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
+        QPainter painter(&writer);
+        if (painter.isActive())
+            painter.drawPixmap(painter.viewport(), px);
+    });
+
+    auto* hl = new QHBoxLayout;
+    hl->addWidget(chk_norm);
+    hl->addWidget(chk_db);
+    hl->addStretch();
+    hl->addWidget(btn_exp_pdf);
+
+    auto* vl2 = new QVBoxLayout(dlg);
+    vl2->addWidget(pw, 1);
+    vl2->addLayout(hl);
+
+    dlg->show();
+}
+
+// ---------------------------------------------------------------------------
 // Open NPY / NPZ file as a trace set (loads into the main viewer)
 // ---------------------------------------------------------------------------
 void MainWindow::onOpenNpyTraces() {
@@ -2938,7 +3505,7 @@ void MainWindow::onOpenNpyTraces() {
         if (!f->openNpy(path.toStdString(), npy_err)) {
             QMessageBox::critical(this, "Load failed", QString::fromStdString(npy_err)); return;
         }
-        prefetchWithProgress(f.get(), "Reading " + QFileInfo(path).fileName() + "…");
+        // No prefetch here — see the matching comment in openFile().
 
         Dataset ds;
         ds.file         = std::move(f);
@@ -3064,29 +3631,47 @@ static bool exportTracesToNpy(
     const QString& out_path,
     TrsFile* src,
     int32_t first_trace, int32_t count,
-    const std::vector<int32_t>& shifts,
+    const std::vector<int32_t>& shifts, int32_t shifts_first_trace,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
     QWidget* msg_parent,
     QProgressDialog* progress,
     QString& err_out,
-    int32_t* n_written_out = nullptr)
+    int32_t* n_written_out = nullptr,
+    int64_t base_sample = 0, int64_t window_len = 0)
 {
     const TrsHeader& h = src->header();
     int32_t n_req = std::min(count, h.num_traces - first_trace);
     if (n_req <= 0) { err_out = "No traces to export."; return false; }
+    if (window_len <= 0) window_len = h.num_samples;
 
+    // See exportTracesToTrs()'s comment: shift is looked up by absolute
+    // trace index against shifts_first_trace, not by position within
+    // [first_trace, first_trace+count), so first_trace need not equal the
+    // alignment's own starting trace.
+    auto lookupShift = [&](int32_t src_idx, int32_t& shift_out) -> bool {
+        if (shifts.empty()) { shift_out = 0; return true; }
+        int64_t shift_idx = static_cast<int64_t>(src_idx) - shifts_first_trace;
+        if (shift_idx < 0 || shift_idx >= static_cast<int64_t>(shifts.size())) return false;
+        int32_t s = shifts[static_cast<size_t>(shift_idx)];
+        if (s == kAlignDiscardShift) return false;
+        shift_out = s;
+        return true;
+    };
     std::vector<int32_t> keep;
     keep.reserve(static_cast<size_t>(n_req));
     for (int32_t i = 0; i < n_req; i++) {
-        int32_t shift = (i < static_cast<int32_t>(shifts.size())) ? shifts[i] : 0;
-        if (shift == kAlignDiscardShift) continue;
+        int32_t unused_shift;
+        if (!lookupShift(first_trace + i, unused_shift)) continue;
         keep.push_back(i);
     }
-    if (keep.empty()) { err_out = "No traces to export (all discarded by alignment)."; return false; }
+    if (keep.empty()) {
+        err_out = "No traces to export (all discarded by alignment, or outside its range).";
+        return false;
+    }
     int32_t n_out = static_cast<int32_t>(keep.size());
     if (n_written_out) *n_written_out = n_out;
 
-    int64_t out_samples = h.num_samples;
+    int64_t out_samples = window_len;
     for (const auto& t : pipeline) out_samples = t->transformedCount(out_samples);
 
     // Allocate full matrix (may be large)
@@ -3102,9 +3687,9 @@ static bool exportTracesToNpy(
     }
 
     std::vector<float> matrix(total);
-    // buf must hold both the raw read (h.num_samples) AND the post-pipeline output
+    // buf must hold both the raw read (window_len) AND the post-pipeline output
     // (out_samples); expanding transforms like STFT can produce more samples than input.
-    std::vector<float> buf(static_cast<size_t>(std::max((int64_t)h.num_samples, out_samples)));
+    std::vector<float> buf(static_cast<size_t>(std::max(window_len, out_samples)));
 
     for (int32_t ki = 0; ki < n_out; ki++) {
         if (progress) {
@@ -3114,10 +3699,12 @@ static bool exportTracesToNpy(
         }
         int32_t i     = keep[static_cast<size_t>(ki)];
         int32_t src_idx = first_trace + i;
-        int32_t shift = shifts.empty() ? 0 : shifts[static_cast<size_t>(i)];
-        readAlignedWindow(src, src_idx, 0, h.num_samples, shift, h.num_samples, buf.data());
+        int32_t shift = 0;
+        lookupShift(src_idx, shift);   // already validated in the keep pass above
+        readAlignedWindow(src, src_idx, base_sample, window_len, shift,
+                           base_sample, base_sample + window_len, buf.data());
         for (const auto& t : pipeline) t->reset();
-        int64_t n_samp = h.num_samples;
+        int64_t n_samp = window_len;
         for (const auto& t : pipeline) n_samp = t->apply(buf.data(), n_samp, 0);
         std::copy(buf.begin(), buf.begin() + static_cast<size_t>(n_samp),
                   matrix.begin() + static_cast<ptrdiff_t>(ki) * static_cast<ptrdiff_t>(out_samples));
@@ -3136,34 +3723,52 @@ static bool exportTracesToNpz(
     const QString& out_path,
     TrsFile* src,
     int32_t first_trace, int32_t count,
-    const std::vector<int32_t>& shifts,
+    const std::vector<int32_t>& shifts, int32_t shifts_first_trace,
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
     QProgressDialog* progress,
     QString& err_out,
-    int32_t* n_written_out = nullptr)
+    int32_t* n_written_out = nullptr,
+    int64_t base_sample = 0, int64_t window_len = 0)
 {
     const TrsHeader& h = src->header();
     int32_t n_req = std::min(count, h.num_traces - first_trace);
     if (n_req <= 0) { err_out = "No traces to export."; return false; }
+    if (window_len <= 0) window_len = h.num_samples;
 
+    // See exportTracesToTrs()'s comment: shift is looked up by absolute
+    // trace index against shifts_first_trace, not by position within
+    // [first_trace, first_trace+count), so first_trace need not equal the
+    // alignment's own starting trace.
+    auto lookupShift = [&](int32_t src_idx, int32_t& shift_out) -> bool {
+        if (shifts.empty()) { shift_out = 0; return true; }
+        int64_t shift_idx = static_cast<int64_t>(src_idx) - shifts_first_trace;
+        if (shift_idx < 0 || shift_idx >= static_cast<int64_t>(shifts.size())) return false;
+        int32_t s = shifts[static_cast<size_t>(shift_idx)];
+        if (s == kAlignDiscardShift) return false;
+        shift_out = s;
+        return true;
+    };
     std::vector<int32_t> keep;
     keep.reserve(static_cast<size_t>(n_req));
     for (int32_t i = 0; i < n_req; i++) {
-        int32_t shift = (i < static_cast<int32_t>(shifts.size())) ? shifts[i] : 0;
-        if (shift == kAlignDiscardShift) continue;
+        int32_t unused_shift;
+        if (!lookupShift(first_trace + i, unused_shift)) continue;
         keep.push_back(i);
     }
-    if (keep.empty()) { err_out = "No traces to export (all discarded by alignment)."; return false; }
+    if (keep.empty()) {
+        err_out = "No traces to export (all discarded by alignment, or outside its range).";
+        return false;
+    }
     int32_t n_out = static_cast<int32_t>(keep.size());
     if (n_written_out) *n_written_out = n_out;
 
-    int64_t out_samples = h.num_samples;
+    int64_t out_samples = window_len;
     for (const auto& t : pipeline) out_samples = t->transformedCount(out_samples);
 
     std::vector<float> traces(static_cast<size_t>(n_out) * static_cast<size_t>(out_samples));
-    // buf must hold both the raw read (h.num_samples) AND the post-pipeline output
+    // buf must hold both the raw read (window_len) AND the post-pipeline output
     // (out_samples); expanding transforms like STFT can produce more samples than input.
-    std::vector<float> buf(static_cast<size_t>(std::max((int64_t)h.num_samples, out_samples)));
+    std::vector<float> buf(static_cast<size_t>(std::max(window_len, out_samples)));
 
     for (int32_t ki = 0; ki < n_out; ki++) {
         if (progress) {
@@ -3173,10 +3778,12 @@ static bool exportTracesToNpz(
         }
         int32_t i     = keep[static_cast<size_t>(ki)];
         int32_t src_idx = first_trace + i;
-        int32_t shift = shifts.empty() ? 0 : shifts[static_cast<size_t>(i)];
-        readAlignedWindow(src, src_idx, 0, h.num_samples, shift, h.num_samples, buf.data());
+        int32_t shift = 0;
+        lookupShift(src_idx, shift);   // already validated in the keep pass above
+        readAlignedWindow(src, src_idx, base_sample, window_len, shift,
+                           base_sample, base_sample + window_len, buf.data());
         for (const auto& t : pipeline) t->reset();
-        int64_t n_samp = h.num_samples;
+        int64_t n_samp = window_len;
         for (const auto& t : pipeline) n_samp = t->apply(buf.data(), n_samp, 0);
         std::copy(buf.begin(), buf.begin() + static_cast<size_t>(n_samp),
                   traces.begin() + static_cast<ptrdiff_t>(ki) * static_cast<ptrdiff_t>(out_samples));
@@ -3221,13 +3828,16 @@ void MainWindow::onExportNpy() {
     auto* sp_count = new QSpinBox; sp_count->setRange(1, h.num_traces); sp_count->setValue(h.num_traces);
     fl->addRow("First trace:", sp_first);
     fl->addRow("Count:",       sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, h.num_traces);
 
     const bool has_alignment = (activeDs().align_n_samples > 0);
     const int  n_discarded = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
+    QSpinBox* sp_tile = nullptr;
     QCheckBox* chk_align = addAlignmentGroup(fl, has_alignment,
         activeDs().align_first_trace, static_cast<int>(activeDs().align_shifts.size()),
-        n_discarded, sp_first, sp_count);
+        n_discarded, activeDs().align_tile_size, h.num_samples, activeDs().align_baked_tile,
+        sp_first, sp_count, &sp_tile);
 
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     fl->addRow(bb);
@@ -3238,8 +3848,14 @@ void MainWindow::onExportNpy() {
     int32_t first = static_cast<int32_t>(sp_first->value());
     int32_t count = static_cast<int32_t>(sp_count->value());
     const bool use_alignment = chk_align->isChecked();
-    const std::vector<int32_t> shifts = use_alignment ? activeDs().align_shifts
-                                                        : std::vector<int32_t>{};
+    std::vector<int32_t> shifts;
+    int64_t base_sample = 0, window_len = 0;
+    if (use_alignment) {
+        ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
+        shifts      = resolved.shifts;
+        base_sample = resolved.first_sample;
+        window_len  = resolved.n_samples;
+    }
 
     QString path = QFileDialog::getSaveFileName(
         this, "Export traces as NPY", recentDir("npy"), "NumPy files (*.npy)");
@@ -3252,12 +3868,14 @@ void MainWindow::onExportNpy() {
 
     QString err;
     int32_t n_written = 0;
-    bool ok = exportTracesToNpy(path, activeDs().file.get(), first, count, shifts,
-                                 activeDs().pipeline, this, &prog, err, &n_written);
+    bool ok = exportTracesToNpy(path, activeDs().file.get(), first, count,
+                                 shifts, activeDs().align_first_trace,
+                                 activeDs().pipeline, this, &prog, err, &n_written,
+                                 base_sample, window_len);
     if (!ok) {
         if (err != "Export cancelled.") QMessageBox::critical(this, "Export failed", err);
     } else {
-        int64_t out_samples = h.num_samples;
+        int64_t out_samples = (window_len > 0) ? window_len : h.num_samples;
         for (const auto& t : activeDs().pipeline) out_samples = t->transformedCount(out_samples);
         QMessageBox::information(this, "Exported",
             QString("Saved %1 × %2 matrix to:\n%3").arg(n_written).arg(out_samples).arg(path));
@@ -3280,13 +3898,16 @@ void MainWindow::onExportNpz() {
     auto* sp_count = new QSpinBox; sp_count->setRange(1, h.num_traces); sp_count->setValue(h.num_traces);
     fl->addRow("First trace:", sp_first);
     fl->addRow("Count:",       sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, h.num_traces);
 
     const bool has_alignment = (activeDs().align_n_samples > 0);
     const int  n_discarded = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
+    QSpinBox* sp_tile = nullptr;
     QCheckBox* chk_align = addAlignmentGroup(fl, has_alignment,
         activeDs().align_first_trace, static_cast<int>(activeDs().align_shifts.size()),
-        n_discarded, sp_first, sp_count);
+        n_discarded, activeDs().align_tile_size, h.num_samples, activeDs().align_baked_tile,
+        sp_first, sp_count, &sp_tile);
 
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     if (h.data_length > 0)
@@ -3300,8 +3921,14 @@ void MainWindow::onExportNpz() {
     int32_t first = static_cast<int32_t>(sp_first->value());
     int32_t count = static_cast<int32_t>(sp_count->value());
     const bool use_alignment = chk_align->isChecked();
-    const std::vector<int32_t> shifts = use_alignment ? activeDs().align_shifts
-                                                        : std::vector<int32_t>{};
+    std::vector<int32_t> shifts;
+    int64_t base_sample = 0, window_len = 0;
+    if (use_alignment) {
+        ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
+        shifts      = resolved.shifts;
+        base_sample = resolved.first_sample;
+        window_len  = resolved.n_samples;
+    }
 
     QString path = QFileDialog::getSaveFileName(
         this, "Export traces as NPZ", recentDir("npy"), "NumPy archives (*.npz)");
@@ -3314,12 +3941,14 @@ void MainWindow::onExportNpz() {
 
     QString err;
     int32_t n_written = 0;
-    bool ok = exportTracesToNpz(path, activeDs().file.get(), first, count, shifts,
-                                 activeDs().pipeline, &prog, err, &n_written);
+    bool ok = exportTracesToNpz(path, activeDs().file.get(), first, count,
+                                 shifts, activeDs().align_first_trace,
+                                 activeDs().pipeline, &prog, err, &n_written,
+                                 base_sample, window_len);
     if (!ok) {
         if (err != "Export cancelled.") QMessageBox::critical(this, "Export failed", err);
     } else {
-        int64_t out_samples = h.num_samples;
+        int64_t out_samples = (window_len > 0) ? window_len : h.num_samples;
         for (const auto& t : activeDs().pipeline) out_samples = t->transformedCount(out_samples);
         QMessageBox::information(this, "Exported",
             QString("Saved %1 × %2 traces%3 to:\n%4")
@@ -3339,7 +3968,9 @@ void MainWindow::onExportNpz() {
 // ---------------------------------------------------------------------------
 bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
                                int64_t eff_first_sample, int64_t eff_n_samples,
-                               int32_t byte_idx, const std::vector<int32_t>& shifts, bool abs_value,
+                               int32_t byte_idx, const std::vector<int32_t>& shifts,
+                               int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
+                               bool abs_value,
                                QWidget* msg_parent, std::shared_ptr<TTestAccumulator>& acc_out,
                                std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
                                QString& err)
@@ -3430,14 +4061,28 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
             if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
             int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
 
-            // Read window with per-trace shift, zero-pad out of bounds
-            int32_t shift = (ti < static_cast<int32_t>(use_shifts.size())) ? use_shifts[ti] : 0;
-            if (shift == kAlignDiscardShift) { thread_discarded[tid]++; continue; }
+            // Read window with per-trace shift, zero-pad out of bounds.
+            // Looked up by src_idx's position in the *alignment's own*
+            // range, not by ti — eff_first may start anywhere (a subset of
+            // the aligned traces), so ti==0 does not generally mean
+            // "the first aligned trace".
+            int32_t shift = 0;
+            if (!use_shifts.empty()) {
+                int64_t shift_idx = static_cast<int64_t>(src_idx) - shifts_first_trace;
+                if (shift_idx < 0 || shift_idx >= static_cast<int64_t>(use_shifts.size())) {
+                    thread_discarded[tid]++; continue;   // outside the alignment's coverage
+                }
+                shift = use_shifts[static_cast<size_t>(shift_idx)];
+                if (shift == kAlignDiscardShift) { thread_discarded[tid]++; continue; }
+            }
             const int64_t adj_start = eff_first_sample + shift;
             std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
-            if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
-                int64_t src_start = std::max<int64_t>(0, adj_start);
-                int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
+            // Clamp to read_lo/read_hi (the whole file untiled, one tile's
+            // own bounds when tiled) rather than [0, h.num_samples) so a
+            // shift can't pull in a neighboring tile's samples.
+            if (adj_start < read_hi && adj_start + raw_ns > read_lo) {
+                int64_t src_start = std::max<int64_t>(read_lo, adj_start);
+                int64_t src_end   = std::min<int64_t>(read_hi, adj_start + raw_ns);
                 int64_t dst_off   = src_start - adj_start;
                 int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
                                                       trace_buf.data() + dst_off);
@@ -3471,7 +4116,8 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
         if (skipped > 0)
             msg << QString("%1 traces skipped (data byte out of range).").arg(skipped);
         if (discarded_by_align > 0)
-            msg << QString("%1 traces excluded (below alignment correlation threshold).")
+            msg << QString("%1 traces excluded (outside the alignment's range, or below its "
+                           "correlation threshold).")
                        .arg(discarded_by_align);
         QMessageBox::warning(msg_parent, "T-test", msg.join("\n"));
     }
@@ -3529,11 +4175,18 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     sp_s_count->setSpecialValueText("All");
     fl->addRow("First trace:", sp_first);
     fl->addRow("Count:",       sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, n_total);
     fl->addRow("First sample:", sp_s_first);
     fl->addRow("Sample count (0=all):", sp_s_count);
 
     // Alignment group
     const bool has_alignment = (activeDs().align_n_samples > 0);
+    const bool ds_tiled = has_alignment && (activeDs().align_tile_size > 0);
+    const int32_t n_tiles_now = ds_tiled
+        ? static_cast<int32_t>(h.num_samples / activeDs().align_tile_size) : 1;
+    const int32_t align_trace_count = ds_tiled
+        ? static_cast<int32_t>(activeDs().align_shifts.size()) / std::max(1, n_tiles_now)
+        : static_cast<int32_t>(activeDs().align_shifts.size());
     const int  n_align_discarded = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
     auto* grp_align  = new QGroupBox("Alignment");
@@ -3542,27 +4195,56 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     chk_shifts->setChecked(has_alignment);
     chk_shifts->setEnabled(has_alignment);
     chk_shifts->setToolTip(has_alignment
-        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3)."
-                   "%4")
-              .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
+        ? QString("Use shifts from the last alignment run (%1 traces%2). "
+                   "First trace/Count/First sample/Sample count above still narrow the run to "
+                   "a subset if you want — traces outside the alignment's own range are simply "
+                   "excluded (counted as skipped) rather than run unshifted.%3")
+              .arg(align_trace_count)
+              .arg(ds_tiled
+                       ? QString(", %1 tiles of %2 samples each").arg(n_tiles_now).arg(activeDs().align_tile_size)
+                       : QString(", first_sample=%1, n_samples=%2")
+                             .arg(activeDs().align_first_sample).arg(activeDs().align_n_samples))
               .arg(n_align_discarded > 0
                        ? QString(" %1 of those are marked discarded and will be skipped.").arg(n_align_discarded)
                        : QString())
         : "No alignment has been applied to the main view yet.");
     fl_align->addRow(chk_shifts);
+
+    // Tile selector — only when the stored alignment is tiled. Drives which
+    // tile's shifts+window applyAlignmentToSpinboxes()/the accept-time code
+    // below resolve via resolveAlignmentTile().
+    QSpinBox* sp_tile = nullptr;
+    if (ds_tiled) {
+        sp_tile = new QSpinBox;
+        sp_tile->setRange(0, std::max(0, n_tiles_now - 1));
+        sp_tile->setValue(std::clamp(activeDs().align_baked_tile, 0, std::max(0, n_tiles_now - 1)));
+        sp_tile->setToolTip(QString("Which of the %1 tiles to run — the alignment was computed "
+                                    "independently per (trace, tile).").arg(n_tiles_now));
+        fl_align->addRow("Tile:", sp_tile);
+    }
+
+    // Seeds First trace/Count/First sample/Sample count from the alignment's
+    // own range (tile-resolved, when tiled) when checked — a convenient
+    // starting point, not a lock: they stay editable so the shift can be
+    // applied to only a subset of the aligned traces/samples instead of
+    // forcing the full aligned range. computeTTest() looks up each trace's
+    // shift by its absolute index, so any subset works correctly regardless
+    // of where it starts.
     auto applyAlignmentToSpinboxes = [&](bool on) {
         if (on) {
             sp_first->setValue(activeDs().align_first_trace);
-            sp_count->setValue(static_cast<int>(activeDs().align_shifts.size()));
-            sp_s_first->setValue(static_cast<int>(activeDs().align_first_sample));
-            sp_s_count->setValue(static_cast<int>(activeDs().align_n_samples));
+            sp_count->setValue(align_trace_count);
+            int32_t tile_idx = sp_tile ? sp_tile->value() : 0;
+            ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), tile_idx);
+            sp_s_first->setValue(static_cast<int>(resolved.first_sample));
+            sp_s_count->setValue(static_cast<int>(resolved.n_samples));
         }
-        sp_first->setEnabled(!on);
-        sp_count->setEnabled(!on);
-        sp_s_first->setEnabled(!on);
-        sp_s_count->setEnabled(!on);
     };
     connect(chk_shifts, &QCheckBox::toggled, [&](bool on){ applyAlignmentToSpinboxes(on); });
+    if (sp_tile)
+        connect(sp_tile, QOverload<int>::of(&QSpinBox::valueChanged), [&](int){
+            if (chk_shifts->isChecked()) applyAlignmentToSpinboxes(true);
+        });
     if (has_alignment) applyAlignmentToSpinboxes(true);
     fl->addRow(grp_align);
 
@@ -3608,20 +4290,27 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     int32_t byte_idx = have_ttest_param ? auto_byte_idx
                                         : static_cast<int32_t>(sp_byte->value());
 
+    // Trace/sample range are always whatever's in the spinboxes now — Apply
+    // last alignment shifts only controls whether shifts get looked up and
+    // applied, not the range itself, so it can be applied to a subset of the
+    // aligned traces instead of forcing the full aligned range.
     const bool use_alignment = chk_shifts->isChecked();
-    const int32_t eff_first  = use_alignment ? activeDs().align_first_trace : first;
-    const int32_t eff_count  = use_alignment ? static_cast<int32_t>(activeDs().align_shifts.size()) : count;
+    const int32_t eff_first  = first;
+    const int32_t eff_count  = count;
     const int64_t eff_first_sample = static_cast<int64_t>(sp_s_first->value());
     const int64_t eff_n_samples    = static_cast<int64_t>(sp_s_count->value()); // 0 = all
-    const std::vector<int32_t> use_shifts = use_alignment ? activeDs().align_shifts : std::vector<int32_t>{};
+    const int32_t tile_idx = sp_tile ? sp_tile->value() : 0;
+    ResolvedAlignment resolved_tt = resolveAlignmentTile(activeDs(), tile_idx);
+    const std::vector<int32_t> use_shifts = use_alignment ? resolved_tt.shifts : std::vector<int32_t>{};
+    const int32_t shifts_first_trace = activeDs().align_first_trace;
+    // Valid raw-sample bounds for the shift-adjusted read — one tile's own
+    // bounds when tiled, the whole file otherwise (see computeTTest()).
+    const int64_t read_lo = ds_tiled ? resolved_tt.first_sample : 0;
+    const int64_t read_hi = ds_tiled ? resolved_tt.first_sample + resolved_tt.n_samples : h.num_samples;
 
     const bool abs_value = chk_abs->isChecked();
 
     if (onAddToChain && chk_add_chain->isChecked()) {
-        // first/count (not eff_first/eff_count) so a step authored without
-        // alignment yet still has a sensible fallback trace range recorded —
-        // runTTestChainStep() re-derives eff_first/eff_count itself from
-        // use_last_alignment + whatever alignment exists when it actually runs.
         ChainStep s;
         s.kind                = ChainStep::Kind::RunTTest;
         s.first_trace          = first;
@@ -3631,6 +4320,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         s.ttest_n_samples             = eff_n_samples;
         s.ttest_byte_idx                = byte_idx;
         s.ttest_abs                       = abs_value;
+        s.tile_idx                        = ds_tiled ? tile_idx : -1;
         onAddToChain(s);
     }
 
@@ -3639,7 +4329,8 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     int64_t n0 = 0, n1 = 0;
     QString compute_err;
     if (!computeTTest(eff_first, eff_count, eff_first_sample, eff_n_samples, byte_idx, use_shifts,
-                       abs_value, this, acc_ptr, tstat, n0, n1, compute_err)) {
+                       shifts_first_trace, read_lo, read_hi, abs_value, this,
+                       acc_ptr, tstat, n0, n1, compute_err)) {
         if (!compute_err.isEmpty() && compute_err != "Cancelled.")
             QMessageBox::critical(this, "T-test failed", compute_err);
         return;
@@ -4365,6 +5056,7 @@ void MainWindow::onRunXCorr() {
     auto* sp_count   = new QSpinBox; sp_count->setRange(1, n_total); sp_count->setValue(n_total);
     fl_traces->addRow("First trace:", sp_first);
     fl_traces->addRow("Count:",       sp_count);
+    addSelectAllTracesButton(fl_traces, sp_first, sp_count, n_total);
 
     // Sample range
     auto* grp_samples = new QGroupBox("Samples");
@@ -4433,8 +5125,13 @@ void MainWindow::onRunXCorr() {
         lbl_dual_warn->setEnabled(rb_dual->isChecked() || rb_mp->isChecked());
     });
 
-    // Alignment group
-    const bool has_alignment_xcorr = (activeDs().align_n_samples > 0);
+    // Alignment group. Tiled alignment isn't supported here yet
+    // (align_shifts.size() would be num_traces*n_tiles, fed straight into
+    // the compute loop below as a trace count) — treated the same as "no
+    // alignment" so the checkbox stays off and disabled, with its own
+    // explanatory tooltip.
+    const bool has_alignment_xcorr   = (activeDs().align_n_samples > 0) && (activeDs().align_tile_size <= 0);
+    const bool tiled_alignment_xcorr = (activeDs().align_n_samples > 0) && (activeDs().align_tile_size > 0);
     const int  n_align_discarded_xcorr = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
     auto* grp_align_xcorr  = new QGroupBox("Alignment");
@@ -4442,14 +5139,16 @@ void MainWindow::onRunXCorr() {
     auto* chk_shifts_xcorr = new QCheckBox("Apply last alignment shifts");
     chk_shifts_xcorr->setChecked(has_alignment_xcorr);
     chk_shifts_xcorr->setEnabled(has_alignment_xcorr);
-    chk_shifts_xcorr->setToolTip(has_alignment_xcorr
-        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3)."
-                   "%4")
-              .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
-              .arg(n_align_discarded_xcorr > 0
-                       ? QString(" %1 of those are marked discarded and will be skipped.").arg(n_align_discarded_xcorr)
-                       : QString())
-        : "No alignment has been applied to the main view yet.");
+    chk_shifts_xcorr->setToolTip(tiled_alignment_xcorr
+        ? "The last alignment run used tiling — Cross-Correlation doesn't support tiled alignment yet."
+        : has_alignment_xcorr
+              ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3)."
+                         "%4")
+                    .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
+                    .arg(n_align_discarded_xcorr > 0
+                             ? QString(" %1 of those are marked discarded and will be skipped.").arg(n_align_discarded_xcorr)
+                             : QString())
+              : "No alignment has been applied to the main view yet.");
     fl_align_xcorr->addRow(chk_shifts_xcorr);
     // NOTE: [=] (not [&]) throughout this dialog — cfg is non-modal, so
     // onRunXCorr() returns as soon as cfg->show() runs, and these lambdas keep
@@ -5538,19 +6237,27 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
 // Builds up to max_display aligned traces (raw window per shifts[i]/
 // output_mode, pipeline applied) onto pw. Shared by Align Traces' "Show in
 // New Window"/"Apply to Main View" buttons and the Chain "Align" step.
-// output_mode: 0=avg-pad, 1=zero-pad, 2=crop to common range.
-// Returns false (and warns on msg_parent) if crop mode leaves no common
-// range, or a large-allocation warning is declined.
+// output_mode: 0=avg-pad, 1=zero-pad, 2=crop to common range (untiled only —
+// see mainwindow.h for base_sample/window_len). Returns false (and warns on
+// msg_parent) if crop mode leaves no common range, or a large-allocation
+// warning is declined.
 // ---------------------------------------------------------------------------
 bool MainWindow::buildAlignedTraces(PlotWidget* pw, const std::vector<int32_t>& shifts,
                                      int32_t first_tr, int output_mode, int max_display,
-                                     QWidget* msg_parent)
+                                     QWidget* msg_parent,
+                                     int64_t base_sample, int64_t window_len)
 {
     const TrsHeader& h = activeDs().file->header();
+    if (window_len <= 0) window_len = h.num_samples;
+    // A non-default window means the caller resolved one tile's own bounds —
+    // "Crop to common range" doesn't make sense there (per-tile crop bounds
+    // reassembling into one trace is ambiguous), so it's only honored when
+    // base_sample/window_len are still the untiled defaults.
+    const bool tiled_window = (base_sample != 0 || window_len != h.num_samples);
     int32_t num_tr = static_cast<int32_t>(shifts.size());
 
     int64_t out_start, out_len;
-    if (output_mode == 2) {
+    if (output_mode == 2 && !tiled_window) {
         int64_t crop_start = 0;
         int64_t crop_end   = h.num_samples;
         for (int i = 0; i < num_tr; i++) {
@@ -5567,9 +6274,13 @@ bool MainWindow::buildAlignedTraces(PlotWidget* pw, const std::vector<int32_t>& 
         out_start = crop_start;
         out_len   = crop_end - crop_start;
     } else {
-        out_start = 0;
-        out_len   = h.num_samples;
+        out_start = base_sample;
+        out_len   = window_len;
     }
+    // Valid raw-sample bounds for the shift-adjusted read below: the whole
+    // file untiled, one tile's own [base_sample, +window_len) when tiled.
+    const int64_t read_lo = tiled_window ? base_sample : 0;
+    const int64_t read_hi = tiled_window ? base_sample + window_len : h.num_samples;
 
     // Effective sample count after the processing pipeline — an expanding
     // stage (e.g. STFT) needs a larger buffer than out_len.
@@ -5611,8 +6322,8 @@ bool MainWindow::buildAlignedTraces(PlotWidget* pw, const std::vector<int32_t>& 
 
         int64_t raw_start = out_start + shift;
         int64_t raw_end   = raw_start + out_len;
-        int64_t src_start = std::max<int64_t>(0, raw_start);
-        int64_t src_end   = std::min<int64_t>(h.num_samples, raw_end);
+        int64_t src_start = std::max<int64_t>(read_lo, raw_start);
+        int64_t src_end   = std::min<int64_t>(read_hi, raw_end);
         int64_t dst_off   = src_start - raw_start;
 
         if (src_start < src_end)
@@ -5658,19 +6369,31 @@ bool MainWindow::buildAlignedTraces(PlotWidget* pw, const std::vector<int32_t>& 
 }
 
 // ---------------------------------------------------------------------------
-// Commits shifts as the active dataset's alignment and bakes a NUM_COLORS
-// preview into the main plot — exactly what Align Traces' "Apply to Main
-// View" does, factored out so the Chain "Align" step can reuse it after
-// running alignByPeak/alignByXCorr itself.
+// Commits shifts (possibly a tile-flattened array, when tile_size > 0) as
+// the active dataset's alignment and bakes a NUM_COLORS preview of tile_idx
+// into the main plot — exactly what Align Traces' "Apply to Main View" does,
+// factored out so the Chain "Align" step can reuse it after running
+// alignByPeak/alignByXCorr (or runTiledAlignment) itself.
 // ---------------------------------------------------------------------------
 bool MainWindow::computeAndStoreAlignment(const std::vector<int32_t>& shifts, int32_t first_tr,
-                                           int output_mode, QWidget* msg_parent, QString& err)
+                                           int output_mode, int32_t tile_size, int32_t tile_idx,
+                                           QWidget* msg_parent, QString& err)
 {
-    const TrsHeader& h   = activeDs().file->header();
-    const int32_t num_tr = static_cast<int32_t>(shifts.size());
+    const TrsHeader& h = activeDs().file->header();
 
-    int64_t out_start = 0, out_len = h.num_samples;
-    if (output_mode == 2) {
+    // Resolve tile_idx's own plain per-trace shifts + sample window out of
+    // `shifts` — untiled (tile_size==0), this is `shifts` itself with the
+    // whole-file window.
+    ResolvedAlignment resolved = sliceAlignmentTile(shifts, tile_size, h.num_samples, tile_idx,
+                                                      0, h.num_samples);
+
+    // Crop-mode range (untiled only — "Crop to common range" is disabled in
+    // the UI when tiled, since per-tile crop bounds reassembling into one
+    // trace is ambiguous; a stale tiled step still requesting it silently
+    // falls back to the tile's own window here instead of crashing).
+    int64_t out_start = resolved.first_sample, out_len = resolved.n_samples;
+    if (output_mode == 2 && tile_size <= 0) {
+        int32_t num_tr = static_cast<int32_t>(shifts.size());
         int64_t crop_start = 0, crop_end = h.num_samples;
         for (int i = 0; i < num_tr; i++) {
             int32_t sraw = shifts[static_cast<size_t>(i)];
@@ -5689,6 +6412,8 @@ bool MainWindow::computeAndStoreAlignment(const std::vector<int32_t>& shifts, in
     activeDs().align_first_sample = out_start;
     activeDs().align_n_samples    = out_len;
     activeDs().align_shifts.assign(shifts.begin(), shifts.end());
+    activeDs().align_tile_size    = tile_size;
+    activeDs().align_baked_tile   = tile_idx;
 
     // Show only NUM_COLORS representative traces in the main plot. These
     // are in-memory baked-in traces — mark as not file-backed so drag-align
@@ -5698,7 +6423,8 @@ bool MainWindow::computeAndStoreAlignment(const std::vector<int32_t>& shifts, in
     // otherwise the pipeline would be applied a second time on top of the
     // already-processed result.
     plotWidget()->clearTraces();
-    if (!buildAlignedTraces(plotWidget(), shifts, first_tr, output_mode, NUM_COLORS, msg_parent)) {
+    if (!buildAlignedTraces(plotWidget(), resolved.shifts, first_tr, output_mode, NUM_COLORS,
+                             msg_parent, resolved.first_sample, resolved.n_samples)) {
         err = "Failed to build aligned preview.";
         return false;
     }
@@ -5781,6 +6507,75 @@ static bool loadShiftsCsv(const QString& path, int32_t& first_trace_out,
 }
 
 // ---------------------------------------------------------------------------
+// Loops tile_idx over every tile, calling alignByPeak/alignByXCorr once per
+// tile — unmodified, serially — with ref_first_sample offset by
+// tile_idx*tile_size, and assembles the flattened
+// out.shifts[local_trace*n_tiles+tile_idx] array. See mainwindow.h for the
+// full contract.
+// ---------------------------------------------------------------------------
+bool runTiledAlignment(
+    TrsFile* file, const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    int32_t first_trace, int32_t num_traces, int32_t ref_trace_offset,
+    int32_t ref_trace_count,
+    int64_t ref_first_sample, int64_t ref_num_samples, int32_t search_half,
+    int32_t tile_size, bool is_peak, bool peak_use_abs, float min_correlation,
+    AlignResult& out, AlignProgress progress, std::string& error)
+{
+    const TrsHeader& h = file->header();
+    if (tile_size <= 0 || h.num_samples % tile_size != 0) {
+        error = "Tile size must evenly divide the trace's raw sample count ("
+              + std::to_string(h.num_samples) + " samples).";
+        return false;
+    }
+    const int32_t n_tiles = static_cast<int32_t>(h.num_samples / tile_size);
+
+    // Assembled into a local first, only moved into `out` on full success —
+    // so a cancelled/failed run leaves the caller's `out` untouched rather
+    // than partially filled.
+    AlignResult assembled;
+    assembled.shifts.assign(
+        static_cast<size_t>(num_traces) * static_cast<size_t>(n_tiles), kAlignDiscardShift);
+    assembled.scores.assign(
+        static_cast<size_t>(num_traces) * static_cast<size_t>(n_tiles), 0.0f);
+
+    for (int32_t tile_idx = 0; tile_idx < n_tiles; tile_idx++) {
+        AlignResult tile_result;
+        int64_t tile_ref_first = static_cast<int64_t>(tile_idx) * tile_size + ref_first_sample;
+
+        // Combined tiles*traces progress spanning the whole run.
+        auto tile_progress = [&](int done, int total) -> bool {
+            (void)total;
+            return progress ? progress(tile_idx * num_traces + done, n_tiles * num_traces) : true;
+        };
+
+        bool ok;
+        if (is_peak) {
+            ok = alignByPeak(file, pipeline, first_trace, num_traces, ref_trace_offset,
+                              ref_trace_count, tile_ref_first, ref_num_samples, search_half,
+                              peak_use_abs, tile_result, tile_progress, error);
+        } else {
+            ok = alignByXCorr(file, pipeline, first_trace, num_traces, ref_trace_offset,
+                               ref_trace_count, tile_ref_first, ref_num_samples, search_half,
+                               min_correlation, tile_result, tile_progress, error);
+        }
+        if (!ok) return false;   // error/"Cancelled." already set by alignByPeak/alignByXCorr
+
+        for (int32_t lt = 0; lt < num_traces; lt++) {
+            assembled.shifts[static_cast<size_t>(lt) * static_cast<size_t>(n_tiles)
+                              + static_cast<size_t>(tile_idx)] =
+                tile_result.shifts[static_cast<size_t>(lt)];
+            if (!tile_result.scores.empty())
+                assembled.scores[static_cast<size_t>(lt) * static_cast<size_t>(n_tiles)
+                                  + static_cast<size_t>(tile_idx)] =
+                    tile_result.scores[static_cast<size_t>(lt)];
+        }
+    }
+
+    out = std::move(assembled);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // Trace alignment dialog
 // ---------------------------------------------------------------------------
 void MainWindow::onAlignTraces() {
@@ -5820,6 +6615,21 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     sp_ref->setRange(0, h.num_traces - 1);
     sp_ref->setValue(spin_first_->value());
     sp_ref->setToolTip("Absolute trace index used as the alignment template.");
+
+    // Optional averaging: build the template from the elementwise average of
+    // this many consecutive traces starting at Reference trace, instead of
+    // that one trace alone. A less noisy template — but only an improvement
+    // if those traces are already close to aligned with each other; averaging
+    // jittered traces blurs the very feature being searched for. Default 1 =
+    // today's exact single-trace behavior.
+    auto* sp_ref_count = new QSpinBox;
+    sp_ref_count->setRange(1, h.num_traces);
+    sp_ref_count->setValue(1);
+    sp_ref_count->setToolTip(
+        "Average this many consecutive traces (starting at Reference trace) "
+        "into the template instead of using a single trace — reduces noise "
+        "in the template, but only helps if those traces are already close "
+        "to aligned with each other. 1 = use the reference trace alone.");
 
     // Reference region — in pipeline-processed sample units (see note above).
     auto* sp_ref_first = new QSpinBox;
@@ -5889,6 +6699,23 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     region_hl->addWidget(sp_ref_len);
     region_hl->addWidget(btn_draw);
     region_hl->addStretch();
+
+    // Tile size — 0 (default) is today's untiled behavior. >0 splits each
+    // trace into num_samples/tile_size independent tiles and computes one
+    // shift per (trace, tile) pair — see runTiledAlignment().
+    auto* sp_tile_size = new QSpinBox;
+    sp_tile_size->setRange(0, static_cast<int>(std::min<int64_t>(INT32_MAX, h.num_samples)));
+    sp_tile_size->setValue(0);
+    sp_tile_size->setSpecialValueText("Whole trace");
+    sp_tile_size->setToolTip(
+        "Split each trace into num_samples/tile_size independent tiles and align "
+        "each (trace, tile) pair separately — e.g. a capture that repeats the same "
+        "operation N times back-to-back. Must evenly divide the trace's raw sample "
+        "count. 0 = whole trace (today's untiled behavior).\n"
+        "The reference region above is relative to the start of each tile, not the "
+        "start of the trace. Keep the search half-window within one tile — this is "
+        "not enforced, and a too-large search window can pull in a neighboring "
+        "tile's samples.");
 
     // Method
     auto* combo_method = new QComboBox;
@@ -5961,10 +6788,20 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     tr_hl->addWidget(sp_tr_first);
     tr_hl->addWidget(new QLabel("Count:"));
     tr_hl->addWidget(sp_tr_count);
+    auto* btn_tr_all = new QPushButton("All");
+    btn_tr_all->setToolTip("First = 0, Count = every trace in the file.");
+    int32_t h_num_traces = h.num_traces;
+    connect(btn_tr_all, &QPushButton::clicked, dlg, [sp_tr_first, sp_tr_count, h_num_traces]() {
+        sp_tr_first->setValue(0);
+        sp_tr_count->setValue(h_num_traces);
+    });
+    tr_hl->addWidget(btn_tr_all);
     tr_hl->addStretch();
 
     fl->addRow("Reference trace:",   sp_ref);
+    fl->addRow("Average reference over (traces):", sp_ref_count);
     fl->addRow("Reference region (pipeline samples):", region_row);
+    fl->addRow("Tile size (samples, 0 = whole trace):", sp_tile_size);
     fl->addRow("Method:",            combo_method);
     fl->addRow("Search window ± (pipeline samples):", sp_search);
     fl->addRow(peak_row);
@@ -5986,6 +6823,21 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     vl->addWidget(run_row);
 
     // ── Results (shown after a successful run) ────────────────────────────────
+    // Tile selector — shown only when the current result is tiled (Run with
+    // Tile size > 0, or a loaded shift table, which is always untiled).
+    // Drives showResults()'s displayed slice, "Show in New Window…"'s
+    // preview, and the tile Apply to Main View bakes.
+    auto* result_tile_row = new QWidget;
+    auto* result_tile_hl  = new QHBoxLayout(result_tile_row);
+    result_tile_hl->setContentsMargins(0, 0, 0, 0);
+    result_tile_hl->addWidget(new QLabel("Tile:"));
+    auto* sp_result_tile = new QSpinBox;
+    sp_result_tile->setRange(0, 0);
+    result_tile_hl->addWidget(sp_result_tile);
+    result_tile_hl->addStretch();
+    result_tile_row->setVisible(false);
+    vl->addWidget(result_tile_row);
+
     auto* tbl = new QTableWidget(0, 3);
     tbl->setHorizontalHeaderLabels({"Trace", "Shift (samples)", "Correlation"});
     tbl->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -6010,7 +6862,24 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     combo_output->setToolTip(
         "Pad with average: fill the shifted-in region with the mean of each trace.\n"
         "Pad with zeros: fill with 0.\n"
-        "Crop: trim all traces to the sample range where every trace has real data.");
+        "Crop: trim all traces to the sample range where every trace has real data.\n"
+        "Crop is unavailable when tiled — per-tile crop bounds reassembling into "
+        "one trace is ambiguous.");
+    // "Crop to common range" doesn't make sense when tiled (see tooltip
+    // above) — disable that combo entry, and bounce a current selection of
+    // it back to avg-pad, whenever Tile size is set.
+    auto* combo_output_model = qobject_cast<QStandardItemModel*>(combo_output->model());
+    auto updateCropAvailability = [=]() {
+        bool tiled_now = sp_tile_size->value() > 0;
+        if (combo_output_model) {
+            if (auto* item = combo_output_model->item(2)) item->setEnabled(!tiled_now);
+        }
+        if (tiled_now && combo_output->currentIndex() == 2)
+            combo_output->setCurrentIndex(0);
+    };
+    connect(sp_tile_size, QOverload<int>::of(&QSpinBox::valueChanged), dlg,
+            [updateCropAvailability](int){ updateCropAvailability(); });
+    updateCropAvailability();
     auto* btn_show  = new QPushButton("Show in New Window…");
     auto* btn_apply = new QPushButton(onAddToChain ? "Apply to Main View + Add to Chain"
                                                      : "Apply to Main View");
@@ -6031,30 +6900,49 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     output_row->hide();
     vl->addWidget(output_row);
 
-    // Shared mutable state between Run and Show
-    auto result_ptr = std::make_shared<AlignResult>();
+    // Shared mutable state between Run and Show. result_ptr->shifts is the
+    // flattened tile-aware array when result_tile_size_ptr's value is > 0
+    // (size == num_traces*n_tiles), a plain per-trace array otherwise —
+    // result_first_tr_ptr remembers the first_tr that produced it, so the
+    // Tile selector's own valueChanged handler (which has no other way to
+    // know it) can re-run showResults() with the right trace numbering.
+    auto result_ptr           = std::make_shared<AlignResult>();
+    auto result_tile_size_ptr = std::make_shared<int32_t>(0);
+    auto result_first_tr_ptr  = std::make_shared<int32_t>(0);
 
     // Populates the results table + reveals the output controls from
     // whatever's currently in result_ptr — shared by a live Run and by
     // loading a shift table from a file, so both end up in the same state.
+    // When tiled, result_ptr->shifts is the flattened
+    // shifts[local_trace*n_tiles+tile_idx] array — iterates local_trace and
+    // indexes accordingly, showing first_tr+local_trace (not first_tr+i) in
+    // the Trace column, same as every other tile-aware consumer.
     auto showResults = [=](int32_t first_tr) {
-        int32_t num_tr = static_cast<int32_t>(result_ptr->shifts.size());
+        const int32_t tsz = *result_tile_size_ptr;
+        const int32_t n_tiles = tsz > 0
+            ? static_cast<int32_t>(h.num_samples / tsz) : 1;
+        const int32_t sel_tile = std::clamp(
+            static_cast<int32_t>(sp_result_tile->value()), 0, std::max(0, n_tiles - 1));
+        const int32_t num_tr = (tsz > 0 && n_tiles > 0)
+            ? static_cast<int32_t>(result_ptr->shifts.size()) / n_tiles
+            : static_cast<int32_t>(result_ptr->shifts.size());
         const auto& scores = result_ptr->scores;
         int n_discarded = 0;
         tbl->setRowCount(0);
-        for (int i = 0; i < num_tr; i++) {
+        for (int local_trace = 0; local_trace < num_tr; local_trace++) {
+            int idx = (tsz > 0) ? local_trace * n_tiles + sel_tile : local_trace;
             int row = tbl->rowCount();
             tbl->insertRow(row);
-            const int32_t shift = result_ptr->shifts[static_cast<size_t>(i)];
+            const int32_t shift = result_ptr->shifts[static_cast<size_t>(idx)];
             const bool discarded = (shift == kAlignDiscardShift);
             if (discarded) n_discarded++;
 
-            auto* item_trace = new QTableWidgetItem(QString::number(first_tr + i));
+            auto* item_trace = new QTableWidgetItem(QString::number(first_tr + local_trace));
             auto* item_shift = new QTableWidgetItem(
                 discarded ? QString("discarded") : QString::number(shift));
             auto* item_score = new QTableWidgetItem(
-                (i < static_cast<int>(scores.size()))
-                    ? QString::number(scores[static_cast<size_t>(i)], 'f', 3)
+                (idx < static_cast<int>(scores.size()))
+                    ? QString::number(scores[static_cast<size_t>(idx)], 'f', 3)
                     : QString());
             if (discarded) {
                 for (auto* item : {item_trace, item_shift, item_score}) {
@@ -6076,9 +6964,17 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
             lbl_discard_summary->hide();
         }
 
+        result_tile_row->setVisible(tsz > 0);
+        if (tsz > 0) {
+            QSignalBlocker blocker(sp_result_tile);   // avoid re-entering showResults
+            sp_result_tile->setRange(0, std::max(0, n_tiles - 1));
+            sp_result_tile->setValue(sel_tile);
+        }
         output_row->show();
         dlg->adjustSize();
     };
+    connect(sp_result_tile, QOverload<int>::of(&QSpinBox::valueChanged), dlg,
+            [=](int){ showResults(*result_first_tr_ptr); });
 
     // ── Run ──────────────────────────────────────────────────────────────────
     connect(btn_run, &QPushButton::clicked, dlg, [=]() {
@@ -6098,6 +6994,7 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
                     .arg(ref_abs).arg(first_tr).arg(first_tr + num_tr));
             return;
         }
+        int32_t ref_count = static_cast<int32_t>(sp_ref_count->value());
 
         // sp_ref_first/sp_ref_len/sp_search are pipeline-processed sample
         // units (see comment at the top of onAlignTraces); convert to raw
@@ -6132,21 +7029,28 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
         const bool  discard_enabled = !is_peak && chk_discard->isChecked();
         const float min_corr        = discard_enabled
             ? static_cast<float>(sp_min_corr->value()) : -2.0f;
+        const int32_t tile_size_val = static_cast<int32_t>(sp_tile_size->value());
 
         std::string err;
         bool ok;
-        if (is_peak) {
+        if (tile_size_val > 0) {
+            ok = runTiledAlignment(activeDs().file.get(), activeDs().pipeline,
+                                    first_tr, num_tr, ref_off, ref_count,
+                                    ref_first, ref_len, shalf, tile_size_val,
+                                    is_peak, use_abs, min_corr,
+                                    *result_ptr, progress_fn, err);
+        } else if (is_peak) {
             ok = alignByPeak(activeDs().file.get(), activeDs().pipeline,
-                             first_tr, num_tr, ref_off,
+                             first_tr, num_tr, ref_off, ref_count,
                              ref_first, ref_len, shalf, use_abs,
                              *result_ptr, progress_fn, err);
         } else {
             ok = alignByXCorr(activeDs().file.get(), activeDs().pipeline,
-                              first_tr, num_tr, ref_off,
+                              first_tr, num_tr, ref_off, ref_count,
                               ref_first, ref_len, shalf, min_corr,
                               *result_ptr, progress_fn, err);
         }
-        prog.setValue(num_tr);
+        prog.setValue(prog.maximum());
 
         if (!ok) {
             if (!err.empty())
@@ -6155,6 +7059,17 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
             return;
         }
 
+        *result_tile_size_ptr = tile_size_val;
+        *result_first_tr_ptr  = first_tr;
+        // A tiled result can't round-trip through the flat (trace,offset)
+        // CSV format — see the Export Shifts handler below.
+        btn_export_shifts->setEnabled(tile_size_val == 0);
+        btn_export_shifts->setToolTip(tile_size_val == 0
+            ? "Save the (trace,offset) table shown above to a text file — omitted/"
+              "discarded traces are left out, so it can later be reloaded with "
+              "some traces intentionally excluded."
+            : "Export/Load Shifts doesn't support tiled alignment yet — use the "
+              "per-tile Export (TRS/NPY/NPZ) buttons instead.");
         showResults(first_tr);
     });
 
@@ -6178,6 +7093,14 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
             return;
         }
         result_ptr->scores.clear();   // not available from a file — table shows blank scores
+        // A loaded (trace,offset) CSV is always a flat, untiled table.
+        *result_tile_size_ptr = 0;
+        *result_first_tr_ptr  = first_tr;
+        btn_export_shifts->setEnabled(true);
+        btn_export_shifts->setToolTip(
+            "Save the (trace,offset) table shown above to a text file — omitted/"
+            "discarded traces are left out, so it can later be reloaded with "
+            "some traces intentionally excluded.");
 
         sp_tr_first->setValue(first_tr);
         sp_tr_count->setValue(static_cast<int>(result_ptr->shifts.size()));
@@ -6190,8 +7113,18 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     });
 
     // ── Export shifts to file ───────────────────────────────────────────────
+    // saveShiftsCsv()'s flat (trace,offset) format has no room for a tile
+    // axis, so exporting a tiled result_ptr->shifts (btn_export_shifts is
+    // also disabled in that case — this is a belt-and-braces guard) would
+    // silently write the wrong thing rather than erroring.
     connect(btn_export_shifts, &QPushButton::clicked, dlg, [=]() {
         if (result_ptr->shifts.empty()) return;
+        if (*result_tile_size_ptr > 0) {
+            QMessageBox::critical(dlg, "Export Shifts",
+                "Export/Load Shifts doesn't support tiled alignment yet — use the "
+                "per-tile Export (TRS/NPY/NPZ) buttons instead.");
+            return;
+        }
         QString path = QFileDialog::getSaveFileName(dlg, "Export alignment shifts",
                                                      MainWindow::recentDir("align_shifts"),
                                                      "CSV files (*.csv);;All files (*)");
@@ -6214,21 +7147,33 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     // ── Show aligned traces ───────────────────────────────────────────────────
     // Builds aligned trace data into a PlotWidget from the dialog's current
     // result/range/output-mode — thin wrapper around buildAlignedTraces(),
-    // which also backs the Chain "Align" step (see mainwindow.h).
+    // which also backs the Chain "Align" step (see mainwindow.h). Resolves
+    // the selected tile (if any) via sliceAlignmentTile() first, since
+    // result_ptr->shifts may still be the flattened tile-aware array.
     auto buildAligned = [=](PlotWidget* pw, int max_display = INT_MAX) -> bool {
-        return buildAlignedTraces(pw, result_ptr->shifts,
+        int32_t tsz = *result_tile_size_ptr;
+        int32_t tile_idx = tsz > 0 ? static_cast<int32_t>(sp_result_tile->value()) : 0;
+        ResolvedAlignment resolved = sliceAlignmentTile(result_ptr->shifts, tsz, h.num_samples,
+                                                          tile_idx, 0, h.num_samples);
+        return buildAlignedTraces(pw, resolved.shifts,
                                    static_cast<int32_t>(sp_tr_first->value()),
-                                   combo_output->currentIndex(), max_display, dlg);
+                                   combo_output->currentIndex(), max_display, dlg,
+                                   resolved.first_sample, resolved.n_samples);
     };
 
     connect(btn_show, &QPushButton::clicked, dlg, [=]() {
         if (result_ptr->shifts.empty()) return;
+        int32_t tsz = *result_tile_size_ptr;
+        int32_t tile_idx = tsz > 0 ? static_cast<int32_t>(sp_result_tile->value()) : 0;
+        ResolvedAlignment resolved = sliceAlignmentTile(result_ptr->shifts, tsz, h.num_samples,
+                                                          tile_idx, 0, h.num_samples);
         int32_t num_tr = static_cast<int32_t>(std::count_if(
-            result_ptr->shifts.begin(), result_ptr->shifts.end(),
+            resolved.shifts.begin(), resolved.shifts.end(),
             [](int32_t s) { return s != kAlignDiscardShift; }));
 
         auto* vdlg = new QDialog(dlg);
-        vdlg->setWindowTitle(QString("Aligned traces — %1 traces").arg(num_tr));
+        vdlg->setWindowTitle(QString("Aligned traces — %1 traces%2").arg(num_tr)
+                                 .arg(tsz > 0 ? QString(" (tile %1)").arg(tile_idx) : QString()));
         vdlg->setAttribute(Qt::WA_DeleteOnClose);
         auto* vl2 = new QVBoxLayout(vdlg);
         auto* pw  = new PlotWidget(vdlg);
@@ -6243,10 +7188,17 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
 
     connect(btn_apply, &QPushButton::clicked, dlg, [=]() {
         if (result_ptr->shifts.empty()) return;
+        const int32_t tsz = *result_tile_size_ptr;
+        // The tile applied is whatever the current result was actually
+        // produced with (result_tile_size_ptr), not sp_tile_size's live
+        // value — the user may have changed Tile size after Running without
+        // Running again, in which case result_ptr->shifts is still shaped
+        // for the old tile_size and must be resolved accordingly.
+        const int32_t apply_tile_idx = tsz > 0 ? static_cast<int32_t>(sp_result_tile->value()) : 0;
         QString err;
         if (!computeAndStoreAlignment(result_ptr->shifts,
                                        static_cast<int32_t>(sp_tr_first->value()),
-                                       combo_output->currentIndex(), dlg, err))
+                                       combo_output->currentIndex(), tsz, apply_tile_idx, dlg, err))
             return;   // buildAlignedTraces() already showed the warning, if any
 
         if (onAddToChain) {
@@ -6261,6 +7213,7 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
             s.first_trace     = static_cast<int32_t>(sp_tr_first->value());
             s.trace_count     = static_cast<int32_t>(sp_tr_count->value());
             s.ref_offset      = static_cast<int32_t>(sp_ref->value()) - s.first_trace;
+            s.ref_count       = static_cast<int32_t>(sp_ref_count->value());
             s.ref_first       = static_cast<int64_t>(sp_ref_first->value());
             s.ref_len         = static_cast<int64_t>(sp_ref_len->value());
             s.search_half     = static_cast<int32_t>(sp_search->value());
@@ -6268,6 +7221,8 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
             s.discard_enabled = chk_discard->isChecked();
             s.min_corr        = sp_min_corr->value();
             s.output_mode     = combo_output->currentIndex();
+            s.align_tile_size    = tsz;
+            s.align_preview_tile = apply_tile_idx;
             onAddToChain(s);
         }
         dlg->accept();
@@ -6278,10 +7233,12 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
 }
 
 // ---------------------------------------------------------------------------
-// Chain "Run T-test" step: resolves the trace range from the last
-// alignment (if step.use_last_alignment and one exists) or the step's own
-// first_trace/trace_count, then computeTTest() + buildTTestResultTab() —
-// same two calls showTTestDialog() makes after its config dialog closes.
+// Chain "Run T-test" step: always runs over the step's own
+// first_trace/trace_count (the exact range chosen when the step was
+// authored — matches showTTestDialog(), which no longer forces the full
+// aligned range either). use_last_alignment only controls whether shifts
+// get looked up/applied for that range, so a step can run alignment-shifted
+// on any subset of the aligned traces.
 // ---------------------------------------------------------------------------
 bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, QString& err) {
     const TrsHeader& h = activeDs().file->header();
@@ -6295,22 +7252,28 @@ bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, Q
         ? static_cast<int32_t>(h.param_map.at("ttest").offset)
         : step.ttest_byte_idx;
 
-    const bool use_alignment = step.use_last_alignment && activeDs().align_n_samples > 0;
-    const int32_t eff_first = use_alignment ? activeDs().align_first_trace : step.first_trace;
-    const int32_t eff_count = use_alignment ? static_cast<int32_t>(activeDs().align_shifts.size())
-                                              : step.trace_count;
+    const int32_t eff_first = step.first_trace;
+    const int32_t eff_count = step.trace_count;
     if (eff_count < 2) {
         err = "Not enough traces in range (need at least 2).";
         return false;
     }
-    const std::vector<int32_t> use_shifts = use_alignment ? activeDs().align_shifts
+    const bool use_alignment = step.use_last_alignment && activeDs().align_n_samples > 0;
+    const bool ds_tiled = activeDs().align_tile_size > 0;
+    const int32_t tile_idx = std::max<int32_t>(0, step.tile_idx);
+    ResolvedAlignment resolved_tt = resolveAlignmentTile(activeDs(), tile_idx);
+    const std::vector<int32_t> use_shifts = use_alignment ? resolved_tt.shifts
                                                              : std::vector<int32_t>{};
+    const int32_t shifts_first_trace = activeDs().align_first_trace;
+    const int64_t read_lo = ds_tiled ? resolved_tt.first_sample : 0;
+    const int64_t read_hi = ds_tiled ? resolved_tt.first_sample + resolved_tt.n_samples : h.num_samples;
 
     std::shared_ptr<TTestAccumulator> acc_ptr;
     std::vector<float> tstat;
     int64_t n0 = 0, n1 = 0;
     if (!computeTTest(eff_first, eff_count, step.ttest_first_sample, step.ttest_n_samples,
-                       byte_idx, use_shifts, step.ttest_abs, msg_parent, acc_ptr, tstat, n0, n1, err))
+                       byte_idx, use_shifts, shifts_first_trace, read_lo, read_hi, step.ttest_abs,
+                       msg_parent, acc_ptr, tstat, n0, n1, err))
         return false;
 
     buildTTestResultTab(acc_ptr, std::move(tstat), n0, n1, eff_count, step.ttest_abs);
@@ -6396,19 +7359,30 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         AlignResult result;
         std::string aerr;
         bool ok;
-        if (step.align_method == 0) {
+        // loadChain() defaults ref_count to 1 for chains saved before this
+        // field existed, matching the single-reference behavior those chains
+        // ran with; alignByPeak/alignByXCorr/runTiledAlignment also clamp it
+        // to >= 1 themselves regardless, so it's safe to pass through as-is.
+        if (step.align_tile_size > 0) {
+            ok = runTiledAlignment(activeDs().file.get(), pipeline_now, first_tr, num_tr, step.ref_offset,
+                                    step.ref_count, ref_first, ref_len, shalf, step.align_tile_size,
+                                    step.align_method == 0, step.peak_use_abs,
+                                    step.discard_enabled ? static_cast<float>(step.min_corr) : -2.0f,
+                                    result, progress_fn, aerr);
+        } else if (step.align_method == 0) {
             ok = alignByPeak(activeDs().file.get(), pipeline_now, first_tr, num_tr, step.ref_offset,
-                              ref_first, ref_len, shalf, step.peak_use_abs, result, progress_fn, aerr);
+                              step.ref_count, ref_first, ref_len, shalf, step.peak_use_abs, result, progress_fn, aerr);
         } else {
             float min_corr = step.discard_enabled ? static_cast<float>(step.min_corr) : -2.0f;
             ok = alignByXCorr(activeDs().file.get(), pipeline_now, first_tr, num_tr, step.ref_offset,
-                               ref_first, ref_len, shalf, min_corr, result, progress_fn, aerr);
+                               step.ref_count, ref_first, ref_len, shalf, min_corr, result, progress_fn, aerr);
         }
         if (!ok) {
             err = !aerr.empty() ? QString::fromStdString(aerr) : "Alignment cancelled.";
             return false;
         }
-        return computeAndStoreAlignment(result.shifts, first_tr, step.output_mode, msg_parent, err);
+        return computeAndStoreAlignment(result.shifts, first_tr, step.output_mode,
+                                         step.align_tile_size, step.align_preview_tile, msg_parent, err);
     }
 
     case ChainStep::Kind::Reload: {
@@ -6419,7 +7393,11 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         // comment on MainWindow::runChainStep in mainwindow.h.
         if (activeDs().align_n_samples > 0) {
             spin_first_->setValue(activeDs().align_first_trace);
-            spin_count_->setValue(static_cast<int>(activeDs().align_shifts.size()));
+            // align_shifts.size() is the flattened num_traces*n_tiles size
+            // when tiled — divide back down to the real per-trace count.
+            const int32_t n_tiles = activeDs().align_tile_size > 0
+                ? static_cast<int32_t>(activeDs().file->header().num_samples / activeDs().align_tile_size) : 1;
+            spin_count_->setValue(static_cast<int>(activeDs().align_shifts.size()) / std::max(1, n_tiles));
         }
         onApplyTraces();
         return true;
@@ -6439,25 +7417,42 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
             updateRecentDir("chain", path);
         }
 
-        const std::vector<int32_t> shifts = step.use_last_alignment ? activeDs().align_shifts
-                                                                       : std::vector<int32_t>{};
+        std::vector<int32_t> shifts;
+        int64_t base_sample = 0, window_len = 0;
+        if (step.use_last_alignment) {
+            // tile_idx < 0 means "unset" (JSON backward compat, or an
+            // untiled step) — default to tile 0, which resolveAlignmentTile
+            // ignores entirely when the dataset's alignment isn't tiled.
+            ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), std::max<int32_t>(0, step.tile_idx));
+            shifts      = resolved.shifts;
+            base_sample = resolved.first_sample;
+            window_len  = resolved.n_samples;
+        }
+        // Looked up by absolute trace index against align_first_trace, not
+        // by position within [exp_first, exp_first+exp_count) — see
+        // exportTracesToTrs()'s comment — so exp_first need not equal the
+        // alignment's own starting trace either.
+        const int32_t shifts_first_trace = activeDs().align_first_trace;
         int32_t n_written = 0;
         bool ok;
         switch (step.export_format) {
         case 0:
             ok = exportTracesToTrs(path, activeDs().file.get(), step.exp_first, step.exp_count,
-                                    shifts, activeDs().pipeline, nullptr, err, &n_written);
+                                    shifts, shifts_first_trace, activeDs().pipeline, nullptr, err,
+                                    &n_written, base_sample, window_len);
             // exportTracesToTrs repurposes a non-empty err as a non-fatal
             // clipped-sample-count note on success, not a failure.
             if (ok) err.clear();
             break;
         case 1:
             ok = exportTracesToNpy(path, activeDs().file.get(), step.exp_first, step.exp_count,
-                                    shifts, activeDs().pipeline, msg_parent, nullptr, err, &n_written);
+                                    shifts, shifts_first_trace, activeDs().pipeline, msg_parent,
+                                    nullptr, err, &n_written, base_sample, window_len);
             break;
         default:
             ok = exportTracesToNpz(path, activeDs().file.get(), step.exp_first, step.exp_count,
-                                    shifts, activeDs().pipeline, nullptr, err, &n_written);
+                                    shifts, shifts_first_trace, activeDs().pipeline, nullptr, err,
+                                    &n_written, base_sample, window_len);
             break;
         }
         return ok;
@@ -6466,6 +7461,10 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
     case ChainStep::Kind::ExportShifts: {
         if (activeDs().align_shifts.empty()) {
             err = "No alignment shifts to export — run an Align step first.";
+            return false;
+        }
+        if (activeDs().align_tile_size > 0) {
+            err = "Export/Load Shifts doesn't support tiled alignment yet.";
             return false;
         }
         QString path = step.path;
@@ -6495,6 +7494,10 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         activeDs().align_first_sample = 0;
         activeDs().align_n_samples    = activeDs().file->header().num_samples;
         activeDs().align_shifts       = std::move(shifts);
+        // A loaded CSV is always a flat, untiled shift table — reset in case
+        // a prior tiled alignment's leftover align_tile_size would otherwise
+        // make resolveAlignmentTile() misinterpret it via tiled indexing.
+        activeDs().align_tile_size    = 0;
         updateUndoButton();
         return true;
     }
@@ -6582,17 +7585,25 @@ void MainWindow::onChainEditor() {
         combo_fmt->addItems({"TRS", "NPY", "NPZ"});
         fl->addRow("Format:", combo_fmt);
 
+        const bool ds_tiled_now = activeDs().align_tile_size > 0;
+        const int32_t n_tiles_now = ds_tiled_now
+            ? static_cast<int32_t>(h.num_samples / activeDs().align_tile_size) : 1;
+        const int32_t align_trace_count_now = ds_tiled_now
+            ? static_cast<int32_t>(activeDs().align_shifts.size()) / std::max(1, n_tiles_now)
+            : static_cast<int32_t>(activeDs().align_shifts.size());
+
         auto* sp_first = new QSpinBox; sp_first->setRange(0, std::max(0, h.num_traces - 1));
         auto* sp_count = new QSpinBox; sp_count->setRange(1, h.num_traces);
         if (activeDs().align_n_samples > 0) {
             sp_first->setValue(activeDs().align_first_trace);
-            sp_count->setValue(static_cast<int>(activeDs().align_shifts.size()));
+            sp_count->setValue(align_trace_count_now);
         } else {
             sp_first->setValue(0);
             sp_count->setValue(h.num_traces);
         }
         fl->addRow("First trace:", sp_first);
         fl->addRow("Count:",       sp_count);
+        addSelectAllTracesButton(fl, sp_first, sp_count, h.num_traces);
 
         // A plain checkbox rather than addAlignmentGroup(): at authoring
         // time there may be no alignment yet (e.g. an earlier step in this
@@ -6606,6 +7617,19 @@ void MainWindow::onChainEditor() {
                               "discarded traces are skipped and the rest are read with "
                               "their shift applied. No effect if there is none.");
         fl->addRow(chk_align);
+
+        // Which tile to export if the alignment turns out to be tiled when
+        // this step actually runs — harmless/ignored if it isn't. Seeded
+        // from the dataset's *current* tiling (if any) purely as a
+        // reasonable authoring-time default.
+        auto* sp_export_tile = new QSpinBox;
+        sp_export_tile->setRange(0, std::max(0, n_tiles_now - 1));
+        sp_export_tile->setValue(ds_tiled_now
+            ? std::clamp(activeDs().align_baked_tile, 0, std::max(0, n_tiles_now - 1)) : 0);
+        sp_export_tile->setToolTip("Which tile's shifts+window to use when this step runs, "
+                                   "if the dataset's alignment is tiled at that time. "
+                                   "Ignored otherwise.");
+        fl->addRow("Tile (if alignment is tiled):", sp_export_tile);
 
         auto* le_path = new QLineEdit;
         le_path->setPlaceholderText("(leave blank to prompt for a path each run)");
@@ -6637,6 +7661,7 @@ void MainWindow::onChainEditor() {
         s.exp_count             = static_cast<int32_t>(sp_count->value());
         s.use_last_alignment      = chk_align->isChecked();
         s.path                      = le_path->text();
+        s.tile_idx                    = static_cast<int32_t>(sp_export_tile->value());
         steps->push_back(s);
         refreshList();
     };
@@ -6851,6 +7876,7 @@ void MainWindow::onRunCpa() {
     auto* sp_count   = new QSpinBox; sp_count->setRange(2, n_total); sp_count->setValue(n_total);
     fl_traces->addRow("First trace:", sp_first);
     fl_traces->addRow("Count:",       sp_count);
+    addSelectAllTracesButton(fl_traces, sp_first, sp_count, n_total);
 
     auto* grp_samples = new QGroupBox("Samples");
     auto* fl_samples  = new QFormLayout(grp_samples);
@@ -6868,8 +7894,13 @@ void MainWindow::onRunCpa() {
     sp_m->setToolTip("Number of model evaluations (0 to M-1). 256 for a full AES key byte.");
     fl_hyp->addRow("M:", sp_m);
 
-    // Alignment shifts option — populated by the last "Apply to Main View" run
-    const bool has_alignment = (activeDs().align_n_samples > 0);
+    // Alignment shifts option — populated by the last "Apply to Main View"
+    // run. Tiled alignment isn't supported here yet (align_shifts.size()
+    // would be num_traces*n_tiles, fed straight into the compute loop below
+    // as a trace count) — treated the same as "no alignment" so the
+    // checkbox stays off and disabled, with its own explanatory tooltip.
+    const bool has_alignment  = (activeDs().align_n_samples > 0) && (activeDs().align_tile_size <= 0);
+    const bool tiled_alignment = (activeDs().align_n_samples > 0) && (activeDs().align_tile_size > 0);
     const int  n_align_discarded = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
     auto* grp_align  = new QGroupBox("Alignment");
@@ -6877,14 +7908,16 @@ void MainWindow::onRunCpa() {
     auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
     chk_shifts->setChecked(has_alignment);
     chk_shifts->setEnabled(has_alignment);
-    chk_shifts->setToolTip(has_alignment
-        ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3)."
-                   "%4")
-              .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
-              .arg(n_align_discarded > 0
-                       ? QString(" %1 of those are marked discarded and will be skipped.").arg(n_align_discarded)
-                       : QString())
-        : "No alignment has been applied to the main view yet.");
+    chk_shifts->setToolTip(tiled_alignment
+        ? "The last alignment run used tiling — CPA doesn't support tiled alignment yet."
+        : has_alignment
+              ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3)."
+                         "%4")
+                    .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
+                    .arg(n_align_discarded > 0
+                             ? QString(" %1 of those are marked discarded and will be skipped.").arg(n_align_discarded)
+                             : QString())
+              : "No alignment has been applied to the main view yet.");
     fl_align->addRow(chk_shifts);
 
     // When alignment is toggled, lock/unlock spinboxes and fill in the stored values.
@@ -7235,6 +8268,7 @@ void MainWindow::onRunSNR() {
 
     fl->addRow("First trace:",            sp_first);
     fl->addRow("Count:",                  sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, n_total);
     fl->addRow("First sample:",           sp_s_first);
     fl->addRow("Sample count (0=all):",   sp_s_count);
 
@@ -7466,6 +8500,7 @@ void MainWindow::onRunStaticSNR() {
 
     fl->addRow("First trace:",          sp_first);
     fl->addRow("Count:",                sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, n_total);
     fl->addRow("First sample:",         sp_s_first);
     fl->addRow("Sample count (0=all):", sp_s_count);
 
@@ -7613,6 +8648,14 @@ void MainWindow::onRunStaticSNR() {
 // FFT Spectrum
 // ---------------------------------------------------------------------------
 
+// Smallest power of two >= n (n <= 1 -> 1).
+static int64_t nextPow2(int64_t n) {
+    if (n <= 1) return 1;
+    int64_t p = 1;
+    while (p < n) p <<= 1;
+    return p;
+}
+
 void MainWindow::onRunFFT() {
     if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "FFT", "No file loaded.");
@@ -7621,10 +8664,19 @@ void MainWindow::onRunFFT() {
     const TrsHeader& h = activeDs().file->header();
 
     // --- Configuration dialog ---
+    // Non-modal (unlike most of this app's simple config dialogs) — same
+    // reason as showAlignDialog(): "Draw on plot" below needs to interact
+    // with the main plot while this dialog stays open, which a modal
+    // exec()-shown dialog blocks entirely (that's exactly why the button
+    // silently did nothing when this used to be modal). The Ok button's
+    // handler below runs the whole computation and only closes this dialog
+    // (cfg->accept()) once a result window is actually shown — a failed or
+    // cancelled run leaves it open so the user can adjust and retry.
     const int n_total = h.num_traces;
-    QDialog cfg(this);
-    cfg.setWindowTitle("FFT Spectrum — configuration");
-    auto* fl = new QFormLayout(&cfg);
+    auto* cfg = new QDialog(this);
+    cfg->setAttribute(Qt::WA_DeleteOnClose);
+    cfg->setWindowTitle("FFT Spectrum — configuration");
+    auto* fl = new QFormLayout(cfg);
 
     auto* sp_first   = new QSpinBox; sp_first->setRange(0, std::max(0, n_total-1)); sp_first->setValue(0);
     auto* sp_count   = new QSpinBox; sp_count->setRange(1, n_total);                sp_count->setValue(n_total);
@@ -7634,8 +8686,46 @@ void MainWindow::onRunFFT() {
 
     fl->addRow("First trace:",          sp_first);
     fl->addRow("Count:",                sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, n_total);
     fl->addRow("First sample:",         sp_s_first);
     fl->addRow("Sample count (0=all):", sp_s_count);
+
+    // "Draw on plot" — same crop-select convenience Align Traces' reference
+    // region uses: drag a region on the main plot instead of typing sample
+    // indices by hand. Crop ranges are already in raw sample units (the
+    // plot's own coordinate system), same domain as sp_s_first/sp_s_count
+    // here, so no unit conversion is needed (unlike Align's reference
+    // region, which is in pipeline-processed units).
+    auto* btn_draw = new QPushButton("Draw on plot →");
+    btn_draw->setToolTip("Switch the main plot to crop-select mode.\n"
+                         "Drag to mark the region to run the FFT over — "
+                         "releasing the mouse confirms it immediately, no "
+                         "Enter needed.");
+    fl->addRow(btn_draw);
+    connect(btn_draw, &QPushButton::clicked, cfg, [=]() {
+        plotWidget()->clearCropRanges();
+        plotWidget()->setCropAutoConfirm(true);
+        plotWidget()->setMode(InteractionMode::CropSelect);
+        btn_draw->setText("Drawing… (drag on plot)");
+        btn_draw->setEnabled(false);
+    });
+    auto* crop_guard = new QObject(cfg);
+    connect(plotWidget(), &PlotWidget::cropRangesChanged, crop_guard, [=]() {
+        const auto& ranges = plotWidget()->cropRanges();
+        if (ranges.empty()) return;
+        auto [s, e] = ranges.back();
+        sp_s_first->setValue(static_cast<int>(s));
+        sp_s_count->setValue(static_cast<int>(std::max<int64_t>(1, e - s)));
+        plotWidget()->setCropAutoConfirm(false);
+        plotWidget()->setMode(InteractionMode::Pan);
+        btn_draw->setText("Draw on plot →");
+        btn_draw->setEnabled(true);
+    });
+    connect(cfg, &QDialog::finished, cfg, [=](int) {
+        plotWidget()->setCropAutoConfirm(false);
+        if (plotWidget()->mode() == InteractionMode::CropSelect)
+            plotWidget()->setMode(InteractionMode::Pan);
+    });
 
     auto* cmb_window = new QComboBox;
     cmb_window->addItem("None (rectangular)");
@@ -7651,224 +8741,314 @@ void MainWindow::onRunFFT() {
     cmb_output->addItem("Phase (rad)");
     fl->addRow("Output:", cmb_output);
 
+    // Sample rate override — the frequency axis is normally derived from the
+    // file's own scale_x (seconds/sample) TLV field, but plenty of TRS files
+    // (and every openNpy()/openFromArray() dataset) simply don't carry it, in
+    // which case scale_x sits at its default of 1.0f and the axis falls back
+    // to plain bin indices with no way to know the real sample rate. This
+    // lets you supply one by hand instead of being stuck with bin indices.
+    const bool file_has_freq_axis = (h.scale_x > 0.0f && h.scale_x < 1.0f);
+    QString file_rate_hint = file_has_freq_axis
+        ? QString("File metadata implies %1 samples/sec.")
+              .arg(1.0 / static_cast<double>(h.scale_x), 0, 'g', 6)
+        : QString("This file has no usable sample-rate metadata — the "
+                   "frequency axis shows plain bin indices unless you set "
+                   "a rate below.");
+    auto* sp_rate = new QDoubleSpinBox;
+    sp_rate->setRange(0.0, 1e7);
+    sp_rate->setDecimals(3);
+    sp_rate->setValue(0.0);
+    sp_rate->setSpecialValueText("Use file metadata");
+    auto* cmb_rate_unit = new QComboBox;
+    cmb_rate_unit->addItem("Hz");
+    cmb_rate_unit->addItem("kHz");
+    cmb_rate_unit->addItem("MHz");
+    cmb_rate_unit->addItem("GHz");
+    cmb_rate_unit->setCurrentIndex(2);  // MHz — typical SCA capture range
+    sp_rate->setToolTip(
+        "Only needed when the file's own sample-rate metadata (below) is "
+        "missing or wrong — leave at 0 to keep using it. When set above 0, "
+        "this overrides it for the frequency axis only (doesn't change the "
+        "FFT itself).");
+    auto* rate_row = new QWidget;
+    auto* rate_hl  = new QHBoxLayout(rate_row);
+    rate_hl->setContentsMargins(0, 0, 0, 0);
+    rate_hl->addWidget(sp_rate);
+    rate_hl->addWidget(cmb_rate_unit);
+    fl->addRow("Sample rate override:", rate_row);
+    auto* lbl_rate_hint = new QLabel(file_rate_hint);
+    lbl_rate_hint->setWordWrap(true);
+    lbl_rate_hint->setStyleSheet("color: gray; font-size: 9pt;");
+    fl->addRow("", lbl_rate_hint);
+
+    auto* chk_pad = new QCheckBox("Zero-pad to next power of 2");
+    chk_pad->setToolTip(
+        "Pad the selected region with zeros up to the next power-of-two "
+        "length before the FFT, instead of running it on the region's own "
+        "(usually non-power-of-two) length.\n\n"
+        "Zero-padding after windowing doesn't add information — it "
+        "interpolates a finer, smoother frequency axis (more bins) without "
+        "moving or changing the height of existing peaks, and radix-2 FFTs "
+        "of power-of-two lengths run faster than arbitrary-length ones.");
+    fl->addRow("", chk_pad);
+
     auto* chk_envelope = new QCheckBox("Show min/max envelope");
     chk_envelope->setChecked(false);
     fl->addRow("", chk_envelope);
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     fl->addRow(cfg_bb);
-    connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
-    connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
-    if (cfg.exec() != QDialog::Accepted) return;
+    connect(cfg_bb, &QDialogButtonBox::rejected, cfg, &QDialog::reject);
+    connect(cfg_bb, &QDialogButtonBox::accepted, cfg, [=]() {
+        const int32_t first        = sp_first->value();
+        const int32_t count        = sp_count->value();
+        const int64_t eff_first_sample = sp_s_first->value();
+        const int64_t eff_n_samples    = sp_s_count->value();
+        const int      win_mode    = cmb_window->currentIndex();
+        const int      out_mode    = cmb_output->currentIndex();
+        const bool     show_env    = chk_envelope->isChecked();
+        const bool     pad_pow2    = chk_pad->isChecked();
 
-    const int32_t first        = sp_first->value();
-    const int32_t count        = sp_count->value();
-    const int64_t eff_first_sample = sp_s_first->value();
-    const int64_t eff_n_samples    = sp_s_count->value();
-    const int      win_mode    = cmb_window->currentIndex();
-    const int      out_mode    = cmb_output->currentIndex();
-    const bool     show_env    = chk_envelope->isChecked();
+        const int64_t raw_ns = (eff_n_samples == 0)
+            ? (h.num_samples - eff_first_sample)
+            : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
 
-    const int64_t raw_ns = (eff_n_samples == 0)
-        ? (h.num_samples - eff_first_sample)
-        : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
-
-    int64_t effective_samples = raw_ns;
-    for (const auto& t : activeDs().pipeline)
-        effective_samples = t->transformedCount(effective_samples);
-
-    if (effective_samples < 2) {
-        QMessageBox::critical(this, "FFT", "Too few samples after pipeline.");
-        return;
-    }
-
-    // Number of FFT output bins (one-sided: N/2+1).
-    const int64_t fft_in_n  = effective_samples;
-    const int64_t fft_out_n = fft_in_n / 2 + 1;
-
-    // Build window coefficients.
-    std::vector<float> window(static_cast<size_t>(fft_in_n));
-    {
-        const double N1 = static_cast<double>(fft_in_n - 1);
-        for (int64_t i = 0; i < fft_in_n; ++i) {
-            double w = 1.0;
-            const double phi = 2.0 * M_PI * i / N1;
-            if (win_mode == 1)      w = 0.5 * (1.0 - std::cos(phi));           // Hann
-            else if (win_mode == 2) w = 0.54 - 0.46 * std::cos(phi);           // Hamming
-            else if (win_mode == 3) w = 0.42 - 0.5*std::cos(phi) + 0.08*std::cos(2.0*phi); // Blackman
-            window[i] = static_cast<float>(w);
-        }
-    }
-
-    // Accumulators for average, min, max.
-    std::vector<double> acc_sum(static_cast<size_t>(fft_out_n), 0.0);
-    std::vector<float>  acc_min(static_cast<size_t>(fft_out_n),  std::numeric_limits<float>::max());
-    std::vector<float>  acc_max(static_cast<size_t>(fft_out_n), -std::numeric_limits<float>::max());
-    int64_t n_ok = 0;
-
-    QProgressDialog prog("Computing FFT…", "Cancel", 0, count, this);
-    prog.setWindowModality(Qt::WindowModal);
-    prog.setMinimumDuration(400);
-
-    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
-    Eigen::FFT<float>  fft_engine;
-    fft_engine.SetFlag(Eigen::FFT<float>::HalfSpectrum);  // only positive freqs
-    std::vector<std::complex<float>> freq_buf;
-
-    for (int32_t ti = 0; ti < count; ++ti) {
-        if (prog.wasCanceled()) return;
-        prog.setValue(ti);
-        QApplication::processEvents();
-
-        int32_t src_idx = first + ti;
-        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
-        if (eff_first_sample < h.num_samples && eff_first_sample + raw_ns > 0) {
-            int64_t src_start = std::max<int64_t>(0, eff_first_sample);
-            int64_t src_end   = std::min<int64_t>(h.num_samples, eff_first_sample + raw_ns);
-            int64_t dst_off   = src_start - eff_first_sample;
-            int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
-                                                  trace_buf.data() + dst_off);
-            if (got <= 0) continue;
-        }
-
-        for (const auto& t : activeDs().pipeline) t->reset();
-        int64_t n_out = raw_ns;
+        int64_t effective_samples = raw_ns;
         for (const auto& t : activeDs().pipeline)
-            n_out = t->apply(trace_buf.data(), n_out, 0);
+            effective_samples = t->transformedCount(effective_samples);
 
-        if (n_out < 2) continue;
-
-        // Apply window (in-place).
-        for (int64_t s = 0; s < n_out; ++s)
-            trace_buf[s] *= window[s];
-
-        // FFT.
-        std::vector<float> in_vec(trace_buf.begin(), trace_buf.begin() + n_out);
-        fft_engine.fwd(freq_buf, in_vec);
-
-        // Accumulate magnitude / phase.
-        const float norm = 1.0f / static_cast<float>(n_out);
-        for (int64_t k = 0; k < fft_out_n; ++k) {
-            float val;
-            if (out_mode == 2) {
-                val = std::arg(freq_buf[k]);
-            } else {
-                float mag = std::abs(freq_buf[k]) * norm;
-                // Double all bins except DC and Nyquist to get one-sided amplitude.
-                if (k > 0 && k < fft_out_n - 1) mag *= 2.0f;
-                if (out_mode == 1) {
-                    val = (mag > 0.0f) ? 20.0f * std::log10(mag) : -200.0f;
-                } else {
-                    val = mag;
-                }
-            }
-            acc_sum[k] += static_cast<double>(val);
-            if (val < acc_min[k]) acc_min[k] = val;
-            if (val > acc_max[k]) acc_max[k] = val;
+        if (effective_samples < 2) {
+            QMessageBox::critical(cfg, "FFT", "Too few samples after pipeline.");
+            return;
         }
-        ++n_ok;
-    }
-    prog.setValue(count);
 
-    if (n_ok == 0) {
-        QMessageBox::critical(this, "FFT", "No traces could be processed.");
-        return;
-    }
+        // win_n: the real (unpadded) number of samples the window/data
+        // actually covers. fft_in_n: what's actually handed to the FFT —
+        // the next power-of-two >= win_n when pad_pow2 is set, otherwise
+        // identical to win_n (today's exact behavior). Padding only ever
+        // extends the tail with zeros *after* windowing (see the per-trace
+        // loop below), so it never changes what the window itself looks like.
+        const int64_t win_n     = effective_samples;
+        const int64_t fft_in_n  = pad_pow2 ? nextPow2(win_n) : win_n;
+        const int64_t fft_out_n = fft_in_n / 2 + 1;
 
-    // Build average spectrum.
-    auto avg_ptr = std::make_shared<std::vector<float>>(static_cast<size_t>(fft_out_n));
-    for (int64_t k = 0; k < fft_out_n; ++k)
-        (*avg_ptr)[k] = static_cast<float>(acc_sum[k] / static_cast<double>(n_ok));
+        // Build window coefficients (sized to win_n, not fft_in_n).
+        std::vector<float> window(static_cast<size_t>(win_n));
+        {
+            const double N1 = static_cast<double>(win_n - 1);
+            for (int64_t i = 0; i < win_n; ++i) {
+                double w = 1.0;
+                const double phi = 2.0 * M_PI * i / N1;
+                if (win_mode == 1)      w = 0.5 * (1.0 - std::cos(phi));           // Hann
+                else if (win_mode == 2) w = 0.54 - 0.46 * std::cos(phi);           // Hamming
+                else if (win_mode == 3) w = 0.42 - 0.5*std::cos(phi) + 0.08*std::cos(2.0*phi); // Blackman
+                window[i] = static_cast<float>(w);
+            }
+        }
 
-    // Build x-axis label and frequency axis (for display only via setAxisLabels).
-    // scale_x is seconds/sample in TRS files; if meaningful, show Hz.
-    const float scale_x = h.scale_x;
-    const bool  has_freq_axis = (scale_x > 0.0f && scale_x < 1.0f);  // typical oscilloscope range
-    QString x_label = has_freq_axis ? "Frequency (Hz)" : "Frequency Bin";
-    QString y_label;
-    if (out_mode == 0) y_label = "Amplitude";
-    else if (out_mode == 1) y_label = "Magnitude (dB)";
-    else y_label = "Phase (rad)";
+        // Accumulators for average, min, max.
+        std::vector<double> acc_sum(static_cast<size_t>(fft_out_n), 0.0);
+        std::vector<float>  acc_min(static_cast<size_t>(fft_out_n),  std::numeric_limits<float>::max());
+        std::vector<float>  acc_max(static_cast<size_t>(fft_out_n), -std::numeric_limits<float>::max());
+        int64_t n_ok = 0;
 
-    // If we have a real frequency axis, scale the avg data x-range via a dummy
-    // transform is not needed — PlotWidget currently uses sample-index x-axis.
-    // We store the frequency values as a second shared_ptr and display them;
-    // the user can read the Hz ticks from the axis once we set the x-scale.
-    // PlotWidget supports setXScale(double scale, double offset) via resetView.
-    // For now, pass the frequency-per-bin scale to PlotWidget's x-axis.
+        QProgressDialog prog("Computing FFT…", "Cancel", 0, count, cfg);
+        prog.setWindowModality(Qt::WindowModal);
+        prog.setMinimumDuration(400);
 
-    // --- Result window ---
-    auto* dlg = new QDialog(this);
-    dlg->setAttribute(Qt::WA_DeleteOnClose);
-    dlg->setWindowTitle(QString("FFT Spectrum — %1 traces, %2")
-                            .arg(n_ok)
-                            .arg(cmb_window->currentText()));
-    dlg->resize(1200, 560);
+        std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
+        Eigen::FFT<float>  fft_engine;
+        fft_engine.SetFlag(Eigen::FFT<float>::HalfSpectrum);  // only positive freqs
+        std::vector<std::complex<float>> freq_buf;
 
-    auto* pw = new PlotWidget(dlg);
+        for (int32_t ti = 0; ti < count; ++ti) {
+            if (prog.wasCanceled()) return;
+            prog.setValue(ti);
+            QApplication::processEvents();
 
-    // Set x-axis scale so ticks show Hz instead of bin indices.
-    if (has_freq_axis) {
-        const double fs   = 1.0 / static_cast<double>(scale_x);   // sample rate Hz
-        const double df   = fs / static_cast<double>(fft_in_n);    // Hz per bin
-        pw->setXScale(df, 0.0);
-    }
+            int32_t src_idx = first + ti;
+            std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+            if (eff_first_sample < h.num_samples && eff_first_sample + raw_ns > 0) {
+                int64_t src_start = std::max<int64_t>(0, eff_first_sample);
+                int64_t src_end   = std::min<int64_t>(h.num_samples, eff_first_sample + raw_ns);
+                int64_t dst_off   = src_start - eff_first_sample;
+                int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
+                                                      trace_buf.data() + dst_off);
+                if (got <= 0) continue;
+            }
 
-    if (show_env && n_ok > 1) {
-        auto min_ptr = std::make_shared<std::vector<float>>(acc_min);
-        auto max_ptr = std::make_shared<std::vector<float>>(acc_max);
-        pw->addTrace(min_ptr, QColor("#5c9bd6"), "Min");
-        pw->addTrace(max_ptr, QColor("#5c9bd6"), "Max");
-        pw->addTrace(avg_ptr, QColor("#f4a63a"), "Average");
-    } else {
-        pw->addTrace(avg_ptr, QColor("#f4a63a"), "Average");
-        pw->setTraceFilled(0, true);
-    }
+            for (const auto& t : activeDs().pipeline) t->reset();
+            int64_t n_out = raw_ns;
+            for (const auto& t : activeDs().pipeline)
+                n_out = t->apply(trace_buf.data(), n_out, 0);
 
-    pw->setAxisLabels(x_label, y_label);
-    pw->setThresholds(false, 0.0, 0.0);
-    pw->resetView();
+            if (n_out < 2) continue;
 
-    auto* btn_exp_npy = new QPushButton("Export .npy…");
-    connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, avg_ptr]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as NumPy",
-                                                    MainWindow::recentDir("npy"), "NumPy files (*.npy)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("npy", path);
-        QString e;
-        if (!saveNpy(path, avg_ptr->data(), static_cast<int64_t>(avg_ptr->size()), e))
-            QMessageBox::critical(dlg, "Export failed", e);
-        else
-            QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+            // Apply window (in-place).
+            for (int64_t s = 0; s < n_out; ++s)
+                trace_buf[s] *= window[s];
+
+            // FFT — zero-padded to fft_in_n (== n_out when pad_pow2 is off,
+            // so this degenerates to exactly today's behavior in that case).
+            // The padding happens here, strictly after windowing, so it
+            // never changes what the window itself tapered.
+            std::vector<float> in_vec(static_cast<size_t>(fft_in_n), 0.0f);
+            std::copy(trace_buf.begin(), trace_buf.begin() + n_out, in_vec.begin());
+            fft_engine.fwd(freq_buf, in_vec);
+
+            // Accumulate magnitude / phase.
+            const float norm = 1.0f / static_cast<float>(n_out);
+            for (int64_t k = 0; k < fft_out_n; ++k) {
+                float val;
+                if (out_mode == 2) {
+                    val = std::arg(freq_buf[k]);
+                } else {
+                    float mag = std::abs(freq_buf[k]) * norm;
+                    // Double all bins except DC and Nyquist to get one-sided amplitude.
+                    if (k > 0 && k < fft_out_n - 1) mag *= 2.0f;
+                    if (out_mode == 1) {
+                        val = (mag > 0.0f) ? 20.0f * std::log10(mag) : -200.0f;
+                    } else {
+                        val = mag;
+                    }
+                }
+                acc_sum[k] += static_cast<double>(val);
+                if (val < acc_min[k]) acc_min[k] = val;
+                if (val > acc_max[k]) acc_max[k] = val;
+            }
+            ++n_ok;
+        }
+        prog.setValue(count);
+
+        if (n_ok == 0) {
+            QMessageBox::critical(cfg, "FFT", "No traces could be processed.");
+            return;
+        }
+
+        // Build average spectrum.
+        auto avg_ptr = std::make_shared<std::vector<float>>(static_cast<size_t>(fft_out_n));
+        for (int64_t k = 0; k < fft_out_n; ++k)
+            (*avg_ptr)[k] = static_cast<float>(acc_sum[k] / static_cast<double>(n_ok));
+
+        // Sample rate: the override spinbox (if set > 0) wins over the
+        // file's own scale_x metadata — see the comment where sp_rate is
+        // built for why an override exists at all.
+        static const double kRateUnitMul[4] = {1.0, 1e3, 1e6, 1e9};
+        double rate_override_hz = 0.0;
+        if (sp_rate->value() > 0.0) {
+            int ui = cmb_rate_unit->currentIndex();
+            rate_override_hz = sp_rate->value() * kRateUnitMul[(ui >= 0 && ui < 4) ? ui : 0];
+        }
+
+        // Build x-axis label and frequency scale (for display only, via
+        // setAxisLabels()/setXScale()). scale_x is seconds/sample in TRS
+        // files; if meaningful (or overridden above), show a real frequency
+        // axis instead of raw bin indices.
+        const bool has_freq_axis = file_has_freq_axis || rate_override_hz > 0.0;
+        QString x_label;
+        double  x_scale = 1.0;   // passed to setXScale() below — Hz per bin, in whatever unit x_label names
+        if (has_freq_axis) {
+            const double fs      = (rate_override_hz > 0.0)
+                                        ? rate_override_hz
+                                        : (1.0 / static_cast<double>(h.scale_x));  // sample rate, Hz
+            const double df      = fs / static_cast<double>(fft_in_n); // Hz per bin
+            const double nyquist = fs / 2.0;                           // frequency at the last bin
+            // Pick one consistent unit for the *whole* axis from the top of
+            // its range (Nyquist) instead of letting PlotWidget's generic
+            // per-tick k/M/G formatter (see plot_widget.cpp) pick a
+            // different prefix for every tick — a mix of "12.3k" and "450"
+            // on the same axis reads as inconsistent units even though it's
+            // all technically correct SI-prefixed Hz.
+            double  unit_scale = 1.0;
+            QString unit_name  = "Hz";
+            if      (nyquist >= 1e9) { unit_scale = 1e9; unit_name = "GHz"; }
+            else if (nyquist >= 1e6) { unit_scale = 1e6; unit_name = "MHz"; }
+            else if (nyquist >= 1e3) { unit_scale = 1e3; unit_name = "kHz"; }
+            x_scale = df / unit_scale;
+            x_label = QString("Frequency (%1)").arg(unit_name);
+        } else {
+            x_label = "Frequency Bin";
+        }
+        QString y_label;
+        if (out_mode == 0) y_label = "Amplitude";
+        else if (out_mode == 1) y_label = "Magnitude (dB)";
+        else y_label = "Phase (rad)";
+
+        // --- Result window ---
+        auto* dlg = new QDialog(this);
+        dlg->setAttribute(Qt::WA_DeleteOnClose);
+        dlg->setWindowTitle(QString("FFT Spectrum — %1 traces, %2, N=%3%4")
+                                .arg(n_ok)
+                                .arg(cmb_window->currentText())
+                                .arg(fft_in_n)
+                                .arg(pad_pow2 ? QString(" (padded from %1)").arg(win_n) : QString()));
+        dlg->resize(1200, 560);
+
+        auto* pw = new PlotWidget(dlg);
+
+        // Set x-axis scale so ticks show frequency (in x_label's unit)
+        // instead of bin indices.
+        if (has_freq_axis) pw->setXScale(x_scale, 0.0);
+
+        if (show_env && n_ok > 1) {
+            auto min_ptr = std::make_shared<std::vector<float>>(acc_min);
+            auto max_ptr = std::make_shared<std::vector<float>>(acc_max);
+            pw->addTrace(min_ptr, QColor("#5c9bd6"), "Min");
+            pw->addTrace(max_ptr, QColor("#5c9bd6"), "Max");
+            pw->addTrace(avg_ptr, QColor("#f4a63a"), "Average");
+        } else {
+            pw->addTrace(avg_ptr, QColor("#f4a63a"), "Average");
+            pw->setTraceFilled(0, true);
+        }
+
+        pw->setAxisLabels(x_label, y_label);
+        pw->setThresholds(false, 0.0, 0.0);
+        pw->resetView();
+
+        auto* btn_exp_npy = new QPushButton("Export .npy…");
+        connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, avg_ptr]() {
+            QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as NumPy",
+                                                        MainWindow::recentDir("npy"), "NumPy files (*.npy)");
+            if (path.isEmpty()) return;
+            MainWindow::updateRecentDir("npy", path);
+            QString e;
+            if (!saveNpy(path, avg_ptr->data(), static_cast<int64_t>(avg_ptr->size()), e))
+                QMessageBox::critical(dlg, "Export failed", e);
+            else
+                QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+        });
+
+        auto* btn_exp_pdf = new QPushButton("Export PDF…");
+        connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
+            QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as PDF",
+                                                        MainWindow::recentDir("export"), "PDF files (*.pdf)");
+            if (path.isEmpty()) return;
+            MainWindow::updateRecentDir("export", path);
+            QPixmap px = pw->grab();
+            QPdfWriter writer(path);
+            writer.setResolution(150);
+            writer.setPageSize(QPageSize(QPageSize::A4));
+            writer.setPageOrientation(QPageLayout::Landscape);
+            writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
+            QPainter painter(&writer);
+            if (painter.isActive())
+                painter.drawPixmap(painter.viewport(), px);
+        });
+
+        auto* hl = new QHBoxLayout;
+        hl->addWidget(btn_exp_npy);
+        hl->addWidget(btn_exp_pdf);
+        hl->addStretch();
+
+        auto* vl = new QVBoxLayout(dlg);
+        vl->addWidget(pw, 1);
+        vl->addLayout(hl);
+
+        dlg->show();
+        cfg->accept();   // close the config dialog now that the run succeeded
     });
 
-    auto* btn_exp_pdf = new QPushButton("Export PDF…");
-    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as PDF",
-                                                    MainWindow::recentDir("export"), "PDF files (*.pdf)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("export", path);
-        QPixmap px = pw->grab();
-        QPdfWriter writer(path);
-        writer.setResolution(150);
-        writer.setPageSize(QPageSize(QPageSize::A4));
-        writer.setPageOrientation(QPageLayout::Landscape);
-        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-        QPainter painter(&writer);
-        if (painter.isActive())
-            painter.drawPixmap(painter.viewport(), px);
-    });
-
-    auto* hl = new QHBoxLayout;
-    hl->addWidget(btn_exp_npy);
-    hl->addWidget(btn_exp_pdf);
-    hl->addStretch();
-
-    auto* vl = new QVBoxLayout(dlg);
-    vl->addWidget(pw, 1);
-    vl->addLayout(hl);
-
-    dlg->show();
+    cfg->show();
 }
 
 // ---------------------------------------------------------------------------
@@ -8108,6 +9288,7 @@ void MainWindow::onExportDataset() {
     sp_s_count->setSpecialValueText("All");
     fl_range->addRow("First trace:",          sp_first);
     fl_range->addRow("Trace count:",          sp_count);
+    addSelectAllTracesButton(fl_range, sp_first, sp_count, h.num_traces);
     fl_range->addRow("First sample:",         sp_s_first);
     fl_range->addRow("Sample count (0=all):", sp_s_count);
     vl_cfg->addWidget(grp_range);

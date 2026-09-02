@@ -59,7 +59,7 @@ TEST(AlignByPeak, KnownShifts) {
 
     AlignResult res;
     std::string err;
-    bool ok = alignByPeak(&f, {}, 0, NT, 0, 0, NS, 15, true, res, noProgress(), err);
+    bool ok = alignByPeak(&f, {}, 0, NT, 0, 1, 0, NS, 15, true, res, noProgress(), err);
     ASSERT_TRUE(ok) << err;
     ASSERT_EQ(static_cast<int>(res.shifts.size()), NT);
 
@@ -77,7 +77,7 @@ TEST(AlignByPeak, IdenticalTracesZeroShift) {
 
     AlignResult res;
     std::string err;
-    bool ok = alignByPeak(&f, {}, 0, NT, 0, 0, NS, 10, true, res, noProgress(), err);
+    bool ok = alignByPeak(&f, {}, 0, NT, 0, 1, 0, NS, 10, true, res, noProgress(), err);
     ASSERT_TRUE(ok) << err;
     for (int t = 0; t < NT; ++t)
         EXPECT_EQ(res.shifts[static_cast<size_t>(t)], 0);
@@ -96,7 +96,7 @@ TEST(AlignByPeak, NonZeroRefTrace) {
 
     AlignResult res;
     std::string err;
-    bool ok = alignByPeak(&f, {}, 0, NT, 1, 0, NS, 10, true, res, noProgress(), err);
+    bool ok = alignByPeak(&f, {}, 0, NT, 1, 1, 0, NS, 10, true, res, noProgress(), err);
     ASSERT_TRUE(ok) << err;
     ASSERT_EQ(static_cast<int>(res.shifts.size()), NT);
 
@@ -119,9 +119,61 @@ TEST(AlignByPeak, RefTraceOutOfRangeError) {
 
     AlignResult res;
     std::string err;
-    bool ok = alignByPeak(&f, {}, 0, NT, NT, 0, NS, 5, true, res, noProgress(), err);
+    bool ok = alignByPeak(&f, {}, 0, NT, NT, 1, 0, NS, 5, true, res, noProgress(), err);
     EXPECT_FALSE(ok);
     EXPECT_FALSE(err.empty());
+}
+
+// ---------------------------------------------------------------------------
+// alignByPeak — averaged reference (ref_trace_count > 1)
+// ---------------------------------------------------------------------------
+
+// With ref_trace_count == 1 the reference is trace ref_trace_offset alone.
+// With ref_trace_count > 1 it's the elementwise average of that many
+// consecutive traces starting there — for impulse data that means the
+// averaged "peak" moves toward wherever the *majority* of those traces'
+// impulses sit, even away from ref_trace_offset's own position. This picks
+// offsets where trace 0 alone and traces 0-2 averaged disagree about where
+// the tallest point is, and checks a downstream trace's recovered shift
+// reflects whichever reference was actually used — i.e. the averaging sum
+// in loadProcessedAveraged() is really being applied, not a no-op.
+TEST(AlignByPeak, AveragedReferenceShiftsPeakToMajority) {
+    const int NT = 4, NS = 40, BASE = 15;
+    // trace 0 @ BASE, traces 1-2 @ BASE+4 (outvote trace 0 in the average),
+    // trace 3 @ BASE+9 is just along for the ride to show the effect.
+    std::vector<int> offsets = {0, 4, 4, 9};
+    TrsFile f;
+    std::vector<float> mem;
+    makeImpulseDataset(f, mem, NT, NS, BASE, offsets);
+
+    // ref_trace_count = 1: reference is trace 0 alone, peak at BASE.
+    {
+        AlignResult res;
+        std::string err;
+        bool ok = alignByPeak(&f, {}, 0, NT, /*ref_off=*/0, /*ref_count=*/1,
+                              0, NS, 20, true, res, noProgress(), err);
+        ASSERT_TRUE(ok) << err;
+        EXPECT_EQ(res.shifts[0], 0);   // ref trace itself: hardcoded shift 0
+        EXPECT_EQ(res.shifts[3], 9);   // BASE+9 vs reference peak BASE
+    }
+
+    // ref_trace_count = 3: reference is avg(trace0, trace1, trace2) — traces
+    // 1-2's shared position (BASE+4) outweighs trace 0's own (BASE), so the
+    // averaged peak lands at BASE+4, not BASE.
+    {
+        AlignResult res;
+        std::string err;
+        bool ok = alignByPeak(&f, {}, 0, NT, /*ref_off=*/0, /*ref_count=*/3,
+                              0, NS, 20, true, res, noProgress(), err);
+        ASSERT_TRUE(ok) << err;
+        // No automatic shift-0 shortcut once averaging more than one trace —
+        // trace 0 is searched like any other and comes back negative (its
+        // own peak now sits *behind* the averaged reference).
+        EXPECT_EQ(res.shifts[0], -4);
+        EXPECT_EQ(res.shifts[1], 0);
+        EXPECT_EQ(res.shifts[2], 0);
+        EXPECT_EQ(res.shifts[3], 5);   // BASE+9 vs averaged peak BASE+4
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -140,7 +192,7 @@ TEST(AlignByXCorr, KnownShifts) {
 
     AlignResult res;
     std::string err;
-    bool ok = alignByXCorr(&f, {}, 0, NT, 0, /*ref_first=*/40, /*ref_num=*/40, 10,
+    bool ok = alignByXCorr(&f, {}, 0, NT, 0, 1, /*ref_first=*/40, /*ref_num=*/40, 10,
                            -2.0f, res, noProgress(), err);
     ASSERT_TRUE(ok) << err;
     ASSERT_EQ(static_cast<int>(res.shifts.size()), NT);
@@ -160,10 +212,35 @@ TEST(AlignByXCorr, IdenticalTracesZeroShift) {
     AlignResult res;
     std::string err;
     // Reference region [20, 60): well inside trace, leaving room for ±5 search
-    bool ok = alignByXCorr(&f, {}, 0, NT, 0, 20, 40, 5, -2.0f, res, noProgress(), err);
+    bool ok = alignByXCorr(&f, {}, 0, NT, 0, 1, 20, 40, 5, -2.0f, res, noProgress(), err);
     ASSERT_TRUE(ok) << err;
     for (int t = 0; t < NT; ++t)
         EXPECT_EQ(res.shifts[static_cast<size_t>(t)], 0);
+}
+
+// When the traces being averaged into the reference are already at the same
+// true position, averaging more of them doesn't change the resulting
+// alignment — their average is exactly the same triangle shape, so this
+// should reproduce AlignByXCorr.KnownShifts's results exactly. A sanity
+// check that loadProcessedAveraged()'s sum isn't scaling/distorting the
+// template in a way that shifts the match, for the realistic case this
+// feature targets (reducing noise across traces that share a true position).
+TEST(AlignByXCorr, AveragedReferenceOfIdenticalTracesUnaffected) {
+    const int NT = 5, NS = 120, BASE = 60;
+    std::vector<int> offsets = {0, 0, 0, 5, -5};   // traces 0-2 share BASE
+    TrsFile f;
+    std::vector<float> mem;
+    makeTriangleDataset(f, mem, NT, NS, BASE, offsets, 10);
+
+    AlignResult res;
+    std::string err;
+    bool ok = alignByXCorr(&f, {}, 0, NT, /*ref_off=*/0, /*ref_count=*/3,
+                           /*ref_first=*/40, /*ref_num=*/40, 10, -2.0f,
+                           res, noProgress(), err);
+    ASSERT_TRUE(ok) << err;
+    ASSERT_EQ(static_cast<int>(res.shifts.size()), NT);
+    for (int t = 0; t < NT; ++t)
+        EXPECT_EQ(res.shifts[static_cast<size_t>(t)], offsets[static_cast<size_t>(t)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -182,7 +259,7 @@ TEST(AlignByPeak, CancellationNoCrash) {
 
     AlignResult res;
     std::string err;
-    alignByPeak(&f, {}, 0, NT, 0, 0, NS, 5, true, res, cancel, err);
+    alignByPeak(&f, {}, 0, NT, 0, 1, 0, NS, 5, true, res, cancel, err);
     // No assertion — just verify no crash/hang
 }
 
@@ -215,7 +292,7 @@ TEST(AlignByPeak, PipelineAppliedBeforeSearch) {
     {
         AlignResult res;
         std::string err;
-        bool ok = alignByPeak(&f, {}, 0, NT, 0, 0, NS, 15, /*use_abs=*/false,
+        bool ok = alignByPeak(&f, {}, 0, NT, 0, 1, 0, NS, 15, /*use_abs=*/false,
                               res, noProgress(), err);
         ASSERT_TRUE(ok) << err;
         for (int t = 1; t < NT; ++t)
@@ -229,7 +306,7 @@ TEST(AlignByPeak, PipelineAppliedBeforeSearch) {
         };
         AlignResult res;
         std::string err;
-        bool ok = alignByPeak(&f, pipeline, 0, NT, 0, 0, NS, 15, /*use_abs=*/false,
+        bool ok = alignByPeak(&f, pipeline, 0, NT, 0, 1, 0, NS, 15, /*use_abs=*/false,
                               res, noProgress(), err);
         ASSERT_TRUE(ok) << err;
         EXPECT_EQ(res.shifts[0], 0);
@@ -255,7 +332,7 @@ TEST(AlignByPeak, DecimatingPipelineRescalesShifts) {
     };
     AlignResult res;
     std::string err;
-    bool ok = alignByPeak(&f, pipeline, 0, NT, 0, 0, NS, 30, /*use_abs=*/true,
+    bool ok = alignByPeak(&f, pipeline, 0, NT, 0, 1, 0, NS, 30, /*use_abs=*/true,
                           res, noProgress(), err);
     ASSERT_TRUE(ok) << err;
     EXPECT_EQ(res.shifts[0], 0);
@@ -277,7 +354,7 @@ TEST(AlignByXCorr, DecimatingPipelineRescalesShifts) {
     };
     AlignResult res;
     std::string err;
-    bool ok = alignByXCorr(&f, pipeline, 0, NT, 0, /*ref_first=*/60, /*ref_num=*/80,
+    bool ok = alignByXCorr(&f, pipeline, 0, NT, 0, 1, /*ref_first=*/60, /*ref_num=*/80,
                            30, -2.0f, res, noProgress(), err);
     ASSERT_TRUE(ok) << err;
     EXPECT_EQ(res.shifts[0], 0);
@@ -306,7 +383,7 @@ TEST(AlignByXCorr, ScoresAndThresholdDiscardsPoorMatches) {
     AlignResult res;
     std::string err;
     // No threshold: every trace (including the flat one) gets a real shift.
-    bool ok = alignByXCorr(&f, {}, 0, NT, 0, 40, 40, 10, -2.0f, res, noProgress(), err);
+    bool ok = alignByXCorr(&f, {}, 0, NT, 0, 1, 40, 40, 10, -2.0f, res, noProgress(), err);
     ASSERT_TRUE(ok) << err;
     ASSERT_EQ(static_cast<int>(res.scores.size()), NT);
     EXPECT_FLOAT_EQ(res.scores[0], 1.0f);          // reference always scores 1.0
@@ -316,7 +393,7 @@ TEST(AlignByXCorr, ScoresAndThresholdDiscardsPoorMatches) {
         EXPECT_NE(res.shifts[static_cast<size_t>(t)], kAlignDiscardShift);
 
     // With threshold 0.5: only the flat trace should be discarded.
-    ok = alignByXCorr(&f, {}, 0, NT, 0, 40, 40, 10, 0.5f, res, noProgress(), err);
+    ok = alignByXCorr(&f, {}, 0, NT, 0, 1, 40, 40, 10, 0.5f, res, noProgress(), err);
     ASSERT_TRUE(ok) << err;
     EXPECT_NE(res.shifts[0], kAlignDiscardShift);
     EXPECT_NE(res.shifts[1], kAlignDiscardShift);
@@ -349,7 +426,7 @@ TEST(AlignByPeak, ExpandingStftPipelineDoesNotCrash) {
 
     AlignResult res;
     std::string err;
-    bool ok = alignByPeak(&f, pipeline, 0, NT, 0, 60, 80, 15, true,
+    bool ok = alignByPeak(&f, pipeline, 0, NT, 0, 1, 60, 80, 15, true,
                           res, noProgress(), err);
     // Whether or not the region is large enough for the STFT window, the
     // important thing is that it doesn't corrupt memory / crash.
@@ -370,7 +447,7 @@ TEST(AlignByXCorr, ExpandingStftPipelineDoesNotCrash) {
 
     AlignResult res;
     std::string err;
-    bool ok = alignByXCorr(&f, pipeline, 0, NT, 0, 60, 80, 15, -2.0f,
+    bool ok = alignByXCorr(&f, pipeline, 0, NT, 0, 1, 60, 80, 15, -2.0f,
                            res, noProgress(), err);
     if (ok) EXPECT_EQ(static_cast<int>(res.shifts.size()), NT);
 }
