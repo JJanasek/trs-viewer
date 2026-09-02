@@ -181,8 +181,36 @@ bool TrsFile::openNpy(const std::string& path, std::string& error) {
     std::string hdr(reinterpret_cast<const char*>(base + data_start), header_len);
     data_start += header_len;
 
-    if (hdr.find("'<f4'") == std::string::npos && hdr.find("\"<f4\"") == std::string::npos) {
-        error = "Only little-endian float32 ('<f4') arrays are supported.";
+    // Reject Fortran-ordered (column-major) arrays explicitly — the read
+    // path below assumes C order (row-major, one trace per row); silently
+    // reading a transposed file would produce garbage instead of an error.
+    if (hdr.find("'fortran_order': True") != std::string::npos ||
+        hdr.find("\"fortran_order\": true") != std::string::npos ||
+        hdr.find("\"fortran_order\": True") != std::string::npos) {
+        error = "Fortran-ordered (column-major) NPY arrays are not supported — "
+                "save with the default C order (fortran_order=False).";
+        close();
+        return false;
+    }
+
+    // dtype — same sample codings TRS itself supports (signed int8/16/32,
+    // float32), little-endian only. readSamples() below already handles all
+    // four via header_.sample_type, shared with the TRS read path.
+    auto hasDtype = [&](const char* tok) {
+        return hdr.find(std::string("'") + tok + "'") != std::string::npos ||
+               hdr.find(std::string("\"") + tok + "\"") != std::string::npos;
+    };
+    if (hasDtype("<f4")) {
+        header_.sample_type = SampleType::FLOAT32; header_.sample_size = 4;
+    } else if (hasDtype("<i2")) {
+        header_.sample_type = SampleType::INT16; header_.sample_size = 2;
+    } else if (hasDtype("<i4")) {
+        header_.sample_type = SampleType::INT32; header_.sample_size = 4;
+    } else if (hasDtype("<i1") || hasDtype("|i1")) {
+        header_.sample_type = SampleType::INT8; header_.sample_size = 1;
+    } else {
+        error = "Unsupported dtype — expected little-endian int8 ('<i1'/'|i1'), "
+                "int16 ('<i2'), int32 ('<i4'), or float32 ('<f4').";
         close();
         return false;
     }
@@ -217,8 +245,7 @@ bool TrsFile::openNpy(const std::string& path, std::string& error) {
 
     header_.num_traces  = static_cast<int32_t>(shape[0]);
     header_.num_samples = static_cast<int32_t>(shape[1]);
-    header_.sample_type = SampleType::FLOAT32;
-    header_.sample_size = 4;
+    // sample_type/sample_size already set by the dtype detection above.
     header_.data_length = 0;
     header_.title_space = 0;
 
