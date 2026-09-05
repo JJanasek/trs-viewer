@@ -16,11 +16,15 @@
 #include <QTabBar>
 
 #include <deque>
+#include <map>
 #include <functional>
 #include <memory>
 #include <vector>
 
 class QVBoxLayout;
+class QDockWidget;
+class QProgressBar;
+class JobManager;
 struct ChainStep;
 
 // ---------------------------------------------------------------------------
@@ -41,7 +45,12 @@ struct DatasetSnapshot {
 // Per-file state bundle.  MainWindow keeps a vector of these.
 // ---------------------------------------------------------------------------
 struct Dataset {
-    std::unique_ptr<TrsFile>                  file;
+    // shared_ptr, not unique_ptr: a background analysis job holds its own
+    // reference to the file it is reading, so closing the tab (or the whole
+    // dataset going away) while that job is still running unmaps nothing out
+    // from under it — the file simply outlives the Dataset until the last
+    // job using it finishes. See AnalysisJob in mainwindow.cpp.
+    std::shared_ptr<TrsFile>                  file;
     std::vector<std::shared_ptr<ITransform>>  pipeline;
     QString                                   display_name;
 
@@ -307,14 +316,6 @@ private:
     // signed t-statistic (each sample rectified after acc.compute()
     // succeeds). Returns false (with err set — "Cancelled." on user cancel,
     // empty on a declined memory warning) on failure.
-    bool computeTTest(int32_t eff_first, int32_t eff_count,
-                       int64_t eff_first_sample, int64_t eff_n_samples,
-                       int32_t byte_idx, const std::vector<int32_t>& shifts,
-                       int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
-                       bool abs_value,
-                       QWidget* msg_parent, std::shared_ptr<TTestAccumulator>& acc_out,
-                       std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
-                       QString& err);
 
     // Opens a new result tab with the full interactive t-test view (threshold
     // line, Calc TH, Style, Export PDF/PNG/NPY/TRS, trim controls) from an
@@ -333,6 +334,19 @@ private:
     // step's own first_trace/trace_count), then calls computeTTest() +
     // buildTTestResultTab(). Returns false (with err set) on failure.
     bool runTTestChainStep(const ChainStep& step, QWidget* msg_parent, QString& err);
+
+    // --- Background jobs -------------------------------------------------
+    // Long analyses run on worker threads via jobs_ so one dataset's t-test
+    // (or CPA/SNR/...) doesn't freeze every other tab. refreshJobsDock()
+    // mirrors jobs_'s current state into the dock, which shows itself while
+    // anything is running and hides again when the last job finishes.
+    void refreshJobsDock();
+
+    JobManager*  jobs_      = nullptr;
+    QDockWidget* jobs_dock_ = nullptr;
+    QVBoxLayout* jobs_rows_ = nullptr;
+    struct JobRow { QWidget* row; QProgressBar* bar; QLabel* label; };
+    std::map<int, JobRow> job_rows_;
 
     // Multi-dataset state
     std::vector<Dataset> datasets_;
