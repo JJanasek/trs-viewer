@@ -243,6 +243,34 @@ TEST(AlignByXCorr, AveragedReferenceOfIdenticalTracesUnaffected) {
         EXPECT_EQ(res.shifts[static_cast<size_t>(t)], offsets[static_cast<size_t>(t)]);
 }
 
+// Enough traces that the adaptive batch size actually grows past its initial
+// value mid-run (small traces => sub-millisecond batches => it doubles toward
+// the cap). Guards the batch loop's bookkeeping: a stale size used for the
+// increment instead of the computed batch_end would silently skip or
+// re-process traces, which small-NT tests can't catch because they never
+// leave a batch size of 1.
+TEST(AlignByXCorr, AdaptiveBatchingCoversEveryTrace) {
+    const int NT = 300, NS = 120, BASE = 60;
+    std::vector<int> offsets(NT);
+    for (int t = 0; t < NT; ++t) offsets[static_cast<size_t>(t)] = (t % 11) - 5;  // -5..+5
+    TrsFile f;
+    std::vector<float> mem;
+    makeTriangleDataset(f, mem, NT, NS, BASE, offsets, 10);
+
+    AlignResult res;
+    std::string err;
+    bool ok = alignByXCorr(&f, {}, 0, NT, /*ref_off=*/0, /*ref_count=*/1,
+                           /*ref_first=*/40, /*ref_num=*/40, 10, -2.0f,
+                           res, noProgress(), err);
+    ASSERT_TRUE(ok) << err;
+    ASSERT_EQ(static_cast<int>(res.shifts.size()), NT);
+    // Every trace — not just the ones in the first batch — must carry its own
+    // correct shift relative to trace 0's offset.
+    for (int t = 0; t < NT; ++t)
+        EXPECT_EQ(res.shifts[static_cast<size_t>(t)],
+                  offsets[static_cast<size_t>(t)] - offsets[0]) << "trace " << t;
+}
+
 // ---------------------------------------------------------------------------
 // Cancellation — should not crash
 // ---------------------------------------------------------------------------

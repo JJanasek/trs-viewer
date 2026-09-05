@@ -9,6 +9,7 @@
 #include "leakage_model.h"
 #include "leakage_model_dialog.h"
 #include "chain.h"
+#include "flow_layout.h"
 
 #include <QApplication>
 #include <QButtonGroup>
@@ -50,6 +51,7 @@
 #include <unsupported/Eigen/FFT>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -1545,12 +1547,20 @@ static bool exportTracesToTrs(
     QProgressDialog* progress,
     QString& err_out,
     int32_t* n_written_out = nullptr,
-    int64_t base_sample = 0, int64_t window_len = 0)
+    int64_t base_sample = 0, int64_t window_len = 0,
+    int64_t read_lo = 0, int64_t read_hi = 0)
 {
     const TrsHeader& h = src->header();
     int32_t n_req  = std::min(count, h.num_traces - first_trace);
     if (n_req <= 0) { err_out = "No traces to export."; return false; }
     if (window_len <= 0) window_len = h.num_samples;
+    // Bounds a shifted read may legitimately touch. The default (0/0) means
+    // "the output window itself", which is what a tiled export needs — a shift
+    // must not pull in a neighbouring tile's samples. A *cropped* export
+    // passes the whole file instead: there the output window is deliberately
+    // narrower than the range each trace reads from, which is precisely what
+    // removes the zero-padded edges.
+    if (read_hi <= read_lo) { read_lo = base_sample; read_hi = base_sample + window_len; }
     int64_t n_samples = window_len;   // this window's own raw sample count
 
     // Drop discarded/out-of-alignment-range traces up front so NUMBER_TRACES
@@ -1656,7 +1666,7 @@ static bool exportTracesToTrs(
         while (written < n_samples) {
             int64_t chunk = std::min(CHUNK, n_samples - written);
             readAlignedWindow(src, src_idx, base_sample + written, chunk, shift,
-                               base_sample, base_sample + window_len, buf.data());
+                               read_lo, read_hi, buf.data());
             int64_t out_count = chunk;
             for (auto& t : pipeline) out_count = t->apply(buf.data(), out_count, written);
             writeSamplesAs(fp, h.sample_type, buf.data(), out_count, &clipped);
@@ -1692,6 +1702,41 @@ static void addSelectAllTracesButton(QFormLayout* fl, QSpinBox* sp_first,
     fl->addRow(btn_all);
 }
 
+// Common valid range for a set of shifts: the output window every kept trace
+// can fill entirely with real samples, given each is read at its own offset.
+// Exporting that window instead of the whole trace is what makes an aligned
+// export come out "fresh" — no per-trace zero-padded edges where a shift ran
+// off the end of the data. Same math as buildAlignedTraces()'s "Crop to
+// common range" output mode. Traces outside the alignment's own range or
+// marked kAlignDiscardShift are excluded from the export anyway, so they
+// don't constrain the range. Returns false (with err set) if the shifts are
+// too far apart for any common range to remain.
+static bool cropRangeForShifts(const std::vector<int32_t>& shifts, int32_t shifts_first_trace,
+                                int32_t first_trace, int32_t count, int64_t num_samples,
+                                int64_t& out_start, int64_t& out_len, QString& err)
+{
+    int64_t crop_start = 0;
+    int64_t crop_end   = num_samples;
+    int64_t kept       = 0;
+    for (int32_t i = 0; i < count; i++) {
+        int64_t idx = static_cast<int64_t>(first_trace) + i - shifts_first_trace;
+        if (idx < 0 || idx >= static_cast<int64_t>(shifts.size())) continue;
+        int64_t sh = shifts[static_cast<size_t>(idx)];
+        if (sh == kAlignDiscardShift) continue;
+        crop_start = std::max(crop_start, -sh);
+        crop_end   = std::min(crop_end, num_samples - sh);
+        kept++;
+    }
+    if (kept == 0)          { err = "No aligned traces in the selected range."; return false; }
+    if (crop_end <= crop_start) {
+        err = "No common valid range to crop to — the shifts span more than the trace length.";
+        return false;
+    }
+    out_start = crop_start;
+    out_len   = crop_end - crop_start;
+    return true;
+}
+
 // Adds an "Alignment" group box with an "Apply last alignment shifts"
 // checkbox to `fl`, wired so that checking it *seeds* sp_first/sp_count with
 // the last computed alignment's range as a convenient starting point — not a
@@ -1713,7 +1758,8 @@ static QCheckBox* addAlignmentGroup(QFormLayout* fl, bool has_alignment,
                                      int32_t align_tile_size, int64_t num_samples_total,
                                      int32_t align_baked_tile,
                                      QSpinBox* sp_first, QSpinBox* sp_count,
-                                     QSpinBox** sp_tile_out = nullptr)
+                                     QSpinBox** sp_tile_out = nullptr,
+                                     QCheckBox** chk_crop_out = nullptr)
 {
     const bool tiled = has_alignment && (align_tile_size > 0);
     const int32_t n_tiles = tiled
@@ -1752,6 +1798,26 @@ static QCheckBox* addAlignmentGroup(QFormLayout* fl, bool has_alignment,
         fl_a->addRow("Tile:", sp_tile);
     }
     if (sp_tile_out) *sp_tile_out = sp_tile;
+
+    // Crop away the zero-padded edges a shifted read leaves behind, so the
+    // exported file is all real samples — as if it had been captured already
+    // aligned. Only offered untiled: a tiled export's window is one tile's
+    // own bounds, where per-tile crop ranges wouldn't reassemble into a
+    // single coherent trace (same restriction buildAlignedTraces() has).
+    QCheckBox* chk_crop = nullptr;
+    if (has_alignment && !tiled) {
+        chk_crop = new QCheckBox("Crop to common range (no zero-padded edges)");
+        chk_crop->setToolTip(
+            "Narrow the exported sample window to the range every exported "
+            "trace can fill with real data at its own shift, instead of "
+            "padding each trace's edges with zeros where its shift ran off "
+            "the end. The output is shorter than the source but contains no "
+            "artificial samples.");
+        chk_crop->setEnabled(chk->isChecked());
+        QObject::connect(chk, &QCheckBox::toggled, chk_crop, &QCheckBox::setEnabled);
+        fl_a->addRow(chk_crop);
+    }
+    if (chk_crop_out) *chk_crop_out = chk_crop;
 
     QObject::connect(chk, &QCheckBox::toggled, chk,
         [=](bool on) {
@@ -1795,10 +1861,11 @@ void MainWindow::onExportTrs() {
     const int  n_discarded = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
     QSpinBox* sp_tile = nullptr;
+    QCheckBox* chk_crop = nullptr;
     QCheckBox* chk_align = addAlignmentGroup(fl, has_alignment,
         activeDs().align_first_trace, static_cast<int>(activeDs().align_shifts.size()),
         n_discarded, activeDs().align_tile_size, h.num_samples, activeDs().align_baked_tile,
-        sp_first, sp_count, &sp_tile);
+        sp_first, sp_count, &sp_tile, &chk_crop);
 
     auto* bb = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
@@ -1811,12 +1878,24 @@ void MainWindow::onExportTrs() {
     int32_t count = static_cast<int32_t>(sp_count->value());
     const bool use_alignment = chk_align->isChecked();
     std::vector<int32_t> shifts;
-    int64_t base_sample = 0, window_len = 0;
+    int64_t base_sample = 0, window_len = 0, read_lo = 0, read_hi = 0;
     if (use_alignment) {
         ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
         shifts      = resolved.shifts;
         base_sample = resolved.first_sample;
         window_len  = resolved.n_samples;
+        if (chk_crop && chk_crop->isChecked()) {
+            QString crop_err;
+            if (!cropRangeForShifts(shifts, activeDs().align_first_trace, first, count,
+                                     h.num_samples, base_sample, window_len, crop_err)) {
+                QMessageBox::warning(this, "Export", crop_err);
+                return;
+            }
+            // Reads deliberately reach outside the (narrowed) output window —
+            // that extra data is exactly what fills the edges instead of zeros.
+            read_lo = 0;
+            read_hi = h.num_samples;
+        }
     }
 
     QString path = QFileDialog::getSaveFileName(
@@ -1834,7 +1913,7 @@ void MainWindow::onExportTrs() {
     bool ok = exportTracesToTrs(path, activeDs().file.get(), first, count,
                                 shifts, activeDs().align_first_trace,
                                 activeDs().pipeline, &progress, err, &n_written,
-                                base_sample, window_len);
+                                base_sample, window_len, read_lo, read_hi);
     progress.setValue(count);
 
     if (!ok)
@@ -2851,9 +2930,10 @@ void MainWindow::onLoadNpyTTest() {
     });
 
     auto* ctrl   = new QWidget(dlg);
-    auto* ctrl_l = new QHBoxLayout(ctrl);
+    // Wraps onto extra rows instead of forcing the window wider than the
+    // screen once there are this many controls — see inc/flow_layout.h.
+    auto* ctrl_l = new FlowLayout(ctrl, /*margin=*/0, /*h_spacing=*/6, /*v_spacing=*/4);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
-    ctrl_l->setSpacing(6);
 
     // Mode buttons
     auto* btn_pan_npy  = new QPushButton("Pan");
@@ -2889,13 +2969,12 @@ void MainWindow::onLoadNpyTTest() {
     ctrl_l->addWidget(btn_bz_npy);
     ctrl_l->addWidget(btn_crop_npy);
     ctrl_l->addWidget(btn_rst_npy);
-    ctrl_l->addSpacing(8);
+    ctrl_l->addItem(new QSpacerItem(8, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
     ctrl_l->addWidget(new QLabel(QString("Samples: <b>%1</b>").arg(tstat_ptr->size())));
     {
         auto* lbl_f = qobject_cast<QLabel*>(ctrl_l->itemAt(ctrl_l->count()-1)->widget());
         if (lbl_f) lbl_f->setTextFormat(Qt::RichText);
     }
-    ctrl_l->addStretch();
     auto* btn_yzi_npy = new QPushButton("↑ Amp");
     auto* btn_yzo_npy = new QPushButton("↓ Amp");
     btn_yzi_npy->setToolTip("Zoom in Y (Ctrl/Shift+scroll up)");
@@ -2907,12 +2986,11 @@ void MainWindow::onLoadNpyTTest() {
     ctrl_l->addWidget(spin_thr);
     ctrl_l->addWidget(chk_onesided_npy);
     ctrl_l->addWidget(btn_calc_th_npy);
-    ctrl_l->addSpacing(8);
+    ctrl_l->addItem(new QSpacerItem(8, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
     ctrl_l->addWidget(btn_yzi_npy);
     ctrl_l->addWidget(btn_yzo_npy);
-    ctrl_l->addSpacing(8);
+    ctrl_l->addItem(new QSpacerItem(8, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
     ctrl_l->addWidget(btn_style_npy);
-    ctrl_l->addStretch();
     ctrl_l->addWidget(btn_exp_npy);
     ctrl_l->addWidget(btn_exp_pdf_npy);
     ctrl_l->addWidget(btn_exp_png_npy);
@@ -3637,12 +3715,20 @@ static bool exportTracesToNpy(
     QProgressDialog* progress,
     QString& err_out,
     int32_t* n_written_out = nullptr,
-    int64_t base_sample = 0, int64_t window_len = 0)
+    int64_t base_sample = 0, int64_t window_len = 0,
+    int64_t read_lo = 0, int64_t read_hi = 0)
 {
     const TrsHeader& h = src->header();
     int32_t n_req = std::min(count, h.num_traces - first_trace);
     if (n_req <= 0) { err_out = "No traces to export."; return false; }
     if (window_len <= 0) window_len = h.num_samples;
+    // Bounds a shifted read may legitimately touch. The default (0/0) means
+    // "the output window itself", which is what a tiled export needs — a shift
+    // must not pull in a neighbouring tile's samples. A *cropped* export
+    // passes the whole file instead: there the output window is deliberately
+    // narrower than the range each trace reads from, which is precisely what
+    // removes the zero-padded edges.
+    if (read_hi <= read_lo) { read_lo = base_sample; read_hi = base_sample + window_len; }
 
     // See exportTracesToTrs()'s comment: shift is looked up by absolute
     // trace index against shifts_first_trace, not by position within
@@ -3702,7 +3788,7 @@ static bool exportTracesToNpy(
         int32_t shift = 0;
         lookupShift(src_idx, shift);   // already validated in the keep pass above
         readAlignedWindow(src, src_idx, base_sample, window_len, shift,
-                           base_sample, base_sample + window_len, buf.data());
+                           read_lo, read_hi, buf.data());
         for (const auto& t : pipeline) t->reset();
         int64_t n_samp = window_len;
         for (const auto& t : pipeline) n_samp = t->apply(buf.data(), n_samp, 0);
@@ -3728,12 +3814,20 @@ static bool exportTracesToNpz(
     QProgressDialog* progress,
     QString& err_out,
     int32_t* n_written_out = nullptr,
-    int64_t base_sample = 0, int64_t window_len = 0)
+    int64_t base_sample = 0, int64_t window_len = 0,
+    int64_t read_lo = 0, int64_t read_hi = 0)
 {
     const TrsHeader& h = src->header();
     int32_t n_req = std::min(count, h.num_traces - first_trace);
     if (n_req <= 0) { err_out = "No traces to export."; return false; }
     if (window_len <= 0) window_len = h.num_samples;
+    // Bounds a shifted read may legitimately touch. The default (0/0) means
+    // "the output window itself", which is what a tiled export needs — a shift
+    // must not pull in a neighbouring tile's samples. A *cropped* export
+    // passes the whole file instead: there the output window is deliberately
+    // narrower than the range each trace reads from, which is precisely what
+    // removes the zero-padded edges.
+    if (read_hi <= read_lo) { read_lo = base_sample; read_hi = base_sample + window_len; }
 
     // See exportTracesToTrs()'s comment: shift is looked up by absolute
     // trace index against shifts_first_trace, not by position within
@@ -3781,7 +3875,7 @@ static bool exportTracesToNpz(
         int32_t shift = 0;
         lookupShift(src_idx, shift);   // already validated in the keep pass above
         readAlignedWindow(src, src_idx, base_sample, window_len, shift,
-                           base_sample, base_sample + window_len, buf.data());
+                           read_lo, read_hi, buf.data());
         for (const auto& t : pipeline) t->reset();
         int64_t n_samp = window_len;
         for (const auto& t : pipeline) n_samp = t->apply(buf.data(), n_samp, 0);
@@ -3834,10 +3928,11 @@ void MainWindow::onExportNpy() {
     const int  n_discarded = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
     QSpinBox* sp_tile = nullptr;
+    QCheckBox* chk_crop = nullptr;
     QCheckBox* chk_align = addAlignmentGroup(fl, has_alignment,
         activeDs().align_first_trace, static_cast<int>(activeDs().align_shifts.size()),
         n_discarded, activeDs().align_tile_size, h.num_samples, activeDs().align_baked_tile,
-        sp_first, sp_count, &sp_tile);
+        sp_first, sp_count, &sp_tile, &chk_crop);
 
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     fl->addRow(bb);
@@ -3849,12 +3944,24 @@ void MainWindow::onExportNpy() {
     int32_t count = static_cast<int32_t>(sp_count->value());
     const bool use_alignment = chk_align->isChecked();
     std::vector<int32_t> shifts;
-    int64_t base_sample = 0, window_len = 0;
+    int64_t base_sample = 0, window_len = 0, read_lo = 0, read_hi = 0;
     if (use_alignment) {
         ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
         shifts      = resolved.shifts;
         base_sample = resolved.first_sample;
         window_len  = resolved.n_samples;
+        if (chk_crop && chk_crop->isChecked()) {
+            QString crop_err;
+            if (!cropRangeForShifts(shifts, activeDs().align_first_trace, first, count,
+                                     h.num_samples, base_sample, window_len, crop_err)) {
+                QMessageBox::warning(this, "Export", crop_err);
+                return;
+            }
+            // Reads deliberately reach outside the (narrowed) output window —
+            // that extra data is exactly what fills the edges instead of zeros.
+            read_lo = 0;
+            read_hi = h.num_samples;
+        }
     }
 
     QString path = QFileDialog::getSaveFileName(
@@ -3871,7 +3978,7 @@ void MainWindow::onExportNpy() {
     bool ok = exportTracesToNpy(path, activeDs().file.get(), first, count,
                                  shifts, activeDs().align_first_trace,
                                  activeDs().pipeline, this, &prog, err, &n_written,
-                                 base_sample, window_len);
+                                 base_sample, window_len, read_lo, read_hi);
     if (!ok) {
         if (err != "Export cancelled.") QMessageBox::critical(this, "Export failed", err);
     } else {
@@ -3904,10 +4011,11 @@ void MainWindow::onExportNpz() {
     const int  n_discarded = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
     QSpinBox* sp_tile = nullptr;
+    QCheckBox* chk_crop = nullptr;
     QCheckBox* chk_align = addAlignmentGroup(fl, has_alignment,
         activeDs().align_first_trace, static_cast<int>(activeDs().align_shifts.size()),
         n_discarded, activeDs().align_tile_size, h.num_samples, activeDs().align_baked_tile,
-        sp_first, sp_count, &sp_tile);
+        sp_first, sp_count, &sp_tile, &chk_crop);
 
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     if (h.data_length > 0)
@@ -3922,12 +4030,24 @@ void MainWindow::onExportNpz() {
     int32_t count = static_cast<int32_t>(sp_count->value());
     const bool use_alignment = chk_align->isChecked();
     std::vector<int32_t> shifts;
-    int64_t base_sample = 0, window_len = 0;
+    int64_t base_sample = 0, window_len = 0, read_lo = 0, read_hi = 0;
     if (use_alignment) {
         ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
         shifts      = resolved.shifts;
         base_sample = resolved.first_sample;
         window_len  = resolved.n_samples;
+        if (chk_crop && chk_crop->isChecked()) {
+            QString crop_err;
+            if (!cropRangeForShifts(shifts, activeDs().align_first_trace, first, count,
+                                     h.num_samples, base_sample, window_len, crop_err)) {
+                QMessageBox::warning(this, "Export", crop_err);
+                return;
+            }
+            // Reads deliberately reach outside the (narrowed) output window —
+            // that extra data is exactly what fills the edges instead of zeros.
+            read_lo = 0;
+            read_hi = h.num_samples;
+        }
     }
 
     QString path = QFileDialog::getSaveFileName(
@@ -3944,7 +4064,7 @@ void MainWindow::onExportNpz() {
     bool ok = exportTracesToNpz(path, activeDs().file.get(), first, count,
                                  shifts, activeDs().align_first_trace,
                                  activeDs().pipeline, &prog, err, &n_written,
-                                 base_sample, window_len);
+                                 base_sample, window_len, read_lo, read_hi);
     if (!ok) {
         if (err != "Export cancelled.") QMessageBox::critical(this, "Export failed", err);
     } else {
@@ -4035,15 +4155,22 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
     // Process in batches so the GUI thread can update the progress bar and
     // check for cancellation between parallel regions (Qt calls are only
     // ever made from the main thread, never from inside the omp for below).
-    // Capped at 256 for parallel efficiency, but also capped so there are at
-    // least ~20 progress updates regardless of trace count — otherwise a run
-    // with fewer traces than the batch size reports progress exactly once,
-    // at the very end, which looks indistinguishable from a hang.
-    const int32_t kBatchSize = std::clamp(eff_count / 20, 1, 256);
+    //
+    // The batch size adapts to wall-clock time instead of being a fixed trace
+    // count. Between parallel regions is also the only point where this
+    // process can answer the window manager's "still alive?" ping, and GNOME
+    // raises its "Application is not responding — Wait / Force Quit" dialog
+    // when a reply takes more than a few seconds. No fixed count suits both a
+    // 1K-sample trace and a 5M-sample one — the same 140-trace batch is
+    // milliseconds of work for one and minutes for the other — so aim for
+    // roughly kTargetMs of work per batch and let the trace count follow.
+    constexpr double kTargetMs = 120.0;
+    int32_t batch_size = std::clamp(eff_count / 20, 1, 32);
     bool cancelled = false;
 
-    for (int32_t batch_start = 0; batch_start < eff_count && !cancelled; batch_start += kBatchSize) {
-        int32_t batch_end = std::min(batch_start + kBatchSize, eff_count);
+    for (int32_t batch_start = 0; batch_start < eff_count && !cancelled; ) {
+        int32_t batch_end = std::min(batch_start + batch_size, eff_count);
+        const auto batch_t0 = std::chrono::steady_clock::now();
 
         #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
         for (int32_t ti = batch_start; ti < batch_end; ti++) {
@@ -4094,6 +4221,16 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
                 n_out = t->apply(trace_buf.data(), n_out, 0);
             acc_local.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
         }
+
+        // Re-aim the next batch at kTargetMs. Clamped per step so one slow
+        // batch (a cold page-cache read, say) can't collapse the size to 1 or
+        // blow it up to the cap in a single jump.
+        const double batch_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - batch_t0).count();
+        batch_size = (batch_ms > 1.0)
+            ? std::clamp(static_cast<int32_t>(batch_size * std::clamp(kTargetMs / batch_ms, 0.5, 2.0)), 1, 256)
+            : std::min(batch_size * 2, 256);
+        batch_start = batch_end;   // the new size applies to the *next* batch
 
         prog.setLabelText(QString("Accumulating trace %1 / %2…").arg(batch_end).arg(eff_count));
         prog.setValue(batch_end);
@@ -4575,9 +4712,10 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     });
 
     auto* ctrl = new QWidget;
-    auto* ctrl_l = new QHBoxLayout(ctrl);
+    // Wraps onto extra rows instead of forcing the window wider than the
+    // screen once there are this many controls — see inc/flow_layout.h.
+    auto* ctrl_l = new FlowLayout(ctrl, /*margin=*/0, /*h_spacing=*/6, /*v_spacing=*/4);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
-    ctrl_l->setSpacing(6);
 
     // Mode buttons
     auto* btn_pan_tt  = new QPushButton("Pan");
@@ -4613,9 +4751,8 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     ctrl_l->addWidget(btn_bz_tt);
     ctrl_l->addWidget(btn_crop_tt);
     ctrl_l->addWidget(btn_rst_tt);
-    ctrl_l->addSpacing(8);
+    ctrl_l->addItem(new QSpacerItem(8, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
     ctrl_l->addWidget(lbl_groups);
-    ctrl_l->addStretch();
     auto* btn_yzi = new QPushButton("↑ Amp");
     auto* btn_yzo = new QPushButton("↓ Amp");
     btn_yzi->setToolTip("Zoom in Y (Ctrl/Shift+scroll up)");
@@ -4627,12 +4764,11 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     ctrl_l->addWidget(spin_thr);
     ctrl_l->addWidget(chk_onesided);
     ctrl_l->addWidget(btn_calc_th);
-    ctrl_l->addSpacing(8);
+    ctrl_l->addItem(new QSpacerItem(8, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
     ctrl_l->addWidget(btn_yzi);
     ctrl_l->addWidget(btn_yzo);
-    ctrl_l->addSpacing(8);
+    ctrl_l->addItem(new QSpacerItem(8, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
     ctrl_l->addWidget(btn_style);
-    ctrl_l->addStretch();
     ctrl_l->addWidget(btn_exp_trs);
     ctrl_l->addWidget(btn_exp_npy);
     ctrl_l->addWidget(btn_exp_pdf);
@@ -7418,7 +7554,7 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         }
 
         std::vector<int32_t> shifts;
-        int64_t base_sample = 0, window_len = 0;
+        int64_t base_sample = 0, window_len = 0, read_lo = 0, read_hi = 0;
         if (step.use_last_alignment) {
             // tile_idx < 0 means "unset" (JSON backward compat, or an
             // untiled step) — default to tile 0, which resolveAlignmentTile
@@ -7427,6 +7563,16 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
             shifts      = resolved.shifts;
             base_sample = resolved.first_sample;
             window_len  = resolved.n_samples;
+            // Cropping only applies untiled — see ChainStep::export_crop.
+            if (step.export_crop && activeDs().align_tile_size == 0 && !shifts.empty()) {
+                const int64_t total = activeDs().file->header().num_samples;
+                if (!cropRangeForShifts(shifts, activeDs().align_first_trace,
+                                         step.exp_first, step.exp_count, total,
+                                         base_sample, window_len, err))
+                    return false;
+                read_lo = 0;
+                read_hi = total;
+            }
         }
         // Looked up by absolute trace index against align_first_trace, not
         // by position within [exp_first, exp_first+exp_count) — see
@@ -7439,7 +7585,7 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         case 0:
             ok = exportTracesToTrs(path, activeDs().file.get(), step.exp_first, step.exp_count,
                                     shifts, shifts_first_trace, activeDs().pipeline, nullptr, err,
-                                    &n_written, base_sample, window_len);
+                                    &n_written, base_sample, window_len, read_lo, read_hi);
             // exportTracesToTrs repurposes a non-empty err as a non-fatal
             // clipped-sample-count note on success, not a failure.
             if (ok) err.clear();
@@ -7447,12 +7593,12 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         case 1:
             ok = exportTracesToNpy(path, activeDs().file.get(), step.exp_first, step.exp_count,
                                     shifts, shifts_first_trace, activeDs().pipeline, msg_parent,
-                                    nullptr, err, &n_written, base_sample, window_len);
+                                    nullptr, err, &n_written, base_sample, window_len, read_lo, read_hi);
             break;
         default:
             ok = exportTracesToNpz(path, activeDs().file.get(), step.exp_first, step.exp_count,
                                     shifts, shifts_first_trace, activeDs().pipeline, nullptr, err,
-                                    &n_written, base_sample, window_len);
+                                    &n_written, base_sample, window_len, read_lo, read_hi);
             break;
         }
         return ok;
@@ -7631,6 +7777,14 @@ void MainWindow::onChainEditor() {
                                    "Ignored otherwise.");
         fl->addRow("Tile (if alignment is tiled):", sp_export_tile);
 
+        auto* chk_export_crop = new QCheckBox("Crop to common range (no zero-padded edges)");
+        chk_export_crop->setToolTip(
+            "When this step runs with an alignment applied, narrow the exported "
+            "sample window to the range every exported trace can fill with real "
+            "data at its own shift, instead of padding edges with zeros. Ignored "
+            "if the alignment turns out to be tiled.");
+        fl->addRow(chk_export_crop);
+
         auto* le_path = new QLineEdit;
         le_path->setPlaceholderText("(leave blank to prompt for a path each run)");
         auto* btn_browse = new QPushButton("Browse…");
@@ -7662,6 +7816,7 @@ void MainWindow::onChainEditor() {
         s.use_last_alignment      = chk_align->isChecked();
         s.path                      = le_path->text();
         s.tile_idx                    = static_cast<int32_t>(sp_export_tile->value());
+        s.export_crop                   = chk_export_crop->isChecked();
         steps->push_back(s);
         refreshList();
     };

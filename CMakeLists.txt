@@ -64,6 +64,8 @@ set(SOURCES
     src/align.cpp
     src/chain.cpp
     inc/chain.h
+    src/flow_layout.cpp
+    inc/flow_layout.h
     src/heatmap_widget.cpp
     inc/mainwindow.h
     inc/plot_widget.h
