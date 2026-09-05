@@ -11,3 +11,5 @@ q
 gen_trs.py
 npy_plot.py
 Jan/
+# MkDocs build output
+site/
