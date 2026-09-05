@@ -62,9 +62,10 @@ QString ChainStep::summary() const {
         static const char* kFmt[3] = {"TRS", "NPY", "NPZ"};
         QString fmt = (export_format >= 0 && export_format < 3) ? kFmt[export_format] : QString("?");
         QString dest = path.isEmpty() ? QString("(prompt for path)") : path;
-        return QString("Export %1 → %2%3%4").arg(fmt).arg(dest)
+        return QString("Export %1 → %2%3%4%5").arg(fmt).arg(dest)
             .arg(use_last_alignment ? QString(", apply alignment") : QString())
-            .arg(tile_idx >= 0 ? QString(", tile %1").arg(tile_idx) : QString());
+            .arg(tile_idx >= 0 ? QString(", tile %1").arg(tile_idx) : QString())
+            .arg(export_crop ? QString(", cropped") : QString());
     }
     case Kind::ExportShifts:
         return QString("Export Shifts → %1").arg(path.isEmpty() ? QString("(prompt for path)") : path);
@@ -240,6 +241,7 @@ bool saveChain(const QString& path, const std::vector<ChainStep>& steps, QString
             o["use_last_alignment"] = s.use_last_alignment;
             o["path"]                = s.path;
             o["tile_idx"]             = s.tile_idx;
+            o["export_crop"]           = s.export_crop;
             break;
         case ChainStep::Kind::ExportShifts:
         case ChainStep::Kind::LoadShifts:
@@ -337,6 +339,7 @@ bool loadChain(const QString& path, std::vector<ChainStep>& steps, QString& err)
             s.use_last_alignment    = o.value("use_last_alignment").toBool(true);
             s.path                    = o.value("path").toString();
             s.tile_idx                 = o.value("tile_idx").toInt(-1);
+            s.export_crop               = o.value("export_crop").toBool(false);
             break;
         case ChainStep::Kind::ExportShifts:
         case ChainStep::Kind::LoadShifts:

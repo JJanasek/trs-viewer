@@ -1,6 +1,7 @@
 #include "align.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 
 #ifdef _OPENMP
@@ -311,12 +312,19 @@ bool alignByXCorr(
     // at least ~20 progress updates regardless of trace count — otherwise a
     // run with fewer traces than the batch size reports progress exactly
     // once, at the very end, which looks indistinguishable from a hang.
-    const int32_t kBatchSize = std::clamp(num_traces / 20, 1, 64);
+    // Adaptive batch size: the caller's progress callback is the only point
+    // where a GUI caller can pump its event loop (and answer the window
+    // manager's liveness ping — GNOME shows "Application is not responding"
+    // if that takes more than a few seconds), so aim for roughly kTargetMs of
+    // work per batch rather than a fixed trace count that is far too coarse
+    // for multi-megasample traces.
+    constexpr double kTargetMs = 120.0;
+    int32_t batch_size = std::clamp(num_traces / 20, 1, 16);
     bool cancelled = false;
 
-    for (int32_t batch_start = 0; batch_start < num_traces && !cancelled;
-         batch_start += kBatchSize) {
-        int32_t batch_end = std::min(batch_start + kBatchSize, num_traces);
+    for (int32_t batch_start = 0; batch_start < num_traces && !cancelled; ) {
+        int32_t batch_end = std::min(batch_start + batch_size, num_traces);
+        const auto batch_t0 = std::chrono::steady_clock::now();
 
         #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
         for (int32_t ti = batch_start; ti < batch_end; ti++) {
@@ -406,6 +414,13 @@ bool alignByXCorr(
                 ? kAlignDiscardShift
                 : static_cast<int32_t>(best_k_raw);
         }
+
+        const double batch_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - batch_t0).count();
+        batch_size = (batch_ms > 1.0)
+            ? std::clamp(static_cast<int32_t>(batch_size * std::clamp(kTargetMs / batch_ms, 0.5, 2.0)), 1, 64)
+            : std::min(batch_size * 2, 64);
+        batch_start = batch_end;   // the new size applies to the *next* batch
 
         if (progress && !progress(batch_end, num_traces)) cancelled = true;
     }

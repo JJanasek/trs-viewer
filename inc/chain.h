@@ -77,6 +77,12 @@ struct ChainStep {
     QString path;                    // empty => prompt via QFileDialog when this step runs
     // ExportShifts/LoadShifts also use `path` (same empty-means-prompt rule);
     // ExportShifts writes activeDs().align_shifts, LoadShifts sets it.
+    bool    export_crop        = false; // Export only: crop the output window to the
+                                        // range every exported trace can fill with real
+                                        // samples, instead of zero-padding each trace's
+                                        // edges where its shift ran off the data. Ignored
+                                        // when the alignment is tiled (the window is then
+                                        // one tile's own bounds).
     int32_t tile_idx           = -1; // Export/RunTTest only: which tile's shifts+window to
                                       // use when use_last_alignment and the dataset's
                                       // alignment is tiled. -1 = unset (JSON backward
