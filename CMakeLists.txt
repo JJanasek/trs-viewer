@@ -90,6 +90,8 @@ set(SOURCES
     inc/chain.h
     src/flow_layout.cpp
     inc/flow_layout.h
+    src/job_manager.cpp
+    inc/job_manager.h
     src/heatmap_widget.cpp
     inc/mainwindow.h
     inc/plot_widget.h

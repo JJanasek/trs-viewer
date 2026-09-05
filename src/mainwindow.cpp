@@ -10,6 +10,10 @@
 #include "leakage_model_dialog.h"
 #include "chain.h"
 #include "flow_layout.h"
+#include "job_manager.h"
+#include <QDockWidget>
+#include <QProgressBar>
+#include <set>
 
 #include <QApplication>
 #include <QButtonGroup>
@@ -114,6 +118,22 @@ MainWindow::MainWindow(QWidget* parent)
 {
     setWindowTitle("TRS Viewer");
     resize(1440, 860);
+
+    // Background analysis jobs + the dock that reports them.
+    jobs_ = new JobManager(this);
+    jobs_dock_ = new QDockWidget("Background Jobs", this);
+    jobs_dock_->setAllowedAreas(Qt::BottomDockWidgetArea | Qt::TopDockWidgetArea);
+    jobs_dock_->setFeatures(QDockWidget::DockWidgetMovable | QDockWidget::DockWidgetFloatable);
+    {
+        auto* holder = new QWidget;
+        jobs_rows_ = new QVBoxLayout(holder);
+        jobs_rows_->setContentsMargins(6, 4, 6, 4);
+        jobs_rows_->setSpacing(3);
+        jobs_dock_->setWidget(holder);
+    }
+    addDockWidget(Qt::BottomDockWidgetArea, jobs_dock_);
+    jobs_dock_->hide();   // shown only while something is actually running
+    connect(jobs_, &JobManager::jobsChanged, this, &MainWindow::refreshJobsDock);
 
     setupMenuBar();
 
@@ -953,7 +973,7 @@ void MainWindow::prefetchWithProgress(TrsFile* file, const QString& label) {
 }
 
 void MainWindow::openFile(const QString& path) {
-    auto f = std::make_unique<TrsFile>();
+    auto f = std::make_shared<TrsFile>();
     std::string err;
     if (!f->open(path.toStdString(), err)) {
         QMessageBox::critical(this, "Error opening TRS file",
@@ -3578,7 +3598,7 @@ void MainWindow::onOpenNpyTraces() {
         // Plain .npy: memory-map directly rather than reading the whole file into
         // RAM (a copy here plus the copy TrsFile::openFromArray used to make meant
         // multi-GB files needed ~2x their size in RAM and could get OOM-killed).
-        auto f = std::make_unique<TrsFile>();
+        auto f = std::make_shared<TrsFile>();
         std::string npy_err;
         if (!f->openNpy(path.toStdString(), npy_err)) {
             QMessageBox::critical(this, "Load failed", QString::fromStdString(npy_err)); return;
@@ -3615,7 +3635,7 @@ void MainWindow::onOpenNpyTraces() {
     }
 
     // Build the in-memory TrsFile
-    auto f = std::make_unique<TrsFile>();
+    auto f = std::make_shared<TrsFile>();
     std::vector<uint8_t> data_bytes;
     int16_t data_length = 0;
     std::map<std::string, TrsTraceParam> param_map;
@@ -4086,16 +4106,37 @@ void MainWindow::onExportNpz() {
 // warning (not worth reporting as an error), otherwise a real failure
 // message from TTestAccumulator::compute().
 // ---------------------------------------------------------------------------
-bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
+// The t-test's accumulators dominate its memory: one per worker thread, four
+// doubles per output sample. Asked here, before a run is submitted, because
+// computeTTestCore() may then be running on a worker thread with no way to
+// put a question on screen.
+static bool confirmTTestMemory(QWidget* parent,
+                                const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                                int64_t raw_ns, int n_threads)
+{
+    int64_t effective = raw_ns;
+    for (const auto& t : pipeline) effective = t->transformedCount(effective);
+    const int64_t bytes = effective * 4LL * static_cast<int64_t>(sizeof(double)) * n_threads;
+    if (bytes <= 2LL * 1024 * 1024 * 1024) return true;
+    return QMessageBox::warning(parent, "Memory warning",
+        QString("Accumulators will require ~%1 GB across %2 worker thread(s).\nContinue?")
+            .arg(double(bytes) / (1024.0*1024*1024), 0, 'f', 1).arg(n_threads),
+        QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes;
+}
+
+static bool computeTTestCore(TrsFile* file,
+                               const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                               int32_t eff_first, int32_t eff_count,
                                int64_t eff_first_sample, int64_t eff_n_samples,
                                int32_t byte_idx, const std::vector<int32_t>& shifts,
                                int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
                                bool abs_value,
-                               QWidget* msg_parent, std::shared_ptr<TTestAccumulator>& acc_out,
+                               const std::function<bool(int64_t, int64_t)>& progress,
+                               std::shared_ptr<TTestAccumulator>& acc_out,
                                std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
-                               QString& err)
+                               QString& warn_out, QString& err)
 {
-    const TrsHeader& h = activeDs().file->header();
+    const TrsHeader& h = file->header();
     const std::vector<int32_t>& use_shifts = shifts;
 
     // Effective raw sample count for the window
@@ -4105,12 +4146,12 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
 
     // Effective sample count after pipeline
     int64_t effective_samples = raw_ns;
-    for (const auto& t : activeDs().pipeline)
+    for (const auto& t : pipeline)
         effective_samples = t->transformedCount(effective_samples);
 
     // Accumulation is parallelised across traces, one TTestAccumulator + one
     // cloned pipeline per worker thread (merged together at the end) — the
-    // shared activeDs().pipeline transforms aren't safe to call apply() on
+    // shared pipeline transforms aren't safe to call apply() on
     // concurrently since they may cache internal state (e.g. FFT plans).
     // Capped at 8 threads since each accumulator costs 4×effective_samples
     // doubles; see the memory estimate below.
@@ -4120,32 +4161,16 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
     const int n_threads = 1;
 #endif
 
-    // Memory estimate warning (one accumulator per worker thread)
-    int64_t mem_bytes = effective_samples * 4LL * static_cast<int64_t>(sizeof(double))
-                      * n_threads;
-    if (mem_bytes > 2LL * 1024 * 1024 * 1024) {
-        if (QMessageBox::warning(msg_parent, "Memory warning",
-                QString("Accumulators will require ~%1 GB across %2 worker thread(s).\nContinue?")
-                    .arg(double(mem_bytes) / (1024.0*1024*1024), 0, 'f', 1).arg(n_threads),
-                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
-            err = "Cancelled.";
-            return false;
-        }
-    }
 
     // --- Accumulation ---
     auto acc_ptr = std::make_shared<TTestAccumulator>(static_cast<int32_t>(effective_samples));
-
-    QProgressDialog prog("Accumulating traces…", "Cancel", 0, eff_count, msg_parent);
-    prog.setWindowModality(Qt::WindowModal);
-    prog.setMinimumDuration(400);
 
     std::vector<TTestAccumulator> thread_accs(
         static_cast<size_t>(n_threads), TTestAccumulator(static_cast<int32_t>(effective_samples)));
     std::vector<std::vector<std::shared_ptr<ITransform>>> thread_pipelines(
         static_cast<size_t>(n_threads));
     for (auto& tp : thread_pipelines)
-        for (const auto& t : activeDs().pipeline) tp.push_back(t->clone());
+        for (const auto& t : pipeline) tp.push_back(t->clone());
     std::vector<std::vector<float>> thread_bufs(
         static_cast<size_t>(n_threads),
         std::vector<float>(static_cast<size_t>(std::max(raw_ns, effective_samples))));
@@ -4184,7 +4209,7 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
             std::vector<float>&                      trace_buf  = thread_bufs[tid];
 
             int32_t src_idx = eff_first + ti;
-            auto data_bytes = activeDs().file->readData(src_idx);
+            auto data_bytes = file->readData(src_idx);
             if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
             int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
 
@@ -4211,7 +4236,7 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
                 int64_t src_start = std::max<int64_t>(read_lo, adj_start);
                 int64_t src_end   = std::min<int64_t>(read_hi, adj_start + raw_ns);
                 int64_t dst_off   = src_start - adj_start;
-                int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
+                int64_t got = file->readSamples(src_idx, src_start, src_end - src_start,
                                                       trace_buf.data() + dst_off);
                 if (got <= 0) { thread_skipped[tid]++; continue; }
             }
@@ -4232,10 +4257,7 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
             : std::min(batch_size * 2, 256);
         batch_start = batch_end;   // the new size applies to the *next* batch
 
-        prog.setLabelText(QString("Accumulating trace %1 / %2…").arg(batch_end).arg(eff_count));
-        prog.setValue(batch_end);
-        QApplication::processEvents();
-        if (prog.wasCanceled()) cancelled = true;
+        if (progress && !progress(batch_end, eff_count)) cancelled = true;
     }
     if (cancelled) { err = "Cancelled."; return false; }
 
@@ -4246,7 +4268,6 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
         skipped            += thread_skipped[static_cast<size_t>(t)];
         discarded_by_align += thread_discarded[static_cast<size_t>(t)];
     }
-    prog.setValue(eff_count);
 
     if (skipped > 0 || discarded_by_align > 0) {
         QStringList msg;
@@ -4256,7 +4277,7 @@ bool MainWindow::computeTTest(int32_t eff_first, int32_t eff_count,
             msg << QString("%1 traces excluded (outside the alignment's range, or below its "
                            "correlation threshold).")
                        .arg(discarded_by_align);
-        QMessageBox::warning(msg_parent, "T-test", msg.join("\n"));
+        warn_out = msg.join("\n");
     }
 
     // --- Compute ---
@@ -4461,19 +4482,54 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         onAddToChain(s);
     }
 
-    std::shared_ptr<TTestAccumulator> acc_ptr;
-    std::vector<float> tstat;
-    int64_t n0 = 0, n1 = 0;
-    QString compute_err;
-    if (!computeTTest(eff_first, eff_count, eff_first_sample, eff_n_samples, byte_idx, use_shifts,
-                       shifts_first_trace, read_lo, read_hi, abs_value, this,
-                       acc_ptr, tstat, n0, n1, compute_err)) {
-        if (!compute_err.isEmpty() && compute_err != "Cancelled.")
-            QMessageBox::critical(this, "T-test failed", compute_err);
-        return;
-    }
+    // Everything the run needs is captured now, on the GUI thread: the file
+    // by shared_ptr (so closing this tab mid-run can't unmap it) and the
+    // pipeline as clones (so editing it afterwards doesn't change what this
+    // run sees). Nothing inside the job may touch activeDs() — by the time
+    // it finishes the user may well be on a different tab.
+    std::shared_ptr<TrsFile> job_file = activeDs().file;
+    std::vector<std::shared_ptr<ITransform>> job_pipeline;
+    for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
 
-    buildTTestResultTab(acc_ptr, std::move(tstat), n0, n1, eff_count, abs_value);
+    const int64_t prompt_ns = (eff_n_samples == 0)
+        ? (h.num_samples - eff_first_sample)
+        : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
+    if (!confirmTTestMemory(this, job_pipeline, prompt_ns, jobs_->plannedThreadBudget()))
+        return;
+
+    struct TTestOut {
+        std::shared_ptr<TTestAccumulator> acc;
+        std::vector<float> tstat;
+        int64_t n0 = 0, n1 = 0;
+        QString warn, err;
+    };
+    auto out = std::make_shared<TTestOut>();
+    const QString job_title = QString("T-test — %1 (%2 traces)")
+                                  .arg(activeDs().display_name).arg(eff_count);
+
+    jobs_->submit(job_title,
+        [=](JobContext& ctx) {
+            return computeTTestCore(job_file.get(), job_pipeline,
+                                     eff_first, eff_count, eff_first_sample, eff_n_samples,
+                                     byte_idx, use_shifts, shifts_first_trace,
+                                     read_lo, read_hi, abs_value,
+                                     [&ctx](int64_t done, int64_t total) {
+                                         ctx.setProgress(done, total);
+                                         return !ctx.cancelled();
+                                     },
+                                     out->acc, out->tstat, out->n0, out->n1,
+                                     out->warn, out->err);
+        },
+        [=](bool ok) {
+            if (!ok) {
+                if (!out->err.isEmpty() && out->err != "Cancelled.")
+                    QMessageBox::critical(this, "T-test failed", out->err);
+                return;
+            }
+            if (!out->warn.isEmpty()) QMessageBox::warning(this, "T-test", out->warn);
+            buildTTestResultTab(out->acc, std::move(out->tstat), out->n0, out->n1,
+                                 eff_count, abs_value);
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -7404,13 +7460,44 @@ bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, Q
     const int64_t read_lo = ds_tiled ? resolved_tt.first_sample : 0;
     const int64_t read_hi = ds_tiled ? resolved_tt.first_sample + resolved_tt.n_samples : h.num_samples;
 
+    // Deliberately synchronous, unlike the menu action: chain steps run in
+    // order and a later one may depend on this result, so the Run loop has
+    // to wait here rather than moving on while it computes.
+    const int64_t prompt_ns = (step.ttest_n_samples == 0)
+        ? (h.num_samples - step.ttest_first_sample)
+        : std::min<int64_t>(step.ttest_n_samples, h.num_samples - step.ttest_first_sample);
+#ifdef _OPENMP
+    const int prompt_threads = std::clamp(omp_get_max_threads(), 1, 8);
+#else
+    const int prompt_threads = 1;
+#endif
+    if (!confirmTTestMemory(msg_parent, activeDs().pipeline, prompt_ns, prompt_threads)) {
+        err = "Cancelled.";
+        return false;
+    }
+
+    QProgressDialog prog("Accumulating traces…", "Cancel", 0, eff_count, msg_parent);
+    prog.setWindowModality(Qt::WindowModal);
+    prog.setMinimumDuration(400);
+
     std::shared_ptr<TTestAccumulator> acc_ptr;
     std::vector<float> tstat;
     int64_t n0 = 0, n1 = 0;
-    if (!computeTTest(eff_first, eff_count, step.ttest_first_sample, step.ttest_n_samples,
-                       byte_idx, use_shifts, shifts_first_trace, read_lo, read_hi, step.ttest_abs,
-                       msg_parent, acc_ptr, tstat, n0, n1, err))
+    QString warn;
+    if (!computeTTestCore(activeDs().file.get(), activeDs().pipeline,
+                           eff_first, eff_count, step.ttest_first_sample, step.ttest_n_samples,
+                           byte_idx, use_shifts, shifts_first_trace, read_lo, read_hi,
+                           step.ttest_abs,
+                           [&prog](int64_t done, int64_t total) {
+                               prog.setMaximum(static_cast<int>(total));
+                               prog.setValue(static_cast<int>(done));
+                               QApplication::processEvents();
+                               return !prog.wasCanceled();
+                           },
+                           acc_ptr, tstat, n0, n1, warn, err))
         return false;
+    prog.setValue(eff_count);
+    if (!warn.isEmpty()) QMessageBox::warning(msg_parent, "T-test", warn);
 
     buildTTestResultTab(acc_ptr, std::move(tstat), n0, n1, eff_count, step.ttest_abs);
     return true;
@@ -8097,10 +8184,23 @@ void MainWindow::onRunCpa() {
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    // CPA is the one analysis that still blocks. Its leakage model is
+    // evaluated through the embedded CPython interpreter, and that code
+    // holds no GIL of its own — it is only safe because it runs on the
+    // thread that already owns the interpreter. Everything else (t-test,
+    // ...) runs as a background job instead; see JobManager.
+    auto* lbl_blocking = new QLabel(
+        "<i>Note: CPA runs in the foreground and will block the window until "
+        "it finishes — its Python leakage model cannot safely be evaluated on "
+        "a background thread. Other analyses keep running in the background.</i>");
+    lbl_blocking->setWordWrap(true);
+    lbl_blocking->setTextFormat(Qt::RichText);
+
     vl_cfg->addWidget(grp_traces);
     vl_cfg->addWidget(grp_samples);
     vl_cfg->addWidget(grp_hyp);
     vl_cfg->addWidget(grp_align);
+    vl_cfg->addWidget(lbl_blocking);
     vl_cfg->addWidget(cfg_bb);
     if (cfg.exec() != QDialog::Accepted) return;
 
@@ -8396,6 +8496,87 @@ void MainWindow::onRunCpa() {
 // SNR
 // ---------------------------------------------------------------------------
 
+// Pure SNR accumulation: no widgets, no activeDs(), everything it reads is a
+// parameter — so it is safe to run on a worker thread. See job_manager.h.
+static bool computeSNRCore(TrsFile* file,
+                            const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                            int32_t first, int32_t count,
+                            int64_t eff_first_sample, int64_t raw_ns,
+                            int64_t effective_samples,
+                            int32_t byte_idx, bool use_hw, bool use_sbox,
+                            uint8_t key_byte, int32_t n_classes,
+                            const std::function<bool(int64_t, int64_t)>& progress,
+                            std::vector<float>& snr_out, int64_t& total_out,
+                            int32_t& skipped_out, QString& err)
+{
+    const TrsHeader& h = file->header();
+    SNRAccumulator acc(static_cast<int32_t>(effective_samples), n_classes);
+    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
+    int32_t skipped = 0;
+
+    static const int32_t HW_TABLE[256] = {
+        0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4, 1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,
+        1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5, 2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+        1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5, 2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+        2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+        1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5, 2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
+        2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+        2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
+        3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7, 4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8
+    };
+    static const uint8_t AES_SBOX[256] = {
+        0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+        0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+        0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+        0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+        0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+        0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+        0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+        0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+        0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+        0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+        0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+        0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+        0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+        0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+        0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+        0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+    };
+
+    for (int32_t ti = 0; ti < count; ti++) {
+        if (progress && !progress(ti, count)) { err = "Cancelled."; return false; }
+
+        int32_t src_idx  = first + ti;
+        auto data_bytes  = file->readData(src_idx);
+        if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { skipped++; continue; }
+
+        uint8_t  bval    = data_bytes[byte_idx];
+        if (use_sbox) bval = AES_SBOX[bval ^ key_byte];
+        int32_t  label   = use_hw ? HW_TABLE[bval] : static_cast<int32_t>(bval);
+
+        const int64_t adj_start = eff_first_sample;
+        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+        if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
+            int64_t src_start = std::max<int64_t>(0, adj_start);
+            int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
+            int64_t dst_off   = src_start - adj_start;
+            int64_t got = file->readSamples(src_idx, src_start, src_end - src_start,
+                                             trace_buf.data() + dst_off);
+            if (got <= 0) { skipped++; continue; }
+        }
+        for (const auto& t : pipeline) t->reset();
+        int64_t n_out = raw_ns;
+        for (const auto& t : pipeline) n_out = t->apply(trace_buf.data(), n_out, 0);
+        acc.addTrace(label, trace_buf.data(), static_cast<int32_t>(n_out));
+    }
+
+    std::string cerr;
+    if (!acc.compute(snr_out, cerr)) { err = QString::fromStdString(cerr); return false; }
+    total_out   = acc.totalTraces();
+    skipped_out = skipped;
+    return true;
+}
+
 void MainWindow::onRunSNR() {
     if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "SNR", "No file loaded.");
@@ -8487,152 +8668,168 @@ void MainWindow::onRunSNR() {
             return;
     }
 
-    // --- Accumulation ---
-    SNRAccumulator acc(static_cast<int32_t>(effective_samples), n_classes);
+    // Captured now, on the GUI thread: the file by shared_ptr so closing this
+    // tab can't unmap it mid-run, and the pipeline as clones so later edits
+    // don't change what this run sees.
+    std::shared_ptr<TrsFile> job_file = activeDs().file;
+    std::vector<std::shared_ptr<ITransform>> job_pipeline;
+    for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
 
-    QProgressDialog prog("Accumulating traces…", "Cancel", 0, count, this);
-    prog.setWindowModality(Qt::WindowModal);
-    prog.setMinimumDuration(400);
-
-    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
-    int32_t skipped = 0;
-
-    static const int32_t HW_TABLE[256] = {
-        0,1,1,2,1,2,2,3,1,2,2,3,2,3,3,4, 1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5,
-        1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5, 2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
-        1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5, 2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
-        2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
-        1,2,2,3,2,3,3,4,2,3,3,4,3,4,4,5, 2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6,
-        2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
-        2,3,3,4,3,4,4,5,3,4,4,5,4,5,5,6, 3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7,
-        3,4,4,5,4,5,5,6,4,5,5,6,5,6,6,7, 4,5,5,6,5,6,6,7,5,6,6,7,6,7,7,8
+    struct SNROut {
+        std::vector<float> snr;
+        int64_t total = 0;
+        int32_t skipped = 0;
+        QString err;
     };
-    static const uint8_t AES_SBOX[256] = {
-        0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
-        0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
-        0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
-        0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
-        0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
-        0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
-        0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
-        0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
-        0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
-        0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
-        0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
-        0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
-        0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
-        0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
-        0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
-        0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
-    };
+    auto out = std::make_shared<SNROut>();
+    const QString job_title = QString("SNR — %1 (%2 traces)")
+                                  .arg(activeDs().display_name).arg(count);
 
-    for (int32_t ti = 0; ti < count; ti++) {
-        if (prog.wasCanceled()) return;
-        prog.setValue(ti);
-        QApplication::processEvents();
+    jobs_->submit(job_title,
+        [=](JobContext& ctx) {
+            return computeSNRCore(job_file.get(), job_pipeline, first, count,
+                                   eff_first_sample, raw_ns, effective_samples,
+                                   byte_idx, use_hw, use_sbox, key_byte, n_classes,
+                                   [&ctx](int64_t done, int64_t total) {
+                                       ctx.setProgress(done, total);
+                                       return !ctx.cancelled();
+                                   },
+                                   out->snr, out->total, out->skipped, out->err);
+        },
+        [=](bool ok) {
+            if (!ok) {
+                if (!out->err.isEmpty() && out->err != "Cancelled.")
+                    QMessageBox::critical(this, "SNR failed", out->err);
+                return;
+            }
+            if (out->skipped > 0)
+                QMessageBox::warning(this, "SNR",
+                    QString("%1 traces skipped (data byte out of range).").arg(out->skipped));
 
-        int32_t src_idx  = first + ti;
-        auto data_bytes  = activeDs().file->readData(src_idx);
-        if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { skipped++; continue; }
+            // --- Result tab ---
+            auto snr_ptr = std::make_shared<std::vector<float>>(std::move(out->snr));
 
-        uint8_t  bval    = data_bytes[byte_idx];
-        if (use_sbox) bval = AES_SBOX[bval ^ key_byte];
-        int32_t  label   = use_hw ? HW_TABLE[bval] : static_cast<int32_t>(bval);
+            QString mode_str;
+            if      (mode == 0) mode_str = "raw byte";
+            else if (mode == 1) mode_str = "HW(byte)";
+            else if (mode == 2) mode_str = QString("SBox(byte⊕0x%1)").arg(key_byte, 2, 16, QChar('0'));
+            else                mode_str = QString("HW(SBox(byte⊕0x%1))").arg(key_byte, 2, 16, QChar('0'));
+            QString tab_title = QString("SNR — %1 traces, %2 (%3 classes)")
+                                    .arg(out->total)
+                                    .arg(mode_str)
+                                    .arg(n_classes);
+            addResultTab(*snr_ptr, tab_title, QColor("#f4a63a"), "SNR");
+            PlotWidget* pw = plotWidget();
+            pw->setTraceFilled(0, true);
+            pw->setAxisLabels("Sample Index", "SNR");
+            pw->setThresholds(false, 0.0, 0.0);
+            pw->resetView();
 
-        const int64_t adj_start = eff_first_sample;
-        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
-        if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
-            int64_t src_start = std::max<int64_t>(0, adj_start);
-            int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
-            int64_t dst_off   = src_start - adj_start;
-            int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
-                                                  trace_buf.data() + dst_off);
-            if (got <= 0) { skipped++; continue; }
-        }
-        for (const auto& t : activeDs().pipeline) t->reset();
-        int64_t n_out = raw_ns;
-        for (const auto& t : activeDs().pipeline)
-            n_out = t->apply(trace_buf.data(), n_out, 0);
-        acc.addTrace(label, trace_buf.data(), static_cast<int32_t>(n_out));
-    }
-    prog.setValue(count);
+            auto* btn_exp_npy = new QPushButton("Export .npy…");
+            connect(btn_exp_npy, &QPushButton::clicked, pw, [this, snr_ptr]() {
+                QString path = QFileDialog::getSaveFileName(this, "Export SNR as NumPy",
+                                                            MainWindow::recentDir("npy"), "NumPy files (*.npy)");
+                if (path.isEmpty()) return;
+                MainWindow::updateRecentDir("npy", path);
+                QString e;
+                if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
+                    QMessageBox::critical(this, "Export failed", e);
+                else
+                    QMessageBox::information(this, "Export complete", "Saved: " + path);
+            });
 
-    if (skipped > 0)
-        QMessageBox::warning(this, "SNR",
-            QString("%1 traces skipped (data byte out of range).").arg(skipped));
+            auto* btn_exp_pdf = new QPushButton("Export PDF…");
+            connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
+                QString path = QFileDialog::getSaveFileName(this, "Export SNR as PDF",
+                                                            MainWindow::recentDir("export"), "PDF files (*.pdf)");
+                if (path.isEmpty()) return;
+                MainWindow::updateRecentDir("export", path);
+                QPixmap px = pw->grab();
+                QPdfWriter writer(path);
+                writer.setResolution(150);
+                writer.setPageSize(QPageSize(QPageSize::A4));
+                writer.setPageOrientation(QPageLayout::Landscape);
+                writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
+                QPainter painter(&writer);
+                if (painter.isActive())
+                    painter.drawPixmap(painter.viewport(), px);
+            });
 
-    // --- Compute ---
-    std::vector<float> snr;
-    std::string        err;
-    if (!acc.compute(snr, err)) {
-        QMessageBox::critical(this, "SNR failed", QString::fromStdString(err));
-        return;
-    }
+            auto* extra = new QWidget;
+            auto* hl = new QHBoxLayout(extra);
+            hl->setContentsMargins(4, 2, 4, 2);
+            hl->addWidget(btn_exp_npy);
+            hl->addWidget(btn_exp_pdf);
+            hl->addStretch();
 
-    // --- Result tab ---
-    auto snr_ptr = std::make_shared<std::vector<float>>(std::move(snr));
-
-    QString mode_str;
-    if      (mode == 0) mode_str = "raw byte";
-    else if (mode == 1) mode_str = "HW(byte)";
-    else if (mode == 2) mode_str = QString("SBox(byte⊕0x%1)").arg(key_byte, 2, 16, QChar('0'));
-    else                mode_str = QString("HW(SBox(byte⊕0x%1))").arg(key_byte, 2, 16, QChar('0'));
-    QString tab_title = QString("SNR — %1 traces, %2 (%3 classes)")
-                            .arg(acc.totalTraces())
-                            .arg(mode_str)
-                            .arg(n_classes);
-    addResultTab(*snr_ptr, tab_title, QColor("#f4a63a"), "SNR");
-    PlotWidget* pw = plotWidget();
-    pw->setTraceFilled(0, true);
-    pw->setAxisLabels("Sample Index", "SNR");
-    pw->setThresholds(false, 0.0, 0.0);
-    pw->resetView();
-
-    auto* btn_exp_npy = new QPushButton("Export .npy…");
-    connect(btn_exp_npy, &QPushButton::clicked, pw, [this, snr_ptr]() {
-        QString path = QFileDialog::getSaveFileName(this, "Export SNR as NumPy",
-                                                    MainWindow::recentDir("npy"), "NumPy files (*.npy)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("npy", path);
-        QString e;
-        if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
-            QMessageBox::critical(this, "Export failed", e);
-        else
-            QMessageBox::information(this, "Export complete", "Saved: " + path);
-    });
-
-    auto* btn_exp_pdf = new QPushButton("Export PDF…");
-    connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
-        QString path = QFileDialog::getSaveFileName(this, "Export SNR as PDF",
-                                                    MainWindow::recentDir("export"), "PDF files (*.pdf)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("export", path);
-        QPixmap px = pw->grab();
-        QPdfWriter writer(path);
-        writer.setResolution(150);
-        writer.setPageSize(QPageSize(QPageSize::A4));
-        writer.setPageOrientation(QPageLayout::Landscape);
-        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-        QPainter painter(&writer);
-        if (painter.isActive())
-            painter.drawPixmap(painter.viewport(), px);
-    });
-
-    auto* extra = new QWidget;
-    auto* hl = new QHBoxLayout(extra);
-    hl->setContentsMargins(4, 2, 4, 2);
-    hl->addWidget(btn_exp_npy);
-    hl->addWidget(btn_exp_pdf);
-    hl->addStretch();
-
-    activeDs().extra_toolbar = extra;
-    updateViewLayout();
+            activeDs().extra_toolbar = extra;
+            updateViewLayout();
+        });
 }
 
 // ---------------------------------------------------------------------------
 // Static SNR  |μ[s] / σ[s]|
 // Run the same operation N times; σ is purely electronic/thermal noise.
 // ---------------------------------------------------------------------------
+
+// Pure |mu/sigma| accumulation — same contract as computeSNRCore(): no
+// widgets, no activeDs(), safe on a worker thread.
+static bool computeStaticSNRCore(TrsFile* file,
+                                  const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                                  int32_t first, int32_t count,
+                                  int64_t eff_first_sample, int64_t raw_ns,
+                                  int64_t effective_samples,
+                                  const std::function<bool(int64_t, int64_t)>& progress,
+                                  std::vector<float>& snr_out, int64_t& total_out,
+                                  QString& err)
+{
+    const TrsHeader& h = file->header();
+    std::vector<double> sum(static_cast<size_t>(effective_samples), 0.0);
+    std::vector<double> sum2(static_cast<size_t>(effective_samples), 0.0);
+    int64_t N = 0;
+
+    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
+
+    for (int32_t ti = 0; ti < count; ti++) {
+        if (progress && !progress(ti, count)) { err = "Cancelled."; return false; }
+
+        int32_t src_idx = first + ti;
+        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+        const int64_t adj_start = eff_first_sample;
+        if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
+            int64_t src_start = std::max<int64_t>(0, adj_start);
+            int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
+            int64_t dst_off   = src_start - adj_start;
+            int64_t got = file->readSamples(src_idx, src_start, src_end - src_start,
+                                             trace_buf.data() + dst_off);
+            if (got <= 0) continue;
+        }
+        for (const auto& t : pipeline) t->reset();
+        int64_t n_out = raw_ns;
+        for (const auto& t : pipeline) n_out = t->apply(trace_buf.data(), n_out, 0);
+
+        for (int64_t s = 0; s < n_out; s++) {
+            double v = static_cast<double>(trace_buf[s]);
+            sum[s]  += v;
+            sum2[s] += v * v;
+        }
+        N++;
+    }
+
+    if (N < 2) { err = "Need at least 2 traces."; return false; }
+
+    snr_out.assign(static_cast<size_t>(effective_samples), 0.0f);
+    const double nd = static_cast<double>(N);
+    for (int64_t s = 0; s < effective_samples; s++) {
+        double mean = sum[s] / nd;
+        double var  = (sum2[s] - sum[s] * mean) / (nd - 1.0);
+        if (var < 0.0) var = 0.0;
+        double sigma = std::sqrt(var);
+        snr_out[s] = (sigma > 0.0) ? static_cast<float>(std::abs(mean) / sigma) : 0.0f;
+    }
+    total_out = N;
+    return true;
+}
 
 void MainWindow::onRunStaticSNR() {
     if (!hasActiveDs() || activeDs().is_result) {
@@ -8677,126 +8874,96 @@ void MainWindow::onRunStaticSNR() {
     for (const auto& t : activeDs().pipeline)
         effective_samples = t->transformedCount(effective_samples);
 
-    // --- Accumulate sum and sum-of-squares ---
-    std::vector<double> sum(static_cast<size_t>(effective_samples), 0.0);
-    std::vector<double> sum2(static_cast<size_t>(effective_samples), 0.0);
-    int64_t N = 0;
+    std::shared_ptr<TrsFile> job_file = activeDs().file;
+    std::vector<std::shared_ptr<ITransform>> job_pipeline;
+    for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
 
-    QProgressDialog prog("Accumulating traces…", "Cancel", 0, count, this);
-    prog.setWindowModality(Qt::WindowModal);
-    prog.setMinimumDuration(400);
+    struct StaticSNROut { std::vector<float> snr; int64_t total = 0; QString err; };
+    auto out = std::make_shared<StaticSNROut>();
+    const QString job_title = QString("Static SNR — %1 (%2 traces)")
+                                  .arg(activeDs().display_name).arg(count);
 
-    std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
+    jobs_->submit(job_title,
+        [=](JobContext& ctx) {
+            return computeStaticSNRCore(job_file.get(), job_pipeline, first, count,
+                                         eff_first_sample, raw_ns, effective_samples,
+                                         [&ctx](int64_t done, int64_t total) {
+                                             ctx.setProgress(done, total);
+                                             return !ctx.cancelled();
+                                         },
+                                         out->snr, out->total, out->err);
+        },
+        [=](bool ok) {
+            if (!ok) {
+                if (!out->err.isEmpty() && out->err != "Cancelled.")
+                    QMessageBox::critical(this, "Static SNR", out->err);
+                return;
+            }
 
-    for (int32_t ti = 0; ti < count; ti++) {
-        if (prog.wasCanceled()) return;
-        prog.setValue(ti);
-        QApplication::processEvents();
+            // --- Result window ---
+            float snr_min = *std::min_element(out->snr.begin(), out->snr.end());
+            float snr_max = *std::max_element(out->snr.begin(), out->snr.end());
+            double snr_sum = std::accumulate(out->snr.begin(), out->snr.end(), 0.0);
+            float snr_avg = out->snr.empty() ? 0.f : static_cast<float>(snr_sum / out->snr.size());
 
-        int32_t src_idx = first + ti;
-        std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
-        const int64_t adj_start = eff_first_sample;
-        if (adj_start < h.num_samples && adj_start + raw_ns > 0) {
-            int64_t src_start = std::max<int64_t>(0, adj_start);
-            int64_t src_end   = std::min<int64_t>(h.num_samples, adj_start + raw_ns);
-            int64_t dst_off   = src_start - adj_start;
-            int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
-                                                  trace_buf.data() + dst_off);
-            if (got <= 0) continue;
-        }
-        for (const auto& t : activeDs().pipeline) t->reset();
-        int64_t n_out = raw_ns;
-        for (const auto& t : activeDs().pipeline)
-            n_out = t->apply(trace_buf.data(), n_out, 0);
+            auto snr_ptr = std::make_shared<std::vector<float>>(std::move(out->snr));
 
-        for (int64_t s = 0; s < n_out; s++) {
-            double v = static_cast<double>(trace_buf[s]);
-            sum[s]  += v;
-            sum2[s] += v * v;
-        }
-        N++;
-    }
-    prog.setValue(count);
+            QString tab_title = QString("Static SNR |μ/σ| — %1 traces").arg(out->total);
+            addResultTab(*snr_ptr, tab_title, QColor("#4fc3f7"), "|μ/σ|");
+            PlotWidget* pw = plotWidget();
+            pw->setTraceFilled(0, true);
+            pw->setAxisLabels("Sample Index", "|μ/σ|");
+            pw->setThresholds(false, 0.0, 0.0);
+            pw->resetView();
 
-    if (N < 2) {
-        QMessageBox::critical(this, "Static SNR", "Need at least 2 traces.");
-        return;
-    }
+            auto* lbl_stats = new QLabel(
+                QString("Min: <b>%1</b>  Max: <b>%2</b>  Avg: <b>%3</b>")
+                    .arg(static_cast<double>(snr_min), 0, 'f', 4)
+                    .arg(static_cast<double>(snr_max), 0, 'f', 4)
+                    .arg(static_cast<double>(snr_avg), 0, 'f', 4));
+            lbl_stats->setTextFormat(Qt::RichText);
 
-    // --- Compute |μ / σ| per sample ---
-    std::vector<float> snr(static_cast<size_t>(effective_samples));
-    double nd = static_cast<double>(N);
-    for (int64_t s = 0; s < effective_samples; s++) {
-        double mean = sum[s] / nd;
-        double var  = (sum2[s] - sum[s] * mean) / (nd - 1.0);
-        if (var < 0.0) var = 0.0;
-        double sigma = std::sqrt(var);
-        snr[s] = (sigma > 0.0) ? static_cast<float>(std::abs(mean) / sigma) : 0.0f;
-    }
+            auto* btn_exp_npy = new QPushButton("Export .npy…");
+            connect(btn_exp_npy, &QPushButton::clicked, pw, [this, snr_ptr]() {
+                QString path = QFileDialog::getSaveFileName(this, "Export static SNR as NumPy",
+                                                            MainWindow::recentDir("npy"), "NumPy files (*.npy)");
+                if (path.isEmpty()) return;
+                MainWindow::updateRecentDir("npy", path);
+                QString e;
+                if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
+                    QMessageBox::critical(this, "Export failed", e);
+                else
+                    QMessageBox::information(this, "Export complete", "Saved: " + path);
+            });
 
-    // --- Result window ---
-    float snr_min = *std::min_element(snr.begin(), snr.end());
-    float snr_max = *std::max_element(snr.begin(), snr.end());
-    double snr_sum = std::accumulate(snr.begin(), snr.end(), 0.0);
-    float snr_avg = snr.empty() ? 0.f : static_cast<float>(snr_sum / snr.size());
+            auto* btn_exp_pdf = new QPushButton("Export PDF…");
+            connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
+                QString path = QFileDialog::getSaveFileName(this, "Export static SNR as PDF",
+                                                            MainWindow::recentDir("export"), "PDF files (*.pdf)");
+                if (path.isEmpty()) return;
+                MainWindow::updateRecentDir("export", path);
+                QPixmap px = pw->grab();
+                QPdfWriter writer(path);
+                writer.setResolution(150);
+                writer.setPageSize(QPageSize(QPageSize::A4));
+                writer.setPageOrientation(QPageLayout::Landscape);
+                writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
+                QPainter painter(&writer);
+                if (painter.isActive())
+                    painter.drawPixmap(painter.viewport(), px);
+            });
 
-    auto snr_ptr = std::make_shared<std::vector<float>>(std::move(snr));
+            auto* extra = new QWidget;
+            auto* hl = new QHBoxLayout(extra);
+            hl->setContentsMargins(4, 2, 4, 2);
+            hl->addWidget(lbl_stats);
+            hl->addStretch();
+            hl->addWidget(btn_exp_npy);
+            hl->addWidget(btn_exp_pdf);
 
-    QString tab_title = QString("Static SNR |μ/σ| — %1 traces").arg(N);
-    addResultTab(*snr_ptr, tab_title, QColor("#4fc3f7"), "|μ/σ|");
-    PlotWidget* pw = plotWidget();
-    pw->setTraceFilled(0, true);
-    pw->setAxisLabels("Sample Index", "|μ/σ|");
-    pw->setThresholds(false, 0.0, 0.0);
-    pw->resetView();
-
-    auto* lbl_stats = new QLabel(
-        QString("Min: <b>%1</b>  Max: <b>%2</b>  Avg: <b>%3</b>")
-            .arg(static_cast<double>(snr_min), 0, 'f', 4)
-            .arg(static_cast<double>(snr_max), 0, 'f', 4)
-            .arg(static_cast<double>(snr_avg), 0, 'f', 4));
-    lbl_stats->setTextFormat(Qt::RichText);
-
-    auto* btn_exp_npy = new QPushButton("Export .npy…");
-    connect(btn_exp_npy, &QPushButton::clicked, pw, [this, snr_ptr]() {
-        QString path = QFileDialog::getSaveFileName(this, "Export static SNR as NumPy",
-                                                    MainWindow::recentDir("npy"), "NumPy files (*.npy)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("npy", path);
-        QString e;
-        if (!saveNpy(path, snr_ptr->data(), static_cast<int64_t>(snr_ptr->size()), e))
-            QMessageBox::critical(this, "Export failed", e);
-        else
-            QMessageBox::information(this, "Export complete", "Saved: " + path);
-    });
-
-    auto* btn_exp_pdf = new QPushButton("Export PDF…");
-    connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
-        QString path = QFileDialog::getSaveFileName(this, "Export static SNR as PDF",
-                                                    MainWindow::recentDir("export"), "PDF files (*.pdf)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("export", path);
-        QPixmap px = pw->grab();
-        QPdfWriter writer(path);
-        writer.setResolution(150);
-        writer.setPageSize(QPageSize(QPageSize::A4));
-        writer.setPageOrientation(QPageLayout::Landscape);
-        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-        QPainter painter(&writer);
-        if (painter.isActive())
-            painter.drawPixmap(painter.viewport(), px);
-    });
-
-    auto* extra = new QWidget;
-    auto* hl = new QHBoxLayout(extra);
-    hl->setContentsMargins(4, 2, 4, 2);
-    hl->addWidget(lbl_stats);
-    hl->addStretch();
-    hl->addWidget(btn_exp_npy);
-    hl->addWidget(btn_exp_pdf);
-
-    activeDs().extra_toolbar = extra;
-    updateViewLayout();
+            activeDs().extra_toolbar = extra;
+            updateViewLayout();
+        });
 }
 
 // ---------------------------------------------------------------------------
@@ -9627,4 +9794,58 @@ void MainWindow::onExportDataset() {
         QMessageBox::information(this, "Export complete",
             QString("Saved %1 traces × %2 samples, %3 label(s)\n→ %4")
                 .arg(written).arg(eff_ns).arg(labels.size()).arg(out_path));
+}
+
+// ---------------------------------------------------------------------------
+// Mirrors JobManager's current state into the dock: one row per running job
+// with its progress and a Cancel button. Rows are updated in place rather
+// than rebuilt, so the ~8 Hz refresh doesn't make the buttons flicker or
+// steal clicks mid-press.
+// ---------------------------------------------------------------------------
+void MainWindow::refreshJobsDock() {
+    if (!jobs_ || !jobs_rows_) return;
+    const auto active = jobs_->snapshot();
+
+    std::set<int> live;
+    for (const auto& st : active) live.insert(st.id);
+
+    for (auto it = job_rows_.begin(); it != job_rows_.end(); ) {
+        if (live.count(it->first) == 0) {
+            it->second.row->deleteLater();
+            it = job_rows_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    for (const auto& st : active) {
+        auto found = job_rows_.find(st.id);
+        if (found == job_rows_.end()) {
+            auto* row = new QWidget;
+            auto* hl  = new QHBoxLayout(row);
+            hl->setContentsMargins(0, 0, 0, 0);
+            auto* lbl = new QLabel(st.title);
+            auto* bar = new QProgressBar;
+            bar->setMinimumWidth(180);
+            bar->setTextVisible(true);
+            auto* btn = new QPushButton("Cancel");
+            const int id = st.id;
+            connect(btn, &QPushButton::clicked, this, [this, id]() { jobs_->cancel(id); });
+            hl->addWidget(lbl);
+            hl->addWidget(bar, 1);
+            hl->addWidget(btn);
+            jobs_rows_->addWidget(row);
+            found = job_rows_.emplace(st.id, JobRow{row, bar, lbl}).first;
+        }
+        QProgressBar* bar = found->second.bar;
+        if (st.total > 0) {
+            bar->setRange(0, static_cast<int>(std::min<int64_t>(st.total, 1000000)));
+            bar->setValue(static_cast<int>(std::min<int64_t>(st.done, 1000000)));
+        } else {
+            bar->setRange(0, 0);   // indeterminate until the job reports a total
+        }
+        found->second.label->setText(st.cancelled ? st.title + " — cancelling…" : st.title);
+    }
+
+    jobs_dock_->setVisible(!active.empty());
 }
