@@ -7,12 +7,36 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
 # Try Qt6 first, fall back to Qt5
-find_package(Qt6 QUIET COMPONENTS Core Gui Widgets Svg)
+# Qt: prefer 6, fall back to 5.
+#
+# The base modules and Svg are looked up in two steps on purpose.
+# find_package(Qt6 COMPONENTS ...) reports Qt6_FOUND=0 when *any single*
+# component is missing, so asking for them together meant a machine with Qt6
+# installed but its Svg module absent fell straight through to the Qt5 branch
+# and failed with "Could not find Qt5" — pointing at entirely the wrong
+# problem. Checking Svg separately lets the error name the package you
+# actually need to install.
+find_package(Qt6 QUIET COMPONENTS Core Gui Widgets)
 if(Qt6_FOUND)
+    find_package(Qt6 QUIET COMPONENTS Svg)
+    if(NOT Qt6Svg_FOUND)
+        message(FATAL_ERROR
+            "Qt6 was found, but its Svg module is missing (needed for the app icon).\n"
+            "  Fedora / RHEL:   sudo dnf install qt6-qtsvg-devel\n"
+            "  Debian / Ubuntu: sudo apt install qt6-svg-dev\n"
+            "  Arch:            sudo pacman -S qt6-svg\n"
+            "  openSUSE:        sudo zypper install qt6-svg-devel\n"
+            "Or run scripts/install-deps.sh, which installs every dependency.")
+    endif()
     set(QT_LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg)
     message(STATUS "Using Qt6")
 else()
-    find_package(Qt5 REQUIRED COMPONENTS Core Gui Widgets Svg)
+    find_package(Qt5 QUIET COMPONENTS Core Gui Widgets Svg)
+    if(NOT Qt5_FOUND)
+        message(FATAL_ERROR
+            "Neither Qt6 nor Qt5 (Core, Gui, Widgets, Svg) could be found.\n"
+            "Run scripts/install-deps.sh, or see the Installation section of README.md.")
+    endif()
     set(QT_LIBS Qt5::Core Qt5::Gui Qt5::Widgets Qt5::Svg)
     message(STATUS "Using Qt5")
 endif()

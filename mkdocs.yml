@@ -1,0 +1,51 @@
+site_name: trs-viewer
+site_description: Interactive power-trace viewer and side-channel analysis toolkit
+repo_url: https://github.com/JJanasek/trs-viewer
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  logo: logo.svg
+  favicon: logo.svg
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - search.highlight
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle: {icon: material/weather-night, name: Switch to dark mode}
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle: {icon: material/weather-sunny, name: Switch to light mode}
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc: {permalink: true}
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+nav:
+  - Home: index.md
+  - Installation: install.md
+  - Usage: usage.md
+  - Features:
+      - Trace viewing: features/viewing.md
+      - Processing pipeline: features/pipeline.md
+      - Trace alignment: features/alignment.md
+      - Welch t-test: features/ttest.md
+      - Cross-correlation: features/xcorr.md
+      - CPA: features/cpa.md
+      - SNR: features/snr.md
+      - Static SNR: features/static-snr.md
+      - FFT spectrum: features/fft.md
+      - Heatmap viewer: features/heatmap.md
+      - Export (TRS/NPY/NPZ): features/export.md
+      - Export dataset: features/export-dataset.md
+      - Range editor: features/range-editor.md
+      - Chain editor: features/chain.md
+      - NPY/NPZ support: features/npy-npz.md
+  - File formats: formats.md
+  - Development: development.md
