@@ -110,6 +110,13 @@ static QRgb interpColormap(float t, const CmapEntry* cm, int n) {
 QRgb HeatmapWidget::colormap(float v) const {
     float range = vmax_ - vmin_;
     float t = (range != 0.0f) ? (v - vmin_) / range : 0.5f;
+    return colormapT(t);
+}
+
+QRgb HeatmapWidget::colormapT(float t) const {
+    // Contrast stretches about the midpoint, brightness shifts; interpColormap
+    // clamps the result to [0,1], which is what makes both safe to over-drive.
+    t = (t - 0.5f) * contrast_ + 0.5f + brightness_;
     switch (color_scheme_) {
     case ColorScheme::Grayscale: return interpColormap(t, kGrayscale, 2);
     case ColorScheme::Hot:       return interpColormap(t, kHot,       4);
@@ -139,16 +146,53 @@ QImage HeatmapWidget::renderRegion(int W, int H,
     const double dx = (x1 - x0) / W;
     const double dy = (y1 - y0) / H;
     const int    Nr = rows_, Nc = cols_;
-    const float* dm = display_matrix_.data();
+
+    // Cells per pixel decides the source level. Below one, every cell is
+    // drawn anyway. Above, sample a pooled level whose block is the *smallest*
+    // power of two >= cells-per-pixel, so each pooled cell is at least a pixel
+    // wide and none can fall between samples — that is what keeps a small
+    // hotspot on screen at any zoom (see Downsample).
+    const double cpp = std::max(dx, dy);
+    int f = 1;
+    if (downsample_ != Downsample::Nearest && cpp > 1.0)
+        while (f < cpp) f *= 2;
+    if (f > 1) ensurePooled(f);
+    const float* dm     = (f > 1) ? pooled_.data() : display_matrix_.data();
+    const int    stride = (f > 1) ? pooled_cols_    : Nc;
+
+    // Inside a selected region, each cell's normalised value is blended from
+    // the global scale toward the region's own scale by region_boost_ — the
+    // rest of the heatmap is untouched, so the region's strongest cells stand
+    // out against a background that still reads normally. Optionally the
+    // outside is darkened too (not hidden — it still gives context).
+    const bool  boost = sel_valid_ && region_boost_ > 0.0f;
+    const bool  dim   = sel_valid_ && dim_outside_;
+    const float g_rng = vmax_ - vmin_;
+    const float l_rng = sel_hi_ - sel_lo_;
+    auto dimmed = [](QRgb c) {
+        return qRgb(qRed(c) * 35 / 100, qGreen(c) * 35 / 100, qBlue(c) * 35 / 100);
+    };
 
 #pragma omp parallel for schedule(static)
     for (int row = 0; row < H; row++) {
         const int data_row = std::clamp(static_cast<int>(y0 + (row + 0.5) * dy), 0, Nr - 1);
-        const float* src   = dm + static_cast<size_t>(data_row) * Nc;
+        const float* src   = dm + static_cast<size_t>(data_row / f) * stride;
         QRgb*        line  = bits + row * bpl;
+        const bool row_in  = sel_valid_ && data_row >= sel_r0_ && data_row <= sel_r1_;
         for (int col = 0; col < W; col++) {
-            const int data_col = std::clamp(static_cast<int>(x0 + (col + 0.5) * dx), 0, Nc - 1);
-            line[col] = colormap(src[data_col]);
+            const int   data_col = std::clamp(static_cast<int>(x0 + (col + 0.5) * dx), 0, Nc - 1);
+            const bool  inside   = row_in && data_col >= sel_c0_ && data_col <= sel_c1_;
+            const float v        = src[data_col / f];
+            QRgb c;
+            if (inside && boost) {
+                const float tg = (g_rng != 0.0f) ? (v - vmin_)  / g_rng : 0.5f;
+                const float tl = (l_rng != 0.0f) ? (v - sel_lo_) / l_rng : 0.5f;
+                c = colormapT(tg + (tl - tg) * region_boost_);
+            } else {
+                c = colormap(v);
+                if (dim && !inside) c = dimmed(c);
+            }
+            line[col] = c;
         }
     }
     return img;
@@ -198,6 +242,16 @@ void HeatmapWidget::setBinaryThreshold(bool enabled, float threshold) {
     update();
 }
 
+void HeatmapWidget::setContrast(float contrast) {
+    contrast_ = std::max(0.0f, contrast);
+    update();
+}
+
+void HeatmapWidget::setBrightness(float brightness) {
+    brightness_ = brightness;
+    update();
+}
+
 void HeatmapWidget::setColorScheme(ColorScheme scheme) {
     color_scheme_ = scheme;
     update();
@@ -208,6 +262,114 @@ void HeatmapWidget::setColorRange(float vmin, float vmax) {
     vmin_ = vmin;
     vmax_ = vmax;
     update();
+}
+
+void HeatmapWidget::ensurePooled(int f) const {
+    if (f <= 1) return;
+    if (pool_factor_ == f && !pooled_.empty()) return;
+    pooled_rows_ = (rows_ + f - 1) / f;
+    pooled_cols_ = (cols_ + f - 1) / f;
+    pooled_.assign(static_cast<size_t>(pooled_rows_) * pooled_cols_, 0.0f);
+    const float* dm = display_matrix_.data();
+    const bool peak = (downsample_ == Downsample::Peak);
+
+#pragma omp parallel for schedule(static)
+    for (int pr = 0; pr < pooled_rows_; pr++) {
+        const int r0 = pr * f, r1 = std::min(rows_, r0 + f);
+        float* out = pooled_.data() + static_cast<size_t>(pr) * pooled_cols_;
+        for (int pc = 0; pc < pooled_cols_; pc++) {
+            const int c0 = pc * f, c1 = std::min(cols_, c0 + f);
+            if (peak) {
+                float best = 0.0f, best_abs = -1.0f;
+                for (int r = r0; r < r1; r++) {
+                    const float* src = dm + static_cast<size_t>(r) * cols_;
+                    for (int c = c0; c < c1; c++) {
+                        const float a = std::abs(src[c]);
+                        if (a > best_abs) { best_abs = a; best = src[c]; }
+                    }
+                }
+                out[pc] = best;
+            } else {
+                double sum = 0.0;
+                for (int r = r0; r < r1; r++) {
+                    const float* src = dm + static_cast<size_t>(r) * cols_;
+                    for (int c = c0; c < c1; c++) sum += src[c];
+                }
+                out[pc] = static_cast<float>(sum / ((r1 - r0) * (c1 - c0)));
+            }
+        }
+    }
+    pool_factor_ = f;
+}
+
+void HeatmapWidget::setDownsample(Downsample d) {
+    downsample_ = d;
+    invalidatePooled();
+    update();
+}
+
+void HeatmapWidget::setView(double x0, double y0, double x1, double y1) {
+    if (rows_ <= 0 || cols_ <= 0) return;
+    const double Mx = static_cast<double>(cols_), My = static_cast<double>(rows_);
+    double sx = std::clamp(x1 - x0, 2.0, Mx);
+    double sy = std::clamp(y1 - y0, 2.0, My);
+    view_x0_ = std::clamp(x0, 0.0, Mx - sx); view_x1_ = view_x0_ + sx;
+    view_y0_ = std::clamp(y0, 0.0, My - sy); view_y1_ = view_y0_ + sy;
+    update();
+}
+
+void HeatmapWidget::setSelection(int row0, int col0, int row1, int col1) {
+    if (rows_ <= 0 || cols_ <= 0) return;
+    sel_r0_ = std::clamp(std::min(row0, row1), 0, rows_ - 1);
+    sel_r1_ = std::clamp(std::max(row0, row1), 0, rows_ - 1);
+    sel_c0_ = std::clamp(std::min(col0, col1), 0, cols_ - 1);
+    sel_c1_ = std::clamp(std::max(col0, col1), 0, cols_ - 1);
+    sel_valid_ = true;
+    selecting_ = false;
+    refreshSelectionRange();
+    emit regionSelected(sel_r0_, sel_c0_, sel_r1_, sel_c1_);
+    update();
+}
+
+void HeatmapWidget::zoomToSelection(double margin_frac) {
+    if (!sel_valid_) return;
+    const double w = sel_c1_ + 1 - sel_c0_, h = sel_r1_ + 1 - sel_r0_;
+    const double mx = w * margin_frac, my = h * margin_frac;
+    setView(sel_c0_ - mx, sel_r0_ - my, sel_c1_ + 1 + mx, sel_r1_ + 1 + my);
+}
+
+std::vector<HeatmapWidget::Hotspot> HeatmapWidget::findHotspots(int count, int block) const {
+    std::vector<Hotspot> out;
+    if (rows_ <= 0 || cols_ <= 0 || display_matrix_.empty() || count <= 0) return out;
+    block = std::max(1, block);
+    const int br = (rows_ + block - 1) / block, bc = (cols_ + block - 1) / block;
+    const bool square = (rows_ == cols_);
+    std::vector<Hotspot> per_block(static_cast<size_t>(br) * bc, Hotspot{-1, -1, 0.0f});
+
+#pragma omp parallel for schedule(static)
+    for (int pr = 0; pr < br; pr++) {
+        for (int pc = 0; pc < bc; pc++) {
+            if (square && std::abs(pr - pc) <= 1) continue;   // diagonal band: trivially strong
+            const int r0 = pr * block, r1 = std::min(rows_, r0 + block);
+            const int c0 = pc * block, c1 = std::min(cols_, c0 + block);
+            Hotspot best{-1, -1, 0.0f};
+            float best_abs = -1.0f;
+            for (int r = r0; r < r1; r++) {
+                const float* src = display_matrix_.data() + static_cast<size_t>(r) * cols_;
+                for (int c = c0; c < c1; c++) {
+                    const float a = std::abs(src[c]);
+                    if (a > best_abs) { best_abs = a; best = Hotspot{r, c, src[c]}; }
+                }
+            }
+            per_block[static_cast<size_t>(pr) * bc + pc] = best;
+        }
+    }
+    for (const auto& h : per_block) if (h.row >= 0) out.push_back(h);
+    const size_t keep = std::min<size_t>(static_cast<size_t>(count), out.size());
+    std::partial_sort(out.begin(), out.begin() + static_cast<ptrdiff_t>(keep), out.end(),
+                      [](const Hotspot& a, const Hotspot& b) { return std::abs(a.value) > std::abs(b.value); });
+    out.resize(keep);
+    return out;
 }
 
 void HeatmapWidget::resetView() {
@@ -255,20 +417,19 @@ void HeatmapWidget::applyProcessing() {
         for (int i = 0; i < sz; i++)
             display_matrix_[i] = (std::abs(display_matrix_[i]) >= threshold_value_) ? 1.0f : 0.0f;
     }
+    invalidatePooled();
+    refreshSelectionRange();   // the region's own range follows the processed values
 }
 
-void HeatmapWidget::computeClipRange(float percentile,
-                                      float& out_vmin, float& out_vmax) const {
-    if (display_matrix_.empty()) { out_vmin = vmin_; out_vmax = vmax_; return; }
-    std::vector<float> vals = display_matrix_;
+// Symmetric percentile clip of `vals` (consumed — it is partially sorted in
+// place): vmax at `percentile`, vmin at 1-percentile.
+static void percentileRange(std::vector<float>& vals, float percentile,
+                             float& out_vmin, float& out_vmax) {
     const size_t n = vals.size();
-
-    // Upper clip point
     size_t hi = static_cast<size_t>(std::clamp(percentile, 0.0f, 1.0f) * (n - 1));
     std::nth_element(vals.begin(), vals.begin() + hi, vals.end());
     out_vmax = vals[hi];
 
-    // Lower clip point (symmetric: 1 - percentile)
     size_t lo = static_cast<size_t>(std::clamp(1.0f - percentile, 0.0f, 1.0f) * (n - 1));
     std::nth_element(vals.begin(), vals.begin() + lo, vals.end());
     out_vmin = vals[lo];
@@ -276,16 +437,72 @@ void HeatmapWidget::computeClipRange(float percentile,
     if (out_vmax <= out_vmin) out_vmax = out_vmin + 1e-6f;
 }
 
+void HeatmapWidget::computeClipRange(float percentile,
+                                      float& out_vmin, float& out_vmax) const {
+    if (display_matrix_.empty()) { out_vmin = vmin_; out_vmax = vmax_; return; }
+    std::vector<float> vals = display_matrix_;
+    percentileRange(vals, percentile, out_vmin, out_vmax);
+}
+
+bool HeatmapWidget::computeClipRangeInSelection(float percentile,
+                                                 float& out_vmin, float& out_vmax) const {
+    if (!sel_valid_ || display_matrix_.empty()) return false;
+    std::vector<float> vals;
+    vals.reserve(static_cast<size_t>(sel_r1_ - sel_r0_ + 1) * (sel_c1_ - sel_c0_ + 1));
+    for (int r = sel_r0_; r <= sel_r1_; r++)
+        for (int c = sel_c0_; c <= sel_c1_; c++)
+            vals.push_back(display_matrix_[static_cast<size_t>(r) * cols_ + c]);
+    percentileRange(vals, percentile, out_vmin, out_vmax);
+    return true;
+}
+
+void HeatmapWidget::setSelectMode(bool on) {
+    select_mode_ = on;
+    setCursor(on ? Qt::CrossCursor : Qt::ArrowCursor);
+}
+
+void HeatmapWidget::clearSelection() {
+    sel_valid_ = false;
+    selecting_ = false;
+    update();
+}
+
+void HeatmapWidget::setDimOutsideSelection(bool on) {
+    dim_outside_ = on;
+    update();
+}
+
+void HeatmapWidget::setRegionBoost(float strength01) {
+    region_boost_ = std::clamp(strength01, 0.0f, 1.0f);
+    update();
+}
+
+void HeatmapWidget::setSelectionPercentile(float percentile) {
+    sel_percentile_ = std::clamp(percentile, 0.0f, 1.0f);
+    refreshSelectionRange();
+    update();
+}
+
+void HeatmapWidget::refreshSelectionRange() {
+    if (!sel_valid_) return;
+    computeClipRangeInSelection(sel_percentile_, sel_lo_, sel_hi_);
+}
+
 bool HeatmapWidget::exportPng(const QString& path, int max_pixels) const {
     if (rows_ <= 0 || cols_ <= 0 || display_matrix_.empty()) return false;
-    // Scale to max_pixels on the longer side, preserving aspect ratio.
-    int W = cols_, H = rows_;
-    if (W > max_pixels || H > max_pixels) {
-        if (W >= H) { W = max_pixels; H = std::max(1, max_pixels * rows_ / cols_); }
-        else        { H = max_pixels; W = std::max(1, max_pixels * cols_ / rows_); }
-    }
-    QImage img = renderRegion(W, H, 0.0, 0.0,
-                               static_cast<double>(cols_), static_cast<double>(rows_));
+    // Export exactly what is on screen — the current zoomed view, not the
+    // whole matrix — so the PNG matches what the user is looking at
+    // (contrast, brightness, colour range, region boost and all). On a huge
+    // matrix, exporting the full extent would pool it down to max_pixels and
+    // lose whatever region the user had zoomed into. Same aspect ratio as the
+    // visible plot rectangle, capped at max_pixels on the longer side.
+    const double vw = view_x1_ - view_x0_, vh = view_y1_ - view_y0_;
+    if (vw <= 0.0 || vh <= 0.0) return false;
+    const double aspect = vw / vh;
+    int W, H;
+    if (aspect >= 1.0) { W = max_pixels; H = std::max(1, static_cast<int>(max_pixels / aspect)); }
+    else               { H = max_pixels; W = std::max(1, static_cast<int>(max_pixels * aspect)); }
+    QImage img = renderRegion(W, H, view_x0_, view_y0_, view_x1_, view_y1_);
     return img.save(path, "PNG");
 }
 
@@ -310,6 +527,21 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
                                     view_x0_, view_y0_,
                                     view_x1_, view_y1_);
     p.drawImage(pr.topLeft(), viewport);
+
+    // Selection: the live rubber band while dragging, the committed region
+    // outline afterwards (in data coordinates, so it tracks pan/zoom).
+    if (selecting_) {
+        p.setPen(QPen(QColor(255, 255, 255, 220), 1, Qt::DashLine));
+        p.drawRect(QRect(sel_press_, sel_cur_).normalized().intersected(pr));
+    } else if (sel_valid_) {
+        auto sx = [&](double col) { return pr.left() + (col - view_x0_) / (view_x1_ - view_x0_) * pr.width(); };
+        auto sy = [&](double row) { return pr.top()  + (row - view_y0_) / (view_y1_ - view_y0_) * pr.height(); };
+        QRectF r(QPointF(sx(sel_c0_), sy(sel_r0_)), QPointF(sx(sel_c1_ + 1), sy(sel_r1_ + 1)));
+        p.setClipRect(pr);
+        p.setPen(QPen(QColor(255, 255, 255, 230), 2));
+        p.drawRect(r);
+        p.setClipping(false);
+    }
 
     // Border
     p.setPen(QColor(80, 80, 100));
@@ -364,6 +596,14 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
 
 // ---------------------------------------------------------------------------
 void HeatmapWidget::mousePressEvent(QMouseEvent* e) {
+    if (e->button() == Qt::LeftButton &&
+        (select_mode_ || (e->modifiers() & Qt::ShiftModifier)) &&
+        plotRect().contains(e->pos())) {
+        selecting_ = true;
+        sel_press_ = sel_cur_ = e->pos();
+        update();
+        return;
+    }
     if (e->button() == Qt::LeftButton) {
         dragging_    = true;
         drag_origin_ = e->pos();
@@ -376,7 +616,10 @@ void HeatmapWidget::mousePressEvent(QMouseEvent* e) {
 void HeatmapWidget::mouseMoveEvent(QMouseEvent* e) {
     QRect pr = plotRect();
 
-    if (dragging_) {
+    if (selecting_) {
+        sel_cur_ = e->pos();
+        update();
+    } else if (dragging_) {
         double px_per_unit_x = pr.width()  / std::max(1.0, view_x1_ - view_x0_);
         double px_per_unit_y = pr.height() / std::max(1.0, view_y1_ - view_y0_);
 
@@ -403,6 +646,29 @@ void HeatmapWidget::mouseMoveEvent(QMouseEvent* e) {
 }
 
 void HeatmapWidget::mouseReleaseEvent(QMouseEvent* e) {
+    if (e->button() == Qt::LeftButton && selecting_) {
+        selecting_ = false;
+        sel_cur_   = e->pos();   // the release point, not the last move's — they can differ
+        if (rows_ > 0 && cols_ > 0) {
+            QRect pr = plotRect();
+            auto toCell = [&](const QPoint& pt, int& r, int& c) {
+                double fx = view_x0_ + (view_x1_ - view_x0_) * (pt.x() - pr.left()) / std::max(1, pr.width());
+                double fy = view_y0_ + (view_y1_ - view_y0_) * (pt.y() - pr.top())  / std::max(1, pr.height());
+                r = std::clamp(static_cast<int>(std::floor(fy)), 0, rows_ - 1);
+                c = std::clamp(static_cast<int>(std::floor(fx)), 0, cols_ - 1);
+            };
+            int r0, c0, r1, c1;
+            toCell(sel_press_, r0, c0);
+            toCell(sel_cur_,   r1, c1);
+            sel_r0_ = std::min(r0, r1); sel_r1_ = std::max(r0, r1);
+            sel_c0_ = std::min(c0, c1); sel_c1_ = std::max(c0, c1);
+            sel_valid_ = true;
+            refreshSelectionRange();
+            emit regionSelected(sel_r0_, sel_c0_, sel_r1_, sel_c1_);
+        }
+        update();
+        return;
+    }
     if (e->button() == Qt::LeftButton && dragging_) {
         dragging_ = false;
         setCursor(Qt::ArrowCursor);

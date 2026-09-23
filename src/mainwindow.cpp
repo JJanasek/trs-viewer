@@ -3078,6 +3078,264 @@ void MainWindow::onLoadNpyTTest() {
     dlg->show();
 }
 
+// "Auto-clip [98.0] %" — a button plus the percentile it clips to, used by
+// both heatmap viewers (Load heatmap NPY and the cross-correlation result).
+// Clicking sets the colour range to [p-th percentile from the bottom, p-th
+// from the top] of the displayed values (see HeatmapWidget::computeClipRange),
+// so 98 discards the 2 % of outliers at each tail. The percentile used to be
+// fixed at 98; how much to clip depends on how heavy the matrix's tails are,
+// so it is a spinbox now.
+static QWidget* makeAutoClipRow(HeatmapWidget* heatmap,
+                                QDoubleSpinBox* sp_vmin, QDoubleSpinBox* sp_vmax,
+                                QDoubleSpinBox** sp_pct_out = nullptr)
+{
+    auto* row = new QWidget;
+    auto* hl  = new QHBoxLayout(row);
+    hl->setContentsMargins(0, 0, 0, 0);
+    hl->setSpacing(2);
+    auto* btn = new QPushButton("Auto-clip");
+    auto* sp  = new QDoubleSpinBox;
+    sp->setRange(50.0, 99.9);
+    sp->setDecimals(1);
+    sp->setSingleStep(0.5);
+    sp->setValue(98.0);
+    sp->setSuffix(" %");
+    sp->setToolTip("Percentile to clip the colour range to, symmetrically: "
+                   "98 % keeps values between the 2nd and 98th percentile, "
+                   "so a few extreme cells can't wash out the rest.");
+    QObject::connect(btn, &QPushButton::clicked, heatmap, [=]() {
+        float cmin, cmax;
+        heatmap->computeClipRange(static_cast<float>(sp->value() / 100.0), cmin, cmax);
+        sp_vmin->setValue(static_cast<double>(cmin));
+        sp_vmax->setValue(static_cast<double>(cmax));
+        heatmap->setColorRange(cmin, cmax);
+    });
+    hl->addWidget(btn);
+    hl->addWidget(sp);
+    if (sp_pct_out) *sp_pct_out = sp;
+    return row;
+}
+
+// Third row of heatmap controls, shared by both heatmap viewers: render-time
+// Contrast/Brightness (see HeatmapWidget::setContrast) and a "Reset colours"
+// button that puts every display control back to how the viewer opened —
+// colour range, scheme, blur, abs, gamma, threshold and the two tone knobs.
+// Distinct from "Reset View", which only undoes pan/zoom. Must be called
+// after the dialog has applied its own defaults, since that is the state it
+// captures as "original". Every control here already pushes its value into
+// the heatmap from its own change handler, so resetting is just setting the
+// widgets; ordering matters only for abs, whose toggle snaps vmin, which is
+// why the range is restored last.
+static QWidget* makeHeatmapToneRow(HeatmapWidget* heatmap,
+                                   QComboBox* combo_scheme, QDoubleSpinBox* sp_sigma,
+                                   QCheckBox* chk_abs, QDoubleSpinBox* sp_gamma,
+                                   QCheckBox* chk_thresh, QDoubleSpinBox* sp_thresh,
+                                   QDoubleSpinBox* sp_vmin, QDoubleSpinBox* sp_vmax,
+                                   QDoubleSpinBox* sp_clip_pct)
+{
+    auto* row = new QWidget;
+    auto* hl  = new QHBoxLayout(row);
+    hl->setContentsMargins(4, 2, 4, 2);
+
+    auto* sp_contrast = new QDoubleSpinBox;
+    sp_contrast->setRange(0.1, 10.0); sp_contrast->setDecimals(2);
+    sp_contrast->setSingleStep(0.1);  sp_contrast->setValue(1.0);
+    sp_contrast->setToolTip("Stretches the colour mapping about its midpoint. "
+                            "1 = as is; >1 pushes values toward the ends of the "
+                            "scale, <1 flattens them toward the middle.");
+    QObject::connect(sp_contrast, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                     heatmap, [=](double v) { heatmap->setContrast(static_cast<float>(v)); });
+
+    auto* sp_bright = new QDoubleSpinBox;
+    sp_bright->setRange(-1.0, 1.0); sp_bright->setDecimals(2);
+    sp_bright->setSingleStep(0.05); sp_bright->setValue(0.0);
+    sp_bright->setToolTip("Shifts the colour mapping, in units of the full range. "
+                          "0 = as is; +0.2 brightens everything by a fifth of the scale.");
+    QObject::connect(sp_bright, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+                     heatmap, [=](double v) { heatmap->setBrightness(static_cast<float>(v)); });
+
+    const int    init_scheme = combo_scheme->currentIndex();
+    const bool   init_abs    = chk_abs->isChecked();
+    const double init_vmin   = sp_vmin->value();
+    const double init_vmax   = sp_vmax->value();
+
+    auto* btn_reset = new QPushButton("Reset colours");
+    btn_reset->setToolTip("Back to how this view opened: colour range, scheme, blur, "
+                          "abs, gamma, threshold, contrast and brightness. "
+                          "Pan/zoom are left alone — that's \"Reset View\".");
+
+    // Region boost: drag a rectangle (Shift+drag always works; the button
+    // makes plain drag select instead of pan) and, inside it only, cells are
+    // colour-mapped against the region's own value range (at the Auto-clip
+    // percentile) rather than the global one. The rest of the heatmap is
+    // untouched — that's the point: the neighbourhood's strongest
+    // correlations light up at full scale against a background that still
+    // reads normally, so they stand out in the full picture.
+    auto* btn_select = new QPushButton("Select region");
+    btn_select->setCheckable(true);
+    btn_select->setToolTip("Drag a rectangle on the heatmap; inside it, colours are re-scaled "
+                           "to that region's own values (at the Auto-clip percentile) so its "
+                           "strongest correlations stand out. The rest of the heatmap is left "
+                           "as is. Shift+drag does the same without switching modes.");
+    QObject::connect(btn_select, &QPushButton::toggled, heatmap, &HeatmapWidget::setSelectMode);
+
+    auto* sp_boost = new QDoubleSpinBox;
+    sp_boost->setRange(0.0, 100.0); sp_boost->setDecimals(0);
+    sp_boost->setSingleStep(10.0);  sp_boost->setValue(100.0);
+    sp_boost->setSuffix(" %");
+    sp_boost->setToolTip("How far cells inside the region move from the global colour scale "
+                         "to the region's own: 100 % = fully local, 0 % = off.");
+    QObject::connect(sp_boost, QOverload<double>::of(&QDoubleSpinBox::valueChanged), heatmap,
+                     [=](double v) { heatmap->setRegionBoost(static_cast<float>(v / 100.0)); });
+
+    // The region's local range uses the same percentile as Auto-clip, and
+    // follows it live.
+    heatmap->setSelectionPercentile(static_cast<float>(sp_clip_pct->value() / 100.0));
+    QObject::connect(sp_clip_pct, QOverload<double>::of(&QDoubleSpinBox::valueChanged), heatmap,
+                     [=](double v) { heatmap->setSelectionPercentile(static_cast<float>(v / 100.0)); });
+
+    auto* chk_dim = new QCheckBox("Dim outside");
+    chk_dim->setChecked(false);
+    chk_dim->setToolTip("Also darken everything outside the region. Off by default so the "
+                        "full heatmap keeps its normal appearance around the boosted region.");
+    QObject::connect(chk_dim, &QCheckBox::toggled, heatmap, &HeatmapWidget::setDimOutsideSelection);
+
+    auto* btn_clear = new QPushButton("Clear region");
+    QObject::connect(btn_clear, &QPushButton::clicked, heatmap, &HeatmapWidget::clearSelection);
+
+    QObject::connect(btn_reset, &QPushButton::clicked, heatmap, [=]() {
+        heatmap->clearSelection();
+        sp_boost->setValue(100.0);
+        chk_dim->setChecked(false);
+        combo_scheme->setCurrentIndex(init_scheme);
+        sp_sigma->setValue(0.0);
+        sp_gamma->setValue(1.0);
+        chk_thresh->setChecked(false);
+        sp_thresh->setValue(0.5);
+        sp_contrast->setValue(1.0);
+        sp_bright->setValue(0.0);
+        chk_abs->setChecked(init_abs);
+        sp_vmin->setValue(init_vmin);
+        sp_vmax->setValue(init_vmax);
+    });
+
+    hl->addWidget(new QLabel("Contrast:"));
+    hl->addWidget(sp_contrast);
+    hl->addSpacing(8);
+    hl->addWidget(new QLabel("Brightness:"));
+    hl->addWidget(sp_bright);
+    hl->addSpacing(12);
+    hl->addWidget(btn_reset);
+    hl->addSpacing(12);
+    hl->addWidget(btn_select);
+    hl->addWidget(new QLabel("Boost:"));
+    hl->addWidget(sp_boost);
+    hl->addWidget(chk_dim);
+    hl->addWidget(btn_clear);
+    hl->addStretch();
+    return row;
+}
+
+// Fourth row of heatmap controls, for matrices far too large to drive by
+// mouse (a 30k×30k correlation matrix on a ~1000 px view is ~900 cells per
+// pixel): how zoomed-out pixels are formed, jumping to a region by
+// coordinates, and finding the strongest cells automatically.
+static QWidget* makeHeatmapNavRow(HeatmapWidget* heatmap, int32_t rows, int32_t cols,
+                                  QWidget* dlg)
+{
+    auto* row = new QWidget;
+    auto* hl  = new QHBoxLayout(row);
+    hl->setContentsMargins(4, 2, 4, 2);
+
+    auto* cmb_ds = new QComboBox;
+    cmb_ds->addItem("Peak |v|");
+    cmb_ds->addItem("Mean");
+    cmb_ds->addItem("Nearest");
+    cmb_ds->setToolTip("What a pixel shows when it covers many cells (zoomed out).\n"
+                       "Peak |v|: the strongest cell of the block — small hotspots stay "
+                       "visible at any zoom.\nMean: the block average.\nNearest: one "
+                       "arbitrary cell (the old behaviour) — on a huge matrix most cells "
+                       "are never drawn, so a 300×300 hotspot in 30k×30k just disappears.");
+    QObject::connect(cmb_ds, QOverload<int>::of(&QComboBox::currentIndexChanged), heatmap, [=](int i) {
+        heatmap->setDownsample(i == 0 ? HeatmapWidget::Downsample::Peak
+                             : i == 1 ? HeatmapWidget::Downsample::Mean
+                                      : HeatmapWidget::Downsample::Nearest);
+    });
+
+    auto* sp_row  = new QSpinBox; sp_row->setRange(0, std::max(0, rows - 1));
+    auto* sp_col  = new QSpinBox; sp_col->setRange(0, std::max(0, cols - 1));
+    auto* sp_size = new QSpinBox; sp_size->setRange(1, std::max(rows, cols));
+    sp_size->setValue(std::clamp(300, 1, std::max(rows, cols)));
+    for (auto* sp : {sp_row, sp_col, sp_size}) sp->setToolTip(
+        "Centre and side length (cells) of a region to mark and zoom to — the way to "
+        "reach a specific spot when one screen pixel spans dozens of cells.");
+
+    auto* btn_goto = new QPushButton("Mark && zoom");
+    QObject::connect(btn_goto, &QPushButton::clicked, heatmap, [=]() {
+        const int h = sp_size->value() / 2;
+        heatmap->setSelection(sp_row->value() - h, sp_col->value() - h,
+                               sp_row->value() + (sp_size->value() - h) - 1,
+                               sp_col->value() + (sp_size->value() - h) - 1);
+        heatmap->zoomToSelection(0.1);
+    });
+    auto* btn_zoom_sel = new QPushButton("Zoom to region");
+    QObject::connect(btn_zoom_sel, &QPushButton::clicked, heatmap, [=]() { heatmap->zoomToSelection(0.1); });
+
+    // A region drawn by mouse fills the boxes in, so it can be re-centred or
+    // tweaked numerically afterwards.
+    QObject::connect(heatmap, &HeatmapWidget::regionSelected, heatmap, [=](int r0, int c0, int r1, int c1) {
+        sp_row->setValue((r0 + r1) / 2);
+        sp_col->setValue((c0 + c1) / 2);
+        sp_size->setValue(std::max(r1 - r0, c1 - c0) + 1);
+    });
+
+    // Hotspot finder: the strongest cells, one per tile, listed strongest
+    // first; picking one marks a region around it and zooms there.
+    auto* btn_find = new QPushButton("Find hotspots…");
+    btn_find->setToolTip("List the strongest |value| cells, at most one per tile so they "
+                         "spread across the matrix; on a square matrix the main diagonal "
+                         "is skipped. Pick one to mark a region around it and zoom in.");
+    QObject::connect(btn_find, &QPushButton::clicked, heatmap, [=]() {
+        const int block = std::max(1, std::max(rows, cols) / 200);   // <= ~40k tiles
+        const auto spots = heatmap->findHotspots(25, block);
+        if (spots.empty()) {
+            QMessageBox::information(dlg, "Hotspots", "No cells to rank.");
+            return;
+        }
+        auto* d = new QDialog(dlg);
+        d->setAttribute(Qt::WA_DeleteOnClose);
+        d->setWindowTitle(QString("Hotspots — top %1, one per %2×%2 tile").arg(spots.size()).arg(block));
+        auto* vl   = new QVBoxLayout(d);
+        auto* list = new QListWidget;
+        for (const auto& h : spots)
+            list->addItem(QString("(%1, %2)    %3").arg(h.row).arg(h.col).arg(h.value, 0, 'g', 4));
+        vl->addWidget(new QLabel("Pick one to mark a region around it and zoom there:"));
+        vl->addWidget(list, 1);
+        const int half = std::max(sp_size->value(), block) / 2;
+        QObject::connect(list, &QListWidget::currentRowChanged, heatmap, [=](int i) {
+            if (i < 0 || i >= static_cast<int>(spots.size())) return;
+            const auto& h = spots[static_cast<size_t>(i)];
+            heatmap->setSelection(h.row - half, h.col - half, h.row + half, h.col + half);
+            heatmap->zoomToSelection(0.1);
+        });
+        d->resize(360, 420);
+        d->show();
+    });
+
+    hl->addWidget(new QLabel("Zoomed-out:"));
+    hl->addWidget(cmb_ds);
+    hl->addSpacing(12);
+    hl->addWidget(new QLabel("Row:"));  hl->addWidget(sp_row);
+    hl->addWidget(new QLabel("Col:"));  hl->addWidget(sp_col);
+    hl->addWidget(new QLabel("Size:")); hl->addWidget(sp_size);
+    hl->addWidget(btn_goto);
+    hl->addWidget(btn_zoom_sel);
+    hl->addSpacing(12);
+    hl->addWidget(btn_find);
+    hl->addStretch();
+    return row;
+}
+
 void MainWindow::onLoadNpyHeatmap() {
     QString path = QFileDialog::getOpenFileName(
         this, "Load heatmap NPY", recentDir("npy"), "NumPy files (*.npy);;All files (*)");
@@ -3196,14 +3454,8 @@ void MainWindow::onLoadNpyHeatmap() {
     auto* btn_reset_view = new QPushButton("Reset View");
     connect(btn_reset_view, &QPushButton::clicked, heatmap, &HeatmapWidget::resetView);
 
-    auto* btn_autoclip = new QPushButton("Auto-clip 98%");
-    connect(btn_autoclip, &QPushButton::clicked, dlg, [=]() {
-        float cmin, cmax;
-        heatmap->computeClipRange(0.98f, cmin, cmax);
-        sp_vmin->setValue(static_cast<double>(cmin));
-        sp_vmax->setValue(static_cast<double>(cmax));
-        heatmap->setColorRange(cmin, cmax);
-    });
+    QDoubleSpinBox* sp_clip_pct = nullptr;
+    auto* btn_autoclip = makeAutoClipRow(heatmap, sp_vmin, sp_vmax, &sp_clip_pct);
 
     // Keep a shared_ptr so the export lambda can safely capture the data
     auto data_ptr = std::make_shared<std::vector<float>>(std::move(data));
@@ -3274,10 +3526,15 @@ void MainWindow::onLoadNpyHeatmap() {
     row2_l->addWidget(sp_thresh);
     row2_l->addStretch();
 
+    auto* tone_row = makeHeatmapToneRow(heatmap, combo_scheme, sp_sigma, chk_abs, sp_gamma,
+                                        chk_thresh, sp_thresh, sp_vmin, sp_vmax, sp_clip_pct);
+
     auto* vl = new QVBoxLayout(dlg);
     vl->setContentsMargins(4, 4, 4, 4); vl->setSpacing(4);
     vl->addWidget(row1);
     vl->addWidget(row2);
+    vl->addWidget(tone_row);
+    vl->addWidget(makeHeatmapNavRow(heatmap, M, M, dlg));
     vl->addWidget(heatmap, 1);
     dlg->show();
 }
@@ -5815,14 +6072,8 @@ void MainWindow::onRunXCorr() {
             heatmap->setBinaryThreshold(true, static_cast<float>(v));
     });
 
-    auto* btn_autoclip2 = new QPushButton("Auto-clip 98%");
-    connect(btn_autoclip2, &QPushButton::clicked, dlg, [=]() {
-        float cmin, cmax;
-        heatmap->computeClipRange(0.98f, cmin, cmax);
-        sp_vmin->setValue(static_cast<double>(cmin));
-        sp_vmax->setValue(static_cast<double>(cmax));
-        heatmap->setColorRange(cmin, cmax);
-    });
+    QDoubleSpinBox* sp_clip_pct2 = nullptr;
+    auto* btn_autoclip2 = makeAutoClipRow(heatmap, sp_vmin, sp_vmax, &sp_clip_pct2);
 
     connect(btn_exp_png, &QPushButton::clicked, dlg, [=]() {
         QString path = QFileDialog::getSaveFileName(dlg, "Export heatmap as PNG",
@@ -6104,6 +6355,9 @@ void MainWindow::onRunXCorr() {
     if (peak_row) vl->addWidget(peak_row);
     vl->addWidget(ctrl);
     vl->addWidget(proc_row);
+    vl->addWidget(makeHeatmapToneRow(heatmap, combo_scheme2, sp_sigma2, chk_abs2, sp_gamma2,
+                                     chk_thresh2, sp_thresh2, sp_vmin, sp_vmax, sp_clip_pct2));
+    vl->addWidget(makeHeatmapNavRow(heatmap, result_ptr->rows, result_ptr->cols, dlg));
     vl->addWidget(heatmap, 1);
 
     dlg->show();
