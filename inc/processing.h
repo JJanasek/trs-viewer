@@ -37,12 +37,43 @@ public:
     // Strided-sampling cannot be used with such transforms.
     virtual bool requiresSequential() const { return false; }
 
+    // Returns true if apply() is only meaningful when handed a whole trace in
+    // one call, because it makes two passes over the samples or transforms
+    // them as a block: a reverse pass (zero-phase filtering), an FFT of the
+    // entire trace (spectral line excision), a statistic estimated over the
+    // full record (periodic-interference subtraction).
+    //
+    // requiresSequential() is not enough to express this. A causal IIR filter
+    // is sequential but perfectly happy to be fed 256K samples at a time,
+    // carrying its two delay registers across the boundary. These transforms
+    // are not: split the trace and each piece gets its own reverse pass, its
+    // own spectrum, its own interference estimate, and the seams show.
+    //
+    // Callers that chunk (the TRS export writer is the only one today — the
+    // plot and every analysis already apply the pipeline to a whole window in
+    // a single call) must feed the whole trace at once when any stage says
+    // true. See pipelineRequiresWholeTrace() below.
+    virtual bool requiresWholeTrace() const { return false; }
+
     // Number of leading output samples that are part of a startup transient
     // and should be skipped when resetting the view to "valid" data.
     virtual int64_t startupSamples() const { return 0; }
 
     virtual std::shared_ptr<ITransform> clone() const = 0;
 };
+
+// ---------------------------------------------------------------------------
+// True when any stage must see a whole trace per apply() call — see
+// ITransform::requiresWholeTrace(). Chunking callers check this once per run
+// and size their chunk to the full trace when it holds.
+// ---------------------------------------------------------------------------
+inline bool pipelineRequiresWholeTrace(
+    const std::vector<std::shared_ptr<ITransform>>& pipeline)
+{
+    for (const auto& t : pipeline)
+        if (t && t->requiresWholeTrace()) return true;
+    return false;
+}
 
 // ---------------------------------------------------------------------------
 // Pipeline-domain <-> raw-domain sample count conversion.
@@ -366,6 +397,26 @@ public:
     float      cutoff() const { return cutoff_; }
     float      q()      const { return q_; }
 
+    // Zero-phase (forward-backward, "filtfilt") mode.
+    //
+    // The causal default has a frequency-dependent group delay: it does not
+    // just attenuate the stop band, it *delays different frequencies by
+    // different amounts*, and a high-Q notch's delay spikes sharply right at
+    // the notch. Every analysis in this app is indexed by sample — t-test,
+    // CPA, SNR, alignment — so smearing leakage along the time axis is the
+    // one thing preprocessing must not do, and it is easy to mistake the
+    // result for a genuine change in where a device leaks.
+    //
+    // Running the same filter forwards and then backwards makes the combined
+    // response the squared magnitude of the one-way response with *exactly
+    // zero* phase: no delay, no smearing. The costs are that the stop band is
+    // twice as deep in dB (a 20 dB notch becomes 40 dB, so design for half),
+    // the filter is no longer causal, and the whole trace must be available
+    // in one call — see requiresWholeTrace().
+    void setZeroPhase(bool on) { zero_phase_ = on; }
+    bool zeroPhase() const     { return zero_phase_; }
+    bool requiresWholeTrace() const override { return zero_phase_; }
+
     std::shared_ptr<ITransform> clone() const override {
         return std::make_shared<BiquadFilterTransform>(*this);
     }
@@ -377,8 +428,12 @@ private:
     float  cutoff_;   // fraction of Nyquist, (0, 1)
     float  q_;
 
+    bool   zero_phase_ = false;
+
     // Normalised coefficients (b0,b1,b2,a1,a2; a0 folded to 1) and the two
-    // Direct-Form-II-Transposed delay registers.
+    // Direct-Form-II-Transposed delay registers. The delay registers are only
+    // used by the causal path — the zero-phase path is stateless by
+    // construction, since it always sees a whole trace.
     double b0_ = 1.0, b1_ = 0.0, b2_ = 0.0, a1_ = 0.0, a2_ = 0.0;
     double z1_ = 0.0, z2_ = 0.0;
 };
@@ -441,4 +496,360 @@ private:
     int                window_cache_size_ = -1;
     Window             window_cache_type_ = Window::Rectangular;
     Eigen::FFT<float>  fft_;
+};
+
+// ---------------------------------------------------------------------------
+// Narrowband interference removal
+// ---------------------------------------------------------------------------
+//
+// One band to take out of the spectrum, in *normalised* frequency: a fraction
+// of Nyquist, the same unit BiquadFilterTransform's cutoff uses and for the
+// same reason — TRS files can't be relied on to carry a sample rate, so the
+// transforms themselves only ever see ratios and stay portable across trace
+// sets. UI code converts Hz to this unit with hzToNormalized() once it knows
+// a rate; see spectral.h.
+// ---------------------------------------------------------------------------
+struct SpectralBand {
+    double center    = 0.0;   // (0, 1], fraction of Nyquist
+    double halfwidth = 0.0;   // fraction of Nyquist; the band is center ± this
+
+    double lo() const { return center - halfwidth; }
+    double hi() const { return center + halfwidth; }
+};
+
+// Compact round-trip encoding for chain.json, which stores a step's fields as
+// flat scalars and has no list type: "center:halfwidth,center:halfwidth,…".
+std::string encodeSpectralBands(const std::vector<SpectralBand>& bands);
+bool        decodeSpectralBands(const std::string& s, std::vector<SpectralBand>& out);
+
+// Expands a fundamental into the comb f0, 2·f0, … up to Nyquist. `odd_only`
+// keeps just the odd multiples, which is what a square-wave-ish clock or
+// switching converter actually puts most of its energy into — notching the
+// even ones then costs passband for nothing. Bands at or past Nyquist are
+// dropped rather than aliased.
+std::vector<SpectralBand> harmonicComb(double f0_norm, double halfwidth_norm,
+                                        int n_harmonics, bool odd_only);
+
+// ---------------------------------------------------------------------------
+// SpectralExciseTransform — removes narrowband lines by editing the spectrum
+// directly, rather than by filtering.
+//
+// FFT the whole trace, replace the magnitude inside each flagged band with a
+// linear interpolation between the floor either side of it, inverse FFT. This
+// is the standard "flag and interpolate" excision used on radio interference,
+// and for offline trace analysis it beats a notch filter on every axis that
+// matters here:
+//
+//   * Exactly zero phase distortion. A notch has violently steep phase right
+//     where you are operating, and a *causal* notch (which is what cascading
+//     BiquadFilterTransform would give you) also delays the trace by a
+//     frequency-dependent amount. Since every downstream analysis in this app
+//     is per-sample — t-test, CPA, SNR, alignment — smearing leakage along
+//     the time axis is the one thing preprocessing must not do.
+//   * Arbitrarily narrow. A single-bin notch costs one bin of bandwidth; an
+//     IIR notch that narrow rings for thousands of samples.
+//   * Any number of lines in one pass, at no extra cost.
+//
+// The price is that it needs the whole trace in one call (requiresWholeTrace)
+// and O(N log N) work per trace.
+//
+// Interpolating the magnitude — rather than zeroing the bins — is deliberate:
+// zeroing punches a hole in the noise floor, which is itself a spectral
+// feature and rings in the time domain. Filling the band with the surrounding
+// floor level leaves the spectrum looking like the line was never there.
+// ---------------------------------------------------------------------------
+class SpectralExciseTransform : public ITransform {
+public:
+    // What to do with the phase of the excised bins. Preserve keeps each
+    // bin's original phase and only rewrites its magnitude — the least
+    // surprising choice, and the one that leaves the rest of the trace
+    // bit-identical in the absence of lines. Randomize decorrelates the
+    // replacement from the interferer, which matters when the line is strong
+    // enough that even a floor-level residue at the original phase would
+    // still correlate across traces.
+    enum class PhaseMode { Preserve, Randomize };
+
+    explicit SpectralExciseTransform(std::vector<SpectralBand> bands = {},
+                                      PhaseMode phase = PhaseMode::Preserve)
+        : bands_(std::move(bands))
+        , phase_(phase)
+        , rng_(12345u)   // fixed seed: excision must be reproducible run to run
+    {}
+
+    std::string name() const override;
+    int64_t apply(float* buf, int64_t count, int64_t sample_offset) override;
+    void    reset() override {}
+    bool    requiresSequential()  const override { return true; }
+    bool    requiresWholeTrace() const override { return true; }
+
+    void setBands(std::vector<SpectralBand> b) { bands_ = std::move(b); }
+    const std::vector<SpectralBand>& bands() const { return bands_; }
+    void      setPhaseMode(PhaseMode m) { phase_ = m; }
+    PhaseMode phaseMode() const         { return phase_; }
+
+    std::shared_ptr<ITransform> clone() const override {
+        return std::make_shared<SpectralExciseTransform>(*this);
+    }
+
+private:
+    std::vector<SpectralBand> bands_;
+    PhaseMode                 phase_;
+
+    mutable std::mt19937 rng_;
+    // Scratch reused across traces — apply() runs once per trace over a whole
+    // trace set, so reallocating a trace-sized complex spectrum every call is
+    // the dominant cost if you let it be.
+    std::vector<float>               in_scratch_;
+    std::vector<std::complex<float>> freq_scratch_;
+    Eigen::FFT<float>                fft_;
+    int64_t                          fft_size_ = -1;
+};
+
+// ---------------------------------------------------------------------------
+// Biquad cascade machinery, shared by BiquadFilterTransform's zero-phase path
+// and HarmonicNotchTransform.
+// ---------------------------------------------------------------------------
+
+// One second-order section, normalised so a0 == 1.
+struct BiquadCoeffs {
+    double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0;
+};
+
+// RBJ "Audio EQ Cookbook" design; `cutoff` is a fraction of Nyquist, matching
+// BiquadFilterTransform::cutoff().
+BiquadCoeffs designBiquad(BiquadFilterTransform::FilterType type,
+                           double cutoff, double q);
+
+// Runs `sections` in cascade over buf[0..count), forwards then backwards, so
+// the net phase response is exactly zero. Stateless: every call sees a whole
+// trace, which is what makes the reverse pass meaningful at all.
+//
+// Edges are handled by odd reflection about each endpoint — the extension used
+// by scipy's filtfilt(padtype='odd') — and each pass starts from the steady
+// state its first sample implies rather than from zero. Without both, a trace
+// whose value at the edges is far from zero rings for hundreds of samples
+// inward, which on a power trace is exactly where the interesting part of the
+// window often sits.
+void applyBiquadCascadeZeroPhase(const std::vector<BiquadCoeffs>& sections,
+                                  float* buf, int64_t count);
+
+// ---------------------------------------------------------------------------
+// HarmonicNotchTransform — a comb of notches at f0, 2·f0, 3·f0, …
+//
+// The streaming-friendly counterpart to SpectralExciseTransform: no
+// trace-sized FFT, so it copes with traces too long to transform whole (in
+// causal mode), and it gives a smooth analogue-style rolloff rather than a
+// hard edit of individual bins. Prefer excision when you have the whole trace
+// and know where the lines are; prefer this when you know f0 and want a comb.
+//
+// Two deliberate design points:
+//
+//   * Zero-phase by default. A notch has the steepest phase slope of any
+//     second-order section, right where you are operating. See
+//     BiquadFilterTransform::setZeroPhase for why that matters here.
+//
+//   * An odd-harmonics-only mode. A square-ish clock or a switching converter
+//     puts most of its energy into odd multiples of f0, so notching the even
+//     ones spends passband — and passband is where the leakage lives — for
+//     very little return.
+//
+// And one warning that belongs in the code as much as the UI: leakage is *not*
+// confined to clock harmonics (Tian et al., JCEN 2015), and screaming-channel
+// work finds exploitable leakage at non-harmonic frequencies routinely beating
+// the harmonics (Wouters et al., CARDIS 2023). A comb is a blunt instrument;
+// measure SNR or NICV before and after rather than assuming it helped.
+// ---------------------------------------------------------------------------
+class HarmonicNotchTransform : public ITransform {
+public:
+    HarmonicNotchTransform(float f0 = 0.1f, int n_harmonics = 5, float q = 20.0f,
+                            bool odd_only = false, bool zero_phase = true)
+        : f0_(std::clamp(f0, 1e-4f, 0.999f))
+        , n_harmonics_(std::max(1, n_harmonics))
+        , q_(std::max(0.5f, q))
+        , odd_only_(odd_only)
+        , zero_phase_(zero_phase)
+    {
+        rebuild();
+    }
+
+    std::string name() const override;
+    int64_t apply(float* buf, int64_t count, int64_t sample_offset) override;
+    void    reset() override;
+    bool    requiresSequential()  const override { return true; }
+    bool    requiresWholeTrace() const override { return zero_phase_; }
+
+    void  setF0(float f)           { f0_ = std::clamp(f, 1e-4f, 0.999f); rebuild(); }
+    void  setHarmonics(int n)      { n_harmonics_ = std::max(1, n);      rebuild(); }
+    void  setQ(float q)            { q_ = std::max(0.5f, q);             rebuild(); }
+    void  setOddOnly(bool on)      { odd_only_ = on;                     rebuild(); }
+    void  setZeroPhase(bool on)    { zero_phase_ = on;                   rebuild(); }
+    float f0()         const { return f0_; }
+    int   harmonics()  const { return n_harmonics_; }
+    float q()          const { return q_; }
+    bool  oddOnly()    const { return odd_only_; }
+    bool  zeroPhase()  const { return zero_phase_; }
+
+    // Which harmonics actually got a notch: multiples at or past Nyquist are
+    // dropped, so this can be shorter than harmonics().
+    int   activeNotches() const { return static_cast<int>(sections_.size()); }
+
+    std::shared_ptr<ITransform> clone() const override {
+        return std::make_shared<HarmonicNotchTransform>(*this);
+    }
+
+private:
+    void rebuild();
+
+    float f0_;
+    int   n_harmonics_;
+    float q_;
+    bool  odd_only_;
+    bool  zero_phase_;
+
+    std::vector<BiquadCoeffs> sections_;
+    // Causal-mode delay registers, two per section, carried across chunks.
+    std::vector<double>       z1_, z2_;
+};
+
+// ---------------------------------------------------------------------------
+// PeriodicSubtractTransform — synchronous averaging of a periodic interferer,
+// then subtraction.
+//
+// The right tool when the interference is periodic and steady but *not*
+// sinusoidal: a DC-DC converter's switching waveform, a reference clock, an
+// RFID reader's field. Such a source puts energy into a fundamental and a long
+// tail of harmonics, so removing it with notches costs one notch — and one
+// hole in the passband — per harmonic.
+//
+// Instead: fold the trace at the interferer's period, average to get its
+// waveform, subtract that. The fundamental, every harmonic, and whatever was
+// never sinusoidal all go at once, and the spectrum keeps every bin.
+//
+// Why this does not also remove the signal: the cryptographic operation is
+// triggered, so it sits at the same place in every trace and repeats at the
+// *trace* rate. The interferer is free-running and repeats at its own rate.
+// Folding at the interferer's period therefore averages the signal down toward
+// its mean while the interferer adds coherently. The assumption fails if the
+// two rates are commensurate — if the device clocks the converter, say — and
+// then this will eat signal, which is why the period is reported back and the
+// result should be checked with SNR or a t-test either way.
+//
+// The period is deliberately a double. A switcher's period almost never lands
+// on a whole number of samples, and rounding it smears the folded template
+// into uselessness within a few dozen periods; the template is accumulated and
+// subtracted with linear interpolation in phase instead.
+// ---------------------------------------------------------------------------
+class PeriodicSubtractTransform : public ITransform {
+public:
+    // period <= 0 means "estimate from each trace" over
+    // [auto_min_period, auto_max_period]; see estimatePeriod().
+    explicit PeriodicSubtractTransform(double period = 0.0,
+                                        int64_t auto_min_period = 8,
+                                        int64_t auto_max_period = 100000,
+                                        double auto_min_correlation = 0.3)
+        : period_(period)
+        , auto_min_(std::max<int64_t>(2, auto_min_period))
+        , auto_max_(std::max<int64_t>(3, auto_max_period))
+        , auto_min_corr_(auto_min_correlation)
+    {}
+
+    std::string name() const override;
+    int64_t apply(float* buf, int64_t count, int64_t sample_offset) override;
+    void    reset() override {}
+    bool    requiresSequential()  const override { return true; }
+    bool    requiresWholeTrace() const override { return true; }
+
+    void   setPeriod(double p)          { period_ = p; }
+    double period() const               { return period_; }
+    void   setAutoRange(int64_t lo, int64_t hi) {
+        auto_min_ = std::max<int64_t>(2, lo);
+        auto_max_ = std::max<int64_t>(auto_min_ + 1, hi);
+    }
+    int64_t autoMin() const { return auto_min_; }
+    int64_t autoMax() const { return auto_max_; }
+    void    setAutoMinCorrelation(double c) { auto_min_corr_ = c; }
+    double  autoMinCorrelation() const      { return auto_min_corr_; }
+
+    // The period actually used on the last apply() — equal to period() when
+    // that was set, or whatever the estimator found. 0 means the last trace
+    // was left untouched because no convincing period was found.
+    double lastPeriodUsed() const { return last_period_; }
+
+    std::shared_ptr<ITransform> clone() const override {
+        return std::make_shared<PeriodicSubtractTransform>(*this);
+    }
+
+private:
+    double  period_;
+    int64_t auto_min_;
+    int64_t auto_max_;
+    double  auto_min_corr_;
+    double  last_period_ = 0.0;
+
+    std::vector<double> accum_;   // folded sum per template bin
+    std::vector<double> weight_;  // interpolation weight per template bin
+};
+
+// ---------------------------------------------------------------------------
+// ComplexDemodulateTransform — shift a band down to baseband and take its
+// envelope.
+//
+// This is the transform for the case where the carrier is not interference but
+// the *transport*. On a mixed-signal chip, digital switching noise couples into
+// the RF front end and is amplified, modulated onto the carrier and broadcast —
+// the "screaming channel" effect, exploitable at metres rather than
+// centimetres. Notching the carrier there would delete the signal; what you
+// want is to demodulate it. The same machinery reads clock-harmonic sidebands,
+// where activity appears at f_clk ± n/T rather than at f_clk itself.
+//
+// Implementation is a band-select and frequency shift done directly on the
+// spectrum: take the bins within `bandwidth` of `center`, move them to DC,
+// inverse-transform, and report the magnitude of the resulting complex
+// baseband signal. That is exact — no filter transition band, no phase
+// distortion — at the cost of needing the whole trace.
+//
+// Setting `center` to a small value with a wide `bandwidth` degenerates to the
+// Hilbert envelope of the low-frequency content, which is the usual way to
+// demodulate an amplitude-modulated EM capture.
+// ---------------------------------------------------------------------------
+class ComplexDemodulateTransform : public ITransform {
+public:
+    // Envelope is the magnitude of the complex baseband signal — the usual
+    // choice, and what an AM demodulator produces. Baseband is its real part,
+    // i.e. the selected band shifted down but still oscillating, which is
+    // occasionally what you want to feed a correlation.
+    enum class Output { Envelope, Baseband };
+
+    explicit ComplexDemodulateTransform(float center = 0.5f, float bandwidth = 0.05f,
+                                         Output out = Output::Envelope)
+        : center_(std::clamp(center, 0.0f, 1.0f))
+        , bandwidth_(std::clamp(bandwidth, 1e-5f, 1.0f))
+        , output_(out)
+    {}
+
+    std::string name() const override;
+    int64_t apply(float* buf, int64_t count, int64_t sample_offset) override;
+    void    reset() override {}
+    bool    requiresSequential()  const override { return true; }
+    bool    requiresWholeTrace() const override { return true; }
+
+    void   setCenter(float c)    { center_ = std::clamp(c, 0.0f, 1.0f); }
+    void   setBandwidth(float b) { bandwidth_ = std::clamp(b, 1e-5f, 1.0f); }
+    void   setOutput(Output o)   { output_ = o; }
+    float  center()    const { return center_; }
+    float  bandwidth() const { return bandwidth_; }
+    Output output()    const { return output_; }
+
+    std::shared_ptr<ITransform> clone() const override {
+        return std::make_shared<ComplexDemodulateTransform>(*this);
+    }
+
+private:
+    float  center_;      // fraction of Nyquist
+    float  bandwidth_;   // half-width, fraction of Nyquist
+    Output output_;
+
+    std::vector<std::complex<float>> in_scratch_, freq_scratch_, band_scratch_;
+    Eigen::FFT<float>                fft_;
+    int64_t                          fft_size_ = -1;
 };

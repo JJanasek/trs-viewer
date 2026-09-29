@@ -38,6 +38,8 @@ add_library(trs-core-test OBJECT
     ${CMAKE_SOURCE_DIR}/src/cpa.cpp
     ${CMAKE_SOURCE_DIR}/src/xcorr.cpp
     ${CMAKE_SOURCE_DIR}/src/align.cpp
+    ${CMAKE_SOURCE_DIR}/src/spectral.cpp
+    ${CMAKE_SOURCE_DIR}/src/chain.cpp
 )
 
 target_include_directories(trs-core-test PUBLIC
@@ -45,10 +47,14 @@ target_include_directories(trs-core-test PUBLIC
     ${CMAKE_SOURCE_DIR}/src
 )
 
+# chain.cpp needs Qt Core (QString, QJson*) — but only Core, not the widget
+# stack, which is exactly why chain.cpp keeps its step data model separate from
+# MainWindow's dialogs and so can be tested headlessly.
 target_link_libraries(trs-core-test PUBLIC
     OpenMP::OpenMP_CXX
     Eigen3::Eigen
     ZLIB::ZLIB
+    ${QT_LIBS_CORE}
 )
 
 target_compile_options(trs-core-test PRIVATE
@@ -82,3 +88,22 @@ add_trs_test(test_trs_file)
 add_trs_test(test_cpa)
 add_trs_test(test_align)
 add_trs_test(test_xcorr)
+add_trs_test(test_spectral)
+add_trs_test(test_chain)
+
+# HeatmapWidget is a QWidget, so unlike the rest of the suite this target needs
+# the Qt widget stack and a QApplication (created offscreen in the test's own
+# main). Kept separate so the headless core tests stay free of it.
+# The header must be listed too, or AUTOMOC never sees the Q_OBJECT and the
+# signals link as undefined.
+add_executable(test_heatmap test_heatmap.cpp
+    ${CMAKE_SOURCE_DIR}/src/heatmap_widget.cpp
+    ${CMAKE_SOURCE_DIR}/inc/heatmap_widget.h)
+set_target_properties(test_heatmap PROPERTIES AUTOMOC ON)
+target_link_libraries(test_heatmap PRIVATE GTest::gtest ${QT_LIBS})
+target_include_directories(test_heatmap PRIVATE ${CMAKE_SOURCE_DIR}/inc)
+if(ENABLE_SANITIZERS)
+    target_compile_options(test_heatmap PRIVATE -fsanitize=address,leak -fno-omit-frame-pointer -g)
+    target_link_options(   test_heatmap PRIVATE -fsanitize=address,leak)
+endif()
+gtest_discover_tests(test_heatmap)

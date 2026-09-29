@@ -134,7 +134,8 @@ QRgb HeatmapWidget::colormapT(float t) const {
 // ---------------------------------------------------------------------------
 QImage HeatmapWidget::renderRegion(int W, int H,
                                     double x0, double y0,
-                                    double x1, double y1) const
+                                    double x1, double y1,
+                                    int pool_ref_w, int pool_ref_h) const
 {
     QImage img(W, H, QImage::Format_RGB32);
     if (rows_ <= 0 || cols_ <= 0 || display_matrix_.empty() || W <= 0 || H <= 0)
@@ -152,7 +153,12 @@ QImage HeatmapWidget::renderRegion(int W, int H,
     // power of two >= cells-per-pixel, so each pooled cell is at least a pixel
     // wide and none can fall between samples — that is what keeps a small
     // hotspot on screen at any zoom (see Downsample).
-    const double cpp = std::max(dx, dy);
+    // Derived from pool_ref_w/h when given (see the header): the pooling level
+    // must follow what the viewer sees, not how many pixels we happen to be
+    // writing, or the export re-pools the data and stops matching the screen.
+    const double ref_w = (pool_ref_w > 0) ? static_cast<double>(pool_ref_w) : W;
+    const double ref_h = (pool_ref_h > 0) ? static_cast<double>(pool_ref_h) : H;
+    const double cpp = std::max((x1 - x0) / ref_w, (y1 - y0) / ref_h);
     int f = 1;
     if (downsample_ != Downsample::Nearest && cpp > 1.0)
         while (f < cpp) f *= 2;
@@ -488,6 +494,138 @@ void HeatmapWidget::refreshSelectionRange() {
     computeClipRangeInSelection(sel_percentile_, sel_lo_, sel_hi_);
 }
 
+// ---------------------------------------------------------------------------
+// Annotations
+// ---------------------------------------------------------------------------
+void HeatmapWidget::addAnnotation(const Annotation& a) {
+    Annotation n = a;
+    // Normalise and clamp on the way in, so every consumer (draw, hit-test,
+    // export) can assume row0<=row1, col0<=col1 and everything in range.
+    if (n.row0 > n.row1) std::swap(n.row0, n.row1);
+    if (n.col0 > n.col1) std::swap(n.col0, n.col1);
+    n.row0 = std::clamp(n.row0, 0, std::max(0, rows_ - 1));
+    n.row1 = std::clamp(n.row1, 0, std::max(0, rows_ - 1));
+    n.col0 = std::clamp(n.col0, 0, std::max(0, cols_ - 1));
+    n.col1 = std::clamp(n.col1, 0, std::max(0, cols_ - 1));
+    annotations_.push_back(n);
+    emit annotationsChanged();
+    update();
+}
+
+void HeatmapWidget::addAnnotation(int row0, int col0, int row1, int col1,
+                                   const QString& label, const QColor& color) {
+    Annotation a;
+    a.row0 = row0; a.col0 = col0; a.row1 = row1; a.col1 = col1;
+    a.label = label; a.color = color;
+    addAnnotation(a);
+}
+
+bool HeatmapWidget::removeAnnotationAt(int row, int col) {
+    // Back to front: the most recently added box wins when several overlap,
+    // which matches what the user sees on top.
+    for (int i = static_cast<int>(annotations_.size()) - 1; i >= 0; --i) {
+        const Annotation& a = annotations_[static_cast<size_t>(i)];
+        if (row >= a.row0 && row <= a.row1 && col >= a.col0 && col <= a.col1) {
+            annotations_.erase(annotations_.begin() + i);
+            emit annotationsChanged();
+            update();
+            return true;
+        }
+    }
+    return false;
+}
+
+void HeatmapWidget::clearAnnotations() {
+    if (annotations_.empty()) return;
+    annotations_.clear();
+    emit annotationsChanged();
+    update();
+}
+
+void HeatmapWidget::setAnnotateMode(bool on) {
+    annotate_mode_ = on;
+    // Both modes claim the plain left-drag, so they cannot both be active.
+    if (on) select_mode_ = false;
+    setCursor(on ? Qt::CrossCursor : Qt::ArrowCursor);
+    update();
+}
+
+bool HeatmapWidget::annotateCurrentSelection(const QString& label) {
+    if (!sel_valid_) return false;
+    QString text = label;
+    if (text.isEmpty() && !matrix_.empty()) {
+        float peak = 0.0f; bool any = false;
+        for (int r = sel_r0_; r <= sel_r1_; ++r)
+            for (int c = sel_c0_; c <= sel_c1_; ++c) {
+                const float v = matrix_[static_cast<size_t>(r) *
+                                         static_cast<size_t>(cols_) +
+                                         static_cast<size_t>(c)];
+                if (!any || std::abs(v) > std::abs(peak)) { peak = v; any = true; }
+            }
+        if (any) text = QString::number(peak, 'g', 3);
+    }
+    addAnnotation(sel_r0_, sel_c0_, sel_r1_, sel_c1_, text);
+    return true;
+}
+
+void HeatmapWidget::drawAnnotations(QPainter& p, const QRectF& target,
+                                     double x0, double y0, double x1, double y1,
+                                     double scale) const
+{
+    if (annotations_.empty()) return;
+    const double sx_span = x1 - x0, sy_span = y1 - y0;
+    if (sx_span <= 0.0 || sy_span <= 0.0) return;
+
+    auto sx = [&](double col) { return target.left() + (col - x0) / sx_span * target.width(); };
+    auto sy = [&](double row) { return target.top()  + (row - y0) / sy_span * target.height(); };
+
+    p.save();
+    p.setClipRect(target);
+    QFont f = p.font();
+    f.setPointSizeF(std::max(7.0, 9.0 * scale));
+    f.setBold(true);
+    p.setFont(f);
+    const QFontMetricsF fm(f);
+
+    for (const Annotation& a : annotations_) {
+        // +1 on the far edge because bounds are inclusive cell indices and a
+        // cell occupies [i, i+1) in data coordinates.
+        QRectF r(QPointF(sx(a.col0), sy(a.row0)),
+                 QPointF(sx(a.col1 + 1), sy(a.row1 + 1)));
+        if (!r.intersects(target)) continue;
+
+        // A box zoomed out to sub-pixel size would vanish, which defeats the
+        // purpose of marking it — keep it visible at a minimum size.
+        const double min_side = 6.0 * scale;
+        if (r.width()  < min_side) r.adjust(-(min_side - r.width())  / 2, 0,
+                                             (min_side - r.width())  / 2, 0);
+        if (r.height() < min_side) r.adjust(0, -(min_side - r.height()) / 2,
+                                            0,  (min_side - r.height()) / 2);
+
+        // Dark outline under the coloured pen so the box stays legible over
+        // both ends of every colour scheme.
+        p.setBrush(Qt::NoBrush);
+        p.setPen(QPen(QColor(0, 0, 0, 160), std::max(1.0, 3.5 * scale)));
+        p.drawRect(r);
+        p.setPen(QPen(a.color, std::max(1.0, 1.8 * scale)));
+        p.drawRect(r);
+
+        if (a.label.isEmpty()) continue;
+        const QRectF tb = fm.boundingRect(a.label).adjusted(-3 * scale, -1 * scale,
+                                                             3 * scale,  1 * scale);
+        // Above the box normally; below when that would fall off the top.
+        QPointF at(r.left(), r.top() - 2 * scale - tb.height());
+        if (at.y() < target.top()) at.setY(r.bottom() + 2 * scale);
+        const QRectF bg(at, tb.size());
+        p.setPen(Qt::NoPen);
+        p.setBrush(QColor(0, 0, 0, 170));
+        p.drawRect(bg);
+        p.setPen(a.color);
+        p.drawText(bg, Qt::AlignCenter, a.label);
+    }
+    p.restore();
+}
+
 bool HeatmapWidget::exportPng(const QString& path, int max_pixels) const {
     if (rows_ <= 0 || cols_ <= 0 || display_matrix_.empty()) return false;
     // Export exactly what is on screen — the current zoomed view, not the
@@ -498,11 +636,34 @@ bool HeatmapWidget::exportPng(const QString& path, int max_pixels) const {
     // visible plot rectangle, capped at max_pixels on the longer side.
     const double vw = view_x1_ - view_x0_, vh = view_y1_ - view_y0_;
     if (vw <= 0.0 || vh <= 0.0) return false;
-    const double aspect = vw / vh;
+
+    // Aspect comes from the on-screen plot rectangle, not from the view in
+    // data units. The view is *stretched* to fill that rectangle on screen
+    // (resetView sets it to the whole matrix regardless of widget shape), so
+    // taking the data aspect here would export a differently-proportioned
+    // picture than the one being looked at.
+    const QRect pr = plotRect();
+    const bool  have_pr = pr.width() > 0 && pr.height() > 0;
+    const double aspect = have_pr
+        ? static_cast<double>(pr.width()) / static_cast<double>(pr.height())
+        : vw / vh;
     int W, H;
     if (aspect >= 1.0) { W = max_pixels; H = std::max(1, static_cast<int>(max_pixels / aspect)); }
     else               { H = max_pixels; W = std::max(1, static_cast<int>(max_pixels * aspect)); }
-    QImage img = renderRegion(W, H, view_x0_, view_y0_, view_x1_, view_y1_);
+    QImage img = renderRegion(W, H, view_x0_, view_y0_, view_x1_, view_y1_,
+                               have_pr ? pr.width()  : 0,
+                               have_pr ? pr.height() : 0);
+
+    // Burn the annotations in. The export bitmap is much larger than the
+    // on-screen plot, so pen widths and the font are scaled by the same ratio
+    // and the boxes come out looking the same relative size as they do here.
+    if (!annotations_.empty()) {
+        QPainter ap(&img);
+        ap.setRenderHint(QPainter::Antialiasing, true);
+        const double scale = static_cast<double>(W) / std::max(1, pr.width());
+        drawAnnotations(ap, QRectF(0, 0, img.width(), img.height()),
+                        view_x0_, view_y0_, view_x1_, view_y1_, scale);
+    }
     return img.save(path, "PNG");
 }
 
@@ -542,6 +703,9 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
         p.drawRect(r);
         p.setClipping(false);
     }
+
+    // Annotations sit above the heatmap but below the axes and colour bar.
+    drawAnnotations(p, QRectF(pr), view_x0_, view_y0_, view_x1_, view_y1_, 1.0);
 
     // Border
     p.setPen(QColor(80, 80, 100));
@@ -595,9 +759,30 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
 }
 
 // ---------------------------------------------------------------------------
+// Screen point -> inclusive cell index, clamped to the matrix. Factored out
+// because the annotation hit-test must agree exactly with where the drag that
+// created the box thought it was.
+void HeatmapWidget::cellAt(const QPoint& pt, int& row, int& col) const {
+    const QRect pr = plotRect();
+    const double fx = view_x0_ + (view_x1_ - view_x0_) *
+                      (pt.x() - pr.left()) / std::max(1, pr.width());
+    const double fy = view_y0_ + (view_y1_ - view_y0_) *
+                      (pt.y() - pr.top())  / std::max(1, pr.height());
+    row = std::clamp(static_cast<int>(std::floor(fy)), 0, std::max(0, rows_ - 1));
+    col = std::clamp(static_cast<int>(std::floor(fx)), 0, std::max(0, cols_ - 1));
+}
+
 void HeatmapWidget::mousePressEvent(QMouseEvent* e) {
+    // Right-click deletes the box under the cursor. Only in annotate mode, so
+    // a stray right-click never silently destroys a mark while panning.
+    if (e->button() == Qt::RightButton && annotate_mode_ &&
+        rows_ > 0 && cols_ > 0 && plotRect().contains(e->pos())) {
+        int r, c; cellAt(e->pos(), r, c);
+        removeAnnotationAt(r, c);
+        return;
+    }
     if (e->button() == Qt::LeftButton &&
-        (select_mode_ || (e->modifiers() & Qt::ShiftModifier)) &&
+        (select_mode_ || annotate_mode_ || (e->modifiers() & Qt::ShiftModifier)) &&
         plotRect().contains(e->pos())) {
         selecting_ = true;
         sel_press_ = sel_cur_ = e->pos();
@@ -650,21 +835,34 @@ void HeatmapWidget::mouseReleaseEvent(QMouseEvent* e) {
         selecting_ = false;
         sel_cur_   = e->pos();   // the release point, not the last move's — they can differ
         if (rows_ > 0 && cols_ > 0) {
-            QRect pr = plotRect();
-            auto toCell = [&](const QPoint& pt, int& r, int& c) {
-                double fx = view_x0_ + (view_x1_ - view_x0_) * (pt.x() - pr.left()) / std::max(1, pr.width());
-                double fy = view_y0_ + (view_y1_ - view_y0_) * (pt.y() - pr.top())  / std::max(1, pr.height());
-                r = std::clamp(static_cast<int>(std::floor(fy)), 0, rows_ - 1);
-                c = std::clamp(static_cast<int>(std::floor(fx)), 0, cols_ - 1);
-            };
             int r0, c0, r1, c1;
-            toCell(sel_press_, r0, c0);
-            toCell(sel_cur_,   r1, c1);
-            sel_r0_ = std::min(r0, r1); sel_r1_ = std::max(r0, r1);
-            sel_c0_ = std::min(c0, c1); sel_c1_ = std::max(c0, c1);
-            sel_valid_ = true;
-            refreshSelectionRange();
-            emit regionSelected(sel_r0_, sel_c0_, sel_r1_, sel_c1_);
+            cellAt(sel_press_, r0, c0);
+            cellAt(sel_cur_,   r1, c1);
+            const int rlo = std::min(r0, r1), rhi = std::max(r0, r1);
+            const int clo = std::min(c0, c1), chi = std::max(c0, c1);
+
+            if (annotate_mode_) {
+                // Label the box with the strongest value it covers — that is
+                // almost always why the box is being drawn, and it saves
+                // reading it off the hover readout and typing it in.
+                float peak = 0.0f;
+                bool  any  = false;
+                for (int r = rlo; r <= rhi; ++r)
+                    for (int c = clo; c <= chi; ++c) {
+                        const float v = matrix_[static_cast<size_t>(r) *
+                                                 static_cast<size_t>(cols_) +
+                                                 static_cast<size_t>(c)];
+                        if (!any || std::abs(v) > std::abs(peak)) { peak = v; any = true; }
+                    }
+                addAnnotation(rlo, clo, rhi, chi,
+                              any ? QString::number(peak, 'g', 3) : QString());
+            } else {
+                sel_r0_ = rlo; sel_r1_ = rhi;
+                sel_c0_ = clo; sel_c1_ = chi;
+                sel_valid_ = true;
+                refreshSelectionRange();
+                emit regionSelected(sel_r0_, sel_c0_, sel_r1_, sel_c1_);
+            }
         }
         update();
         return;

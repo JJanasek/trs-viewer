@@ -23,8 +23,9 @@ analyses over the result — each in its own tab, several files at a time.
 | **[Welch t-test](features/ttest.md)** | TVLA leakage assessment with thresholds and export |
 | **[CPA](features/cpa.md)** | Correlation power analysis with a Python leakage model |
 | **[SNR](features/snr.md)** · **[Static SNR](features/static-snr.md)** | Per-sample signal-to-noise |
-| **[Cross-correlation](features/xcorr.md)** · **[Heatmap](features/heatmap.md)** | Trace similarity matrices |
+| **[Cross-correlation](features/xcorr.md)** · **[Heatmap](features/heatmap.md)** | Trace similarity matrices, with red-box peak annotations that export with the figure |
 | **[FFT](features/fft.md)** | Averaged spectra over a selected region |
+| **[Narrowband interference](features/interference.md)** | Find and remove carriers, switcher combs and clock harmonics; see which frequencies actually leak |
 | **[Export](features/export.md)** · **[Dataset export](features/export-dataset.md)** | TRS, NPY and NPZ out |
 | **[Chain editor](features/chain.md)** | Save a whole workflow and replay it with one click |
 

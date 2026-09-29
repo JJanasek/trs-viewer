@@ -29,6 +29,9 @@ if(Qt6_FOUND)
             "Or run scripts/install-deps.sh, which installs every dependency.")
     endif()
     set(QT_LIBS Qt6::Core Qt6::Gui Qt6::Widgets Qt6::Svg)
+    # Core alone, for the headless test targets: chain.cpp needs QString
+    # and QJson* but nothing from the widget stack.
+    set(QT_LIBS_CORE Qt6::Core)
     message(STATUS "Using Qt6")
 else()
     find_package(Qt5 QUIET COMPONENTS Core Gui Widgets Svg)
@@ -38,6 +41,7 @@ else()
             "Run scripts/install-deps.sh, or see the Installation section of README.md.")
     endif()
     set(QT_LIBS Qt5::Core Qt5::Gui Qt5::Widgets Qt5::Svg)
+    set(QT_LIBS_CORE Qt5::Core)
     message(STATUS "Using Qt5")
 endif()
 
@@ -99,6 +103,8 @@ set(SOURCES
     src/leakage_model.cpp
     src/cpa.cpp
     src/snr.cpp
+    src/spectral.cpp
+    inc/spectral.h
     src/leakage_model_dialog.cpp
     inc/leakage_model.h
     inc/leakage_model_dialog.h

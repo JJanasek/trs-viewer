@@ -1,7 +1,9 @@
 #pragma once
 
+#include <QColor>
 #include <QImage>
 #include <QPoint>
+#include <QString>
 #include <QWidget>
 
 #include <vector>
@@ -85,6 +87,46 @@ public:
     void setSelection(int row0, int col0, int row1, int col1);   // as if dragged
     void zoomToSelection(double margin_frac = 0.1);
 
+    // --- Annotations -----------------------------------------------------
+    // Persistent red boxes marking cells worth pointing at: a correlation
+    // peak, a region a colleague should look at, the spot a figure is about.
+    //
+    // Deliberately separate from the region selection above. That selection is
+    // a *tool* — it drives local contrast and zoom, there is only ever one,
+    // and it moves the moment you drag again. These are a *record*: many at
+    // once, they survive panning, zooming and every colour change, and they
+    // are drawn into exportPng() so a figure carries its own markings instead
+    // of needing them added afterwards in an image editor.
+    //
+    // Bounds are inclusive cell indices and are stored in data coordinates, so
+    // a box stays on its cells no matter how the view moves.
+    struct Annotation {
+        int     row0 = 0, col0 = 0, row1 = 0, col1 = 0;
+        QString label;                             // drawn above the box
+        QColor  color = QColor(220, 40, 40);
+    };
+
+    void addAnnotation(const Annotation& a);
+    void addAnnotation(int row0, int col0, int row1, int col1,
+                        const QString& label = {},
+                        const QColor& color = QColor(220, 40, 40));
+    // Removes the topmost (most recently added) box containing that cell.
+    // Returns false when no box covers it.
+    bool removeAnnotationAt(int row, int col);
+    void clearAnnotations();
+    const std::vector<Annotation>& annotations() const { return annotations_; }
+
+    // In annotate mode a left-drag draws a box instead of selecting a region,
+    // and a right-click deletes the box under the cursor. Mutually exclusive
+    // with setSelectMode() — turning one on turns the other off, since both
+    // want the same left-drag.
+    void setAnnotateMode(bool on);
+    bool annotateMode() const { return annotate_mode_; }
+    // Promotes the current region selection to a permanent box. No-op when
+    // nothing is selected. Lives here rather than in the caller because the
+    // selection bounds are private.
+    bool annotateCurrentSelection(const QString& label = {});
+
     // The `count` strongest cells (by |value|), at most one per block×block
     // tile so they spread over distinct regions rather than one blob. For a
     // square matrix the main diagonal band is skipped — a self-correlation
@@ -103,6 +145,9 @@ signals:
     void hoverInfo(int s1, int s2, float value);
     // Emitted on release of a region drag; bounds are inclusive cell indices.
     void regionSelected(int row0, int col0, int row1, int col1);
+    // Emitted whenever the annotation list changes, so a UI showing a count
+    // or a list can refresh without polling.
+    void annotationsChanged();
 
 protected:
     void paintEvent(QPaintEvent*) override;
@@ -114,13 +159,38 @@ protected:
 
 private:
     QRect plotRect() const;
+    // Screen point -> inclusive cell index, clamped. Shared by the selection
+    // drag, the annotation drag and the annotation hit-test so all three
+    // agree on which cell the cursor is over.
+    void  cellAt(const QPoint& pt, int& row, int& col) const;
     void  applyProcessing();          // raw → display_matrix_
     // Render the visible region of display_matrix_ into a W×H image.
     // Used by both paintEvent (viewport size) and exportPng (export size).
+    //
+    // pool_ref_w/h: the pixel size the *downsample factor* is derived from,
+    // when it differs from the bitmap being drawn. Cells-per-pixel decides how
+    // coarsely the matrix is pooled, so rendering the same view into a bigger
+    // bitmap pools less — and a single-cell peak that Peak-pooling had
+    // inflated into a visible block on screen collapses back to one pixel in
+    // a 2400px export, which is exactly the mark the export was made to show.
+    // exportPng therefore passes the on-screen plot size here, so the PNG is a
+    // higher-resolution rendering of what is on screen rather than a
+    // differently-pooled one. 0 = use W/H (the paintEvent case).
     QImage renderRegion(int W, int H,
                         double x0, double y0,
-                        double x1, double y1) const;
+                        double x1, double y1,
+                        int pool_ref_w = 0, int pool_ref_h = 0) const;
     QRgb  colormap(float v) const;
+
+    // Draws every annotation box onto `p`, mapping data coordinates to
+    // `target` through the view rectangle (x0,y0)-(x1,y1). Shared by
+    // paintEvent and exportPng so the exported PNG carries exactly the boxes
+    // that are on screen — drawing them only in paintEvent is the easy bug
+    // here, and it produces a figure missing the very marks it was made for.
+    // `scale` grows pen width and font for the (much larger) export bitmap.
+    void drawAnnotations(QPainter& p, const QRectF& target,
+                          double x0, double y0, double x1, double y1,
+                          double scale) const;
 
     // Data
     std::vector<float> matrix_;          // raw data
@@ -151,6 +221,10 @@ private:
     bool   sel_valid_   = false;
     int    sel_r0_ = 0, sel_c0_ = 0, sel_r1_ = 0, sel_c1_ = 0;   // inclusive
     bool   dim_outside_ = false;
+
+    // Annotations
+    std::vector<Annotation> annotations_;
+    bool   annotate_mode_ = false;
     Downsample downsample_ = Downsample::Peak;
     // Pooled copy of display_matrix_ for the current zoom level, built on
     // demand (ensurePooled) and dropped whenever display_matrix_ changes.

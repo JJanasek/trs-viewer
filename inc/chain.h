@@ -32,7 +32,7 @@ struct ChainStep {
     Kind kind = Kind::AddTransform;
 
     // --- AddTransform --------------------------------------------------
-    // transform_type is the combo_transform_ index (0-10, see
+    // transform_type is the combo_transform_ index (0-14, see
     // MainWindow::createTransform()) — reused directly as the type tag so
     // building/describing a step never needs runtime type detection: the
     // caller already knows which concrete ITransform subclass idx maps to.
@@ -45,6 +45,29 @@ struct ChainStep {
     double d_q       = 0.0; // Biquad Q
     double d_cutoff  = 0.0; // Biquad cutoff (fraction of Nyquist)
     int    i_choice  = 0;   // FFT/STFT window-function index, or Biquad filter-type index
+
+    // --- Narrowband interference removal (transform_type 10/11/12) -------
+    // All default to the pre-existing behaviour, so a chain.json written
+    // before these existed loads unchanged: zero_phase off leaves Filter
+    // causal, and an absent band list leaves Spectral Excise a no-op.
+    bool   zero_phase  = false; // Filter / Harmonic Notch: forward-backward pass
+    bool   odd_only    = false; // Harmonic Notch: notch only odd multiples of f0
+    int    n_harmonics = 0;     // Harmonic Notch: how many multiples to notch
+    int    phase_mode  = 0;     // Spectral Excise: 0 = keep phase, 1 = randomise
+    // Spectral Excise band list, encoded by encodeSpectralBands() — a flat
+    // string because this struct has no list type (see the header comment).
+    QString bands;
+
+    // --- Periodic subtraction (13) / complex demodulation (14) -----------
+    double  d_period      = 0.0; // Periodic Subtract: period in samples; 0 = auto-estimate
+    int64_t period_min    = 8;   // ...and the auto-estimate search range,
+    int64_t period_max    = 100000; //   in samples
+    double  d_period_corr = 0.3; // ...and the correlation a candidate must reach
+    double  d_bandwidth   = 0.0; // Demodulate: half-bandwidth (fraction of Nyquist).
+                                  // Demodulate reuses d_cutoff for its centre
+                                  // frequency and i_choice for its output mode,
+                                  // both of which mean exactly what they do for
+                                  // the other frequency-domain stages.
 
     // --- Align (mirrors onAlignTraces()'s parameter set; region/search are
     //     in pipeline-processed sample units, exactly like that dialog) ---

@@ -425,6 +425,16 @@ void PlotWidget::clearTraces() {
     update();
 }
 
+void PlotWidget::removeTracesFrom(int first) {
+    if (first < 0 || first >= static_cast<int>(traces_.size())) return;
+    traces_.erase(traces_.begin() + first, traces_.end());
+    // Deliberately leaves total_samples_ and the view/sticky-Y state alone:
+    // this removes an overlay from a plot whose scale belongs to the traces
+    // that remain, so resetting the view here would yank it out from under
+    // the user every time an overlay is refreshed.
+    update();
+}
+
 void PlotWidget::setTransforms(const std::vector<std::shared_ptr<ITransform>>& tx) {
     transforms_ = tx;
     for (auto& te : traces_) {

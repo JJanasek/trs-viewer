@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "spectral.h"
 #include <zlib.h>
 #include "heatmap_widget.h"
 #include "ttest.h"
@@ -49,6 +50,7 @@
 #include <QSplitter>
 #include <QStandardItemModel>
 #include <QHeaderView>
+#include <QStatusBar>
 #include <QTableWidget>
 #include <QVBoxLayout>
 
@@ -221,6 +223,10 @@ MainWindow::MainWindow(QWidget* parent)
         "STFT Magnitude",
         "Gaussian Noise",
         "Filter (Lowpass/Highpass/Bandpass/Notch)",
+        "Harmonic Notch (comb at f0, 2·f0, …)",
+        "Spectral Line Excision",
+        "Periodic Subtract (remove a periodic interferer)",
+        "Demodulate (band → baseband envelope)",
     });
 
     list_transforms_ = new QListWidget;
@@ -783,6 +789,13 @@ void MainWindow::setupMenuBar() {
     connect(act_snr, &QAction::triggered, this, &MainWindow::onRunSNR);
     sca_menu->addAction(act_snr);
 
+    auto* act_spec_leak = new QAction("Leakage vs &Frequency…", this);
+    act_spec_leak->setToolTip("Welch t-test per (time window, frequency bin) — tells "
+                               "which frequencies actually leak, as opposed to which "
+                               "merely carry energy.");
+    connect(act_spec_leak, &QAction::triggered, this, &MainWindow::onRunSpectralLeakage);
+    sca_menu->addAction(act_spec_leak);
+
     auto* act_static_snr = new QAction("Static SNR |μ/σ|…", this);
     connect(act_static_snr, &QAction::triggered, this, &MainWindow::onRunStaticSNR);
     sca_menu->addAction(act_static_snr);
@@ -1277,11 +1290,15 @@ void MainWindow::rebakeAlignedView() {
     plotWidget()->restoreViewState(saved_view);
 }
 
-void MainWindow::onAddTransform() {
-    auto tx = createTransform(combo_transform_->currentIndex());
-    if (!tx) return;
+// Appends a finished transform to the active dataset's pipeline and brings
+// everything that depends on it back into sync. Shared by the Add button and by
+// the spectral-line detector's "Excise checked", because the plot_file_backed
+// branch below is subtle enough that a second hand-written copy of it would
+// drift out of step.
+void MainWindow::addTransformToPipeline(std::shared_ptr<ITransform> tx) {
+    if (!tx || !hasActiveDs() || activeDs().is_result) return;
     saveSnapshot();
-    activeDs().pipeline.push_back(tx);
+    activeDs().pipeline.push_back(std::move(tx));
     rebuildTransformList();
     updateFileInfo();
     // Only push the live pipeline to the plot when it's showing raw,
@@ -1295,6 +1312,10 @@ void MainWindow::onAddTransform() {
     else
         rebakeAlignedView();
     plotWidget()->update();
+}
+
+void MainWindow::onAddTransform() {
+    addTransformToPipeline(createTransform(combo_transform_->currentIndex()));
 }
 
 void MainWindow::onRemoveTransform() {
@@ -1652,8 +1673,16 @@ static bool exportTracesToTrs(
     std::fputc(0x5F, fp); std::fputc(0x00, fp);      // TRACE_BLOCK
 
     // Trace data -------------------------------------------------------------
-    constexpr int64_t CHUNK = 256 * 1024;
-    std::vector<float> buf(CHUNK);
+    // Normally written 256K samples at a time so a multi-gigabyte trace set
+    // never needs a trace-sized buffer. A pipeline holding a whole-trace stage
+    // (zero-phase filter, spectral excision, periodic-interference
+    // subtraction) can't be fed in pieces without seams at every chunk
+    // boundary, so in that case one "chunk" becomes the whole window — see
+    // ITransform::requiresWholeTrace().
+    const bool whole_trace = pipelineRequiresWholeTrace(pipeline);
+    const int64_t CHUNK = whole_trace ? std::max<int64_t>(1, n_samples)
+                                      : 256 * 1024;
+    std::vector<float> buf(static_cast<size_t>(CHUNK));
     int64_t clipped = 0;
 
     for (int32_t ki = 0; ki < n_traces; ki++) {
@@ -3147,10 +3176,33 @@ static QWidget* makeHeatmapToneRow(HeatmapWidget* heatmap,
                      heatmap, [=](double v) { heatmap->setContrast(static_cast<float>(v)); });
 
     auto* sp_bright = new QDoubleSpinBox;
-    sp_bright->setRange(-1.0, 1.0); sp_bright->setDecimals(2);
+    // Range ±10, not ±1. The two controls are coupled: brightness shifts by a
+    // fraction of the *stretched* scale, so how far it is useful to push it
+    // depends on contrast. Together they map input t to
+    //     t' = (t - 0.5)·contrast + 0.5 + brightness
+    // and the visible slice of the data is the t for which t' lands in [0,1] —
+    // a window of width 1/contrast centred at 0.5 - brightness/contrast.
+    //
+    // At contrast 1 that window is the whole range and ±1 already pushes
+    // everything off the scale, which is why ±1 looked sufficient. At contrast
+    // 10 the window is a tenth of the range, and reaching the top decile needs
+    // brightness -4.5 — unreachable at the old limit, so the two controls
+    // could not be combined to isolate the strongest cells at all.
+    //
+    // Over-driving is harmless: interpColormap clamps t' to [0,1], so values
+    // past the useful bound (|brightness| > 0.5·contrast + 0.5) simply
+    // saturate the whole map rather than misbehaving.
+    sp_bright->setRange(-10.0, 10.0); sp_bright->setDecimals(2);
     sp_bright->setSingleStep(0.05); sp_bright->setValue(0.0);
-    sp_bright->setToolTip("Shifts the colour mapping, in units of the full range. "
-                          "0 = as is; +0.2 brightens everything by a fifth of the scale.");
+    sp_bright->setToolTip(
+        "Shifts the colour mapping, in units of the full range.\n"
+        "0 = as is; +0.2 brightens everything by a fifth of the scale.\n\n"
+        "Works together with Contrast: the two select a window of width "
+        "1/contrast, centred at 0.5 − brightness/contrast. So to isolate just "
+        "the strongest cells, raise Contrast first and then push Brightness "
+        "negative — e.g. contrast 10 with brightness −4.5 shows only the top "
+        "10 % of the range.\n\n"
+        "Beyond roughly ±(0.5 × contrast + 0.5) the whole map saturates.");
     QObject::connect(sp_bright, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
                      heatmap, [=](double v) { heatmap->setBrightness(static_cast<float>(v)); });
 
@@ -3240,6 +3292,106 @@ static QWidget* makeHeatmapToneRow(HeatmapWidget* heatmap,
 // mouse (a 30k×30k correlation matrix on a ~1000 px view is ~900 cells per
 // pixel): how zoomed-out pixels are formed, jumping to a region by
 // coordinates, and finding the strongest cells automatically.
+// ---------------------------------------------------------------------------
+// Annotation row — persistent red boxes marking cells worth pointing at.
+//
+// Two ways in, because there are two reasons to want one: you have spotted a
+// peak yourself and want to mark it, or you want the strongest peaks found and
+// boxed for you. Both end up in the same list, both survive pan/zoom and every
+// colour change, and both are drawn into the exported PNG.
+// ---------------------------------------------------------------------------
+static QWidget* makeHeatmapAnnotateRow(HeatmapWidget* heatmap,
+                                        int32_t rows, int32_t cols, QWidget* dlg)
+{
+    auto* row = new QWidget;
+    auto* hl  = new QHBoxLayout(row);
+    hl->setContentsMargins(4, 2, 4, 2);
+
+    auto* btn_mode = new QPushButton("Annotate");
+    btn_mode->setCheckable(true);
+    btn_mode->setToolTip(
+        "Drag on the heatmap to draw a red box around a peak. The box is "
+        "labelled with the strongest value it covers.\n\n"
+        "Right-click a box to delete it. Boxes stick to their cells through "
+        "pan and zoom, and are included in the exported PNG.");
+    QObject::connect(btn_mode, &QPushButton::toggled, heatmap, [=](bool on) {
+        heatmap->setAnnotateMode(on);
+    });
+
+    auto* sp_top = new QSpinBox;
+    sp_top->setRange(1, 50);
+    sp_top->setValue(5);
+    sp_top->setToolTip("How many of the strongest peaks to box.");
+
+    auto* sp_pad = new QSpinBox;
+    sp_pad->setRange(0, 100000);
+    sp_pad->setValue(std::clamp(std::max(rows, cols) / 100, 1, 200));
+    sp_pad->setToolTip("Half-size of each box, in cells. A peak is a single cell; "
+                        "this is how much context to draw around it.");
+
+    auto* btn_peaks = new QPushButton("Box top peaks");
+    btn_peaks->setToolTip(
+        "Find the strongest cells — at most one per tile, so they spread across "
+        "the matrix rather than clustering on one blob — and box each of them. "
+        "On a square matrix the main diagonal is skipped, since a "
+        "self-correlation matrix is trivially 1.0 there.");
+    QObject::connect(btn_peaks, &QPushButton::clicked, heatmap, [=]() {
+        const int block = std::max(1, std::max(rows, cols) / 200);
+        const auto spots = heatmap->findHotspots(sp_top->value(), block);
+        if (spots.empty()) {
+            QMessageBox::information(dlg, "Annotate", "No cells to rank.");
+            return;
+        }
+        const int pad = sp_pad->value();
+        for (const auto& h : spots)
+            heatmap->addAnnotation(h.row - pad, h.col - pad, h.row + pad, h.col + pad,
+                                    QString::number(h.value, 'g', 3));
+    });
+
+    auto* btn_sel = new QPushButton("Box region");
+    btn_sel->setToolTip("Turn the current selection (shift-drag, or Mark && zoom) "
+                         "into a permanent box.");
+    QObject::connect(btn_sel, &QPushButton::clicked, heatmap, [=]() {
+        if (!heatmap->hasSelection()) {
+            QMessageBox::information(dlg, "Annotate",
+                "Nothing is selected. Shift-drag on the heatmap first, or use "
+                "\"Mark && zoom\" to select by coordinates.");
+            return;
+        }
+        // Read the selection back through the same signal the nav row uses;
+        // HeatmapWidget keeps it internally, so re-emit by re-selecting.
+        heatmap->annotateCurrentSelection();
+    });
+
+    auto* btn_clear = new QPushButton("Clear boxes");
+    QObject::connect(btn_clear, &QPushButton::clicked, heatmap, [=]() {
+        heatmap->clearAnnotations();
+    });
+
+    auto* lbl_count = new QLabel;
+    lbl_count->setStyleSheet("color: gray;");
+    auto refresh = [=]() {
+        const int n = static_cast<int>(heatmap->annotations().size());
+        lbl_count->setText(n == 0 ? QString("no boxes")
+                                  : QString("%1 box%2").arg(n).arg(n == 1 ? "" : "es"));
+    };
+    QObject::connect(heatmap, &HeatmapWidget::annotationsChanged, lbl_count, refresh);
+    refresh();
+
+    hl->addWidget(btn_mode);
+    hl->addSpacing(8);
+    hl->addWidget(new QLabel("Top:"));
+    hl->addWidget(sp_top);
+    hl->addWidget(new QLabel("±cells:"));
+    hl->addWidget(sp_pad);
+    hl->addWidget(btn_peaks);
+    hl->addWidget(btn_sel);
+    hl->addWidget(btn_clear);
+    hl->addWidget(lbl_count);
+    hl->addStretch();
+    return row;
+}
+
 static QWidget* makeHeatmapNavRow(HeatmapWidget* heatmap, int32_t rows, int32_t cols,
                                   QWidget* dlg)
 {
@@ -3535,6 +3687,7 @@ void MainWindow::onLoadNpyHeatmap() {
     vl->addWidget(row2);
     vl->addWidget(tone_row);
     vl->addWidget(makeHeatmapNavRow(heatmap, M, M, dlg));
+    vl->addWidget(makeHeatmapAnnotateRow(heatmap, M, M, dlg));
     vl->addWidget(heatmap, 1);
     dlg->show();
 }
@@ -6358,6 +6511,8 @@ void MainWindow::onRunXCorr() {
     vl->addWidget(makeHeatmapToneRow(heatmap, combo_scheme2, sp_sigma2, chk_abs2, sp_gamma2,
                                      chk_thresh2, sp_thresh2, sp_vmin, sp_vmax, sp_clip_pct2));
     vl->addWidget(makeHeatmapNavRow(heatmap, result_ptr->rows, result_ptr->cols, dlg));
+    vl->addWidget(makeHeatmapAnnotateRow(heatmap, result_ptr->rows,
+                                          result_ptr->cols, dlg));
     vl->addWidget(heatmap, 1);
 
     dlg->show();
@@ -6454,6 +6609,1298 @@ void MainWindow::onRunXCorr() {
     });
 
     cfg->show();
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Spectral line detection over an averaged spectrum.
+//
+// Launched from the FFT result window. The order matters and the UI enforces
+// it: detect first, look at what came back, then excise. Notching an assumed
+// harmonic comb without measuring is how you delete the leakage you were
+// hunting — the literature is explicit that side-channel leakage is not
+// confined to clock harmonics, and that non-harmonic frequencies routinely
+// carry more of it than the harmonics do.
+// ---------------------------------------------------------------------------
+void MainWindow::showSpectralLineDialog(QWidget* parent, PlotWidget* pw,
+                                         std::shared_ptr<std::vector<float>> spec,
+                                         bool spec_is_db, int64_t fft_in_n,
+                                         double fs_hz)
+{
+    if (!spec || spec->size() < 8) {
+        QMessageBox::information(parent, "Spectral lines",
+                                  "Spectrum too short to analyse.");
+        return;
+    }
+    const int64_t n_bins = static_cast<int64_t>(spec->size());
+
+    auto* d = new QDialog(parent);
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    d->setWindowTitle("Spectral lines");
+    d->resize(820, 620);
+    auto* vl = new QVBoxLayout(d);
+
+    auto* blurb = new QLabel(
+        "A line is flagged when it stands above the <i>local</i> median floor "
+        "by more than the excess threshold <b>and</b> is narrower than the "
+        "width limit. The width limit is what separates interference from "
+        "signal: a carrier is a few bins wide on a smooth floor, whereas real "
+        "leakage is broadband and moves the floor itself. Both can be tall.");
+    blurb->setWordWrap(true);
+    vl->addWidget(blurb);
+
+    // --- Detection parameters --------------------------------------------
+    auto* form = new QFormLayout;
+    vl->addLayout(form);
+
+    auto* sp_win = new QSpinBox;
+    sp_win->setRange(5, 8191);
+    sp_win->setSingleStep(32);
+    sp_win->setValue(static_cast<int>(std::min<int64_t>(257, std::max<int64_t>(5, n_bins / 8))));
+    sp_win->setToolTip(
+        "Width of the running-median window that estimates the noise floor, in "
+        "bins. Must be comfortably wider than any line you want to find — a "
+        "line wide enough to fill this window pulls its own baseline up and "
+        "disappears — but narrower than real structure in the floor.");
+    form->addRow("Baseline window (bins):", sp_win);
+
+    auto* sp_exc = new QDoubleSpinBox;
+    sp_exc->setRange(0.5, 120.0);
+    sp_exc->setDecimals(1);
+    sp_exc->setValue(6.0);
+    sp_exc->setToolTip("How far above the local floor a peak must stand to count.");
+    form->addRow("Min excess (dB):", sp_exc);
+
+    auto* sp_wid = new QSpinBox;
+    sp_wid->setRange(1, 4096);
+    sp_wid->setValue(24);
+    sp_wid->setToolTip(
+        "Peaks wider than this are treated as broadband features and ignored. "
+        "This is the guard that stops the detector — and anything you excise on "
+        "its advice — from eating genuine leakage.");
+    form->addRow("Max width (bins):", sp_wid);
+
+    auto* sp_min = new QSpinBox;
+    sp_min->setRange(0, static_cast<int>(std::min<int64_t>(n_bins - 1, INT_MAX)));
+    sp_min->setValue(static_cast<int>(std::min<int64_t>(2, n_bins - 1)));
+    sp_min->setToolTip("Bins below this are skipped. The first few carry trace "
+                        "offset and drift, which are not lines in any useful sense.");
+    form->addRow("Ignore bins below:", sp_min);
+
+    auto* chk_base = new QCheckBox("Overlay the estimated noise floor on the plot");
+    chk_base->setChecked(true);
+    chk_base->setToolTip("Seeing the baseline the detector worked from is how you "
+                          "tell a sensible excess threshold from a silly one.");
+    form->addRow("", chk_base);
+
+    // --- Results ----------------------------------------------------------
+    auto* tbl = new QTableWidget(0, 5);
+    tbl->setHorizontalHeaderLabels({"", "Frequency", "Bin", "Excess (dB)", "Width (bins)"});
+    tbl->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    tbl->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+    tbl->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tbl->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    tbl->setSortingEnabled(false);
+    vl->addWidget(tbl, 1);
+
+    auto* status = new QLabel("Press Detect to analyse the spectrum.");
+    status->setWordWrap(true);
+    vl->addWidget(status);
+
+    auto lines = std::make_shared<std::vector<SpectralLine>>();
+
+    // A spectrum in dB and one in linear magnitude need different excess
+    // arithmetic; the detector is told which it got rather than guessing.
+    auto run = [=]() {
+        LineDetectParams prm;
+        prm.baseline_window = sp_win->value();
+        prm.min_excess_db   = static_cast<float>(sp_exc->value());
+        prm.max_width_bins  = sp_wid->value();
+        prm.min_bin         = sp_min->value();
+        prm.input_is_db     = spec_is_db;
+
+        std::vector<float> baseline;
+        std::string err;
+        if (!detectSpectralLines(*spec, prm, *lines, &baseline, err)) {
+            status->setText(QString("<span style='color:#c0392b'>%1</span>")
+                                .arg(QString::fromStdString(err)));
+            return;
+        }
+
+        tbl->setRowCount(static_cast<int>(lines->size()));
+        for (int i = 0; i < static_cast<int>(lines->size()); ++i) {
+            const SpectralLine& ln = (*lines)[static_cast<size_t>(i)];
+
+            auto* chk = new QTableWidgetItem();
+            chk->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled | Qt::ItemIsSelectable);
+            chk->setCheckState(Qt::Checked);
+            tbl->setItem(i, 0, chk);
+
+            QString freq = QString("bin %1").arg(ln.bin);
+            if (fs_hz > 0.0) {
+                const double hz = binToHz(ln.bin, fft_in_n, fs_hz);
+                if      (hz >= 1e9) freq = QString("%1 GHz").arg(hz / 1e9, 0, 'f', 6);
+                else if (hz >= 1e6) freq = QString("%1 MHz").arg(hz / 1e6, 0, 'f', 4);
+                else if (hz >= 1e3) freq = QString("%1 kHz").arg(hz / 1e3, 0, 'f', 3);
+                else                freq = QString("%1 Hz").arg(hz, 0, 'f', 2);
+            }
+            tbl->setItem(i, 1, new QTableWidgetItem(freq));
+            tbl->setItem(i, 2, new QTableWidgetItem(QString::number(ln.bin)));
+            tbl->setItem(i, 3, new QTableWidgetItem(QString::number(ln.excess_db, 'f', 1)));
+            tbl->setItem(i, 4, new QTableWidgetItem(QString::number(ln.widthBins())));
+        }
+
+        // Mark every detected line's extent on the spectrum plot. The plot's
+        // x-axis is in bins here, which is exactly the marker unit.
+        std::vector<std::pair<int64_t, int64_t>> marks;
+        marks.reserve(lines->size());
+        for (const auto& ln : *lines) marks.emplace_back(ln.lo_bin, ln.hi_bin + 1);
+        pw->setMatchMarkers(marks);
+
+        if (chk_base->isChecked()) {
+            // Trace 0 is the spectrum itself; re-adding the baseline each run
+            // would stack copies, so the previous one is dropped first.
+            pw->removeTracesFrom(baseline_trace_marker_);
+            auto base_ptr = std::make_shared<std::vector<float>>(std::move(baseline));
+            baseline_trace_marker_ = pw->traceCount();
+            pw->addTrace(base_ptr, QColor("#8e44ad"), "Noise floor");
+        }
+
+        if (lines->empty()) {
+            status->setText(
+                "No narrowband lines found. Either the capture is clean, or the "
+                "thresholds are too strict — try a lower excess or a wider "
+                "baseline window.");
+        } else {
+            status->setText(QString(
+                "<b>%1 line%2 found</b>, strongest first. Everything checked "
+                "below is what \"Excise checked\" will remove. The band list is "
+                "in <i>pipeline-processed</i> frequency units, matching this "
+                "spectrum, so the excision stage belongs at the end of the "
+                "pipeline — which is where Add puts it.")
+                .arg(lines->size()).arg(lines->size() == 1 ? "" : "s"));
+        }
+    };
+
+    auto* btn_run    = new QPushButton("Detect");
+    auto* btn_excise = new QPushButton("Excise checked…");
+    auto* btn_none   = new QPushButton("Uncheck all");
+    auto* btn_close  = new QPushButton("Close");
+    btn_run->setDefault(true);
+
+    connect(btn_run, &QPushButton::clicked, d, run);
+    connect(btn_none, &QPushButton::clicked, d, [tbl]() {
+        for (int i = 0; i < tbl->rowCount(); ++i)
+            if (auto* it = tbl->item(i, 0)) it->setCheckState(Qt::Unchecked);
+    });
+    connect(btn_close, &QPushButton::clicked, d, &QDialog::close);
+
+    connect(btn_excise, &QPushButton::clicked, d, [=]() {
+        if (!hasActiveDs() || activeDs().is_result) {
+            QMessageBox::information(d, "Excise",
+                "Excision adds a pipeline stage, which needs a trace file tab.");
+            return;
+        }
+        std::vector<SpectralBand> bands;
+        for (int i = 0; i < tbl->rowCount() &&
+                        i < static_cast<int>(lines->size()); ++i) {
+            auto* it = tbl->item(i, 0);
+            if (!it || it->checkState() != Qt::Checked) continue;
+            const SpectralLine& ln = (*lines)[static_cast<size_t>(i)];
+
+            // Bin -> fraction of Nyquist. The last bin *is* Nyquist, so the
+            // divisor is n_bins-1. Half-width comes from the line's measured
+            // extent plus a one-bin margin, because an interferer that does
+            // not sit exactly on a bin has sinc skirts reaching past where its
+            // excess fell below the detection threshold.
+            const double denom  = static_cast<double>(n_bins - 1);
+            const double centre = static_cast<double>(ln.bin) / denom;
+            const double half   =
+                (static_cast<double>(ln.hi_bin - ln.lo_bin) / 2.0 + 1.0) / denom;
+            bands.push_back(SpectralBand{centre, std::max(half, 1.0 / denom)});
+        }
+        if (bands.empty()) {
+            QMessageBox::information(d, "Excise", "Nothing is checked.");
+            return;
+        }
+        // Hand them to the normal excision dialog rather than applying blind:
+        // the user still gets to see, widen, trim or extend the band list, and
+        // to pick the phase mode.
+        if (auto tx = createSpectralExciseTransform(bands)) {
+            const QString nm = QString::fromStdString(tx->name());
+            addTransformToPipeline(tx);
+            statusBar()->showMessage(QString("Added %1 to the pipeline.").arg(nm), 5000);
+        }
+    });
+
+    auto* hl = new QHBoxLayout;
+    hl->addWidget(btn_run);
+    hl->addWidget(btn_excise);
+    hl->addWidget(btn_none);
+    hl->addStretch();
+    hl->addWidget(btn_close);
+    vl->addLayout(hl);
+
+    // Clean the overlay up on close — leaving amber markers and a stray
+    // baseline trace on someone's spectrum after the dialog is gone is
+    // confusing, and the markers mean nothing without the table.
+    connect(d, &QDialog::finished, d, [this, pw](int) {
+        pw->clearMatchMarkers();
+        pw->removeTracesFrom(baseline_trace_marker_);
+        baseline_trace_marker_ = -1;
+    });
+
+    run();          // detect once up front with the defaults
+    d->show();
+}
+
+// ---------------------------------------------------------------------------
+// Frequency-domain dialog plumbing
+//
+// Everything that removes narrowband interference is configured in real
+// frequency units, because that is how the interference is known: "the BLE
+// carrier", "the switcher runs at 2 MHz", "13.56 MHz reader field". But the
+// transforms themselves only ever see fractions of Nyquist (TRS files can't be
+// relied on to carry a sample rate — see BiquadFilterTransform::cutoff), so
+// every such dialog needs the same two pieces: a way to establish the sample
+// rate, and a frequency entry that converts through it while showing the user
+// both numbers. These helpers are that, shared rather than re-typed three
+// times.
+// ---------------------------------------------------------------------------
+namespace {
+
+static const double kRateUnitMul[4] = {1.0, 1e3, 1e6, 1e9};
+static const char*  kRateUnitName[4] = {"Hz", "kHz", "MHz", "GHz"};
+
+struct RateEntry {
+    QDoubleSpinBox* spin = nullptr;
+    QComboBox*      unit = nullptr;
+    double          file_rate_hz = 0.0;   // 0 when the file doesn't say
+
+    // The rate to actually use: an explicit override beats file metadata,
+    // and 0 means "unknown", which callers must handle rather than divide by.
+    double effectiveHz() const {
+        if (spin && spin->value() > 0.0) {
+            const int ui = unit ? unit->currentIndex() : 0;
+            return spin->value() * kRateUnitMul[(ui >= 0 && ui < 4) ? ui : 0];
+        }
+        return file_rate_hz;
+    }
+};
+
+// scale_x is seconds/sample in TRS. A value of exactly 1.0 is the field's
+// default, i.e. "not set" — treating that as 1 sample/second would put every
+// frequency axis in the wrong place, so it counts as unknown.
+static double fileSampleRateHz(const TrsHeader& h) {
+    return (h.scale_x > 0.0f && h.scale_x < 1.0f)
+               ? 1.0 / static_cast<double>(h.scale_x) : 0.0;
+}
+
+static RateEntry addSampleRateRow(QFormLayout* fl, const TrsHeader& h) {
+    RateEntry re;
+    re.file_rate_hz = fileSampleRateHz(h);
+
+    re.spin = new QDoubleSpinBox;
+    re.spin->setRange(0.0, 1e7);
+    re.spin->setDecimals(4);
+    re.spin->setValue(0.0);
+    re.spin->setSpecialValueText(re.file_rate_hz > 0.0 ? "Use file metadata" : "Not set");
+    re.unit = new QComboBox;
+    for (const char* u : kRateUnitName) re.unit->addItem(u);
+    re.unit->setCurrentIndex(2);   // MHz — the usual SCA capture range
+
+    auto* row = new QWidget;
+    auto* hl  = new QHBoxLayout(row);
+    hl->setContentsMargins(0, 0, 0, 0);
+    hl->addWidget(re.spin);
+    hl->addWidget(re.unit);
+    fl->addRow("Sample rate:", row);
+
+    auto* hint = new QLabel(
+        re.file_rate_hz > 0.0
+            ? QString("File metadata implies %1 samples/sec — leave at 0 to use it.")
+                  .arg(re.file_rate_hz, 0, 'g', 6)
+            : QString("This file carries no sample rate. Set one here to enter "
+                       "frequencies in Hz; otherwise use × Nyquist."));
+    hint->setWordWrap(true);
+    hint->setStyleSheet("color: gray; font-size: 9pt;");
+    fl->addRow("", hint);
+    return re;
+}
+
+// A frequency the user types, in whichever unit they pick. Unit index 0 is
+// "× Nyquist" (the transforms' native unit, always available); 1-4 are real
+// frequencies and need a sample rate.
+struct FreqEntry {
+    QDoubleSpinBox* spin = nullptr;
+    QComboBox*      unit = nullptr;
+    QLabel*         echo = nullptr;
+
+    // Fraction of Nyquist, or -1 when the user asked for Hz and no sample
+    // rate is available to convert with.
+    double normalized(double fs_hz) const {
+        if (!spin || !unit) return -1.0;
+        const int ui = unit->currentIndex();
+        if (ui == 0) return spin->value();
+        if (fs_hz <= 0.0) return -1.0;
+        return hzToNormalized(spin->value() * kRateUnitMul[ui - 1], fs_hz);
+    }
+};
+
+// Keeps a live "= 0.1234 × Nyquist (= 12.3 MHz)" readout under a frequency
+// entry. Showing both numbers is the point: normalised frequency is what the
+// transform stores and what a saved chain replays, so the user needs to see it
+// even while typing MHz.
+static void wireFreqEcho(FreqEntry& fe, const RateEntry& re) {
+    auto update = [&fe, &re]() {
+        const double fs = re.effectiveHz();
+        const double nrm = fe.normalized(fs);
+        if (nrm < 0.0) {
+            fe.echo->setText("needs a sample rate to convert");
+            fe.echo->setStyleSheet("color: #c0392b; font-size: 9pt;");
+            return;
+        }
+        QString txt = QString("= %1 × Nyquist").arg(nrm, 0, 'f', 6);
+        if (fs > 0.0) {
+            const double hz = nrm * fs / 2.0;
+            int u = 0;
+            if      (hz >= 1e9) u = 3;
+            else if (hz >= 1e6) u = 2;
+            else if (hz >= 1e3) u = 1;
+            txt += QString("  (= %1 %2)").arg(hz / kRateUnitMul[u], 0, 'f', 4)
+                                          .arg(kRateUnitName[u]);
+        }
+        if (nrm >= 1.0) txt += "  — at or past Nyquist, will be ignored";
+        fe.echo->setText(txt);
+        fe.echo->setStyleSheet(nrm >= 1.0 ? "color: #c0392b; font-size: 9pt;"
+                                          : "color: gray; font-size: 9pt;");
+    };
+    QObject::connect(fe.spin, &QDoubleSpinBox::valueChanged, fe.echo, update);
+    QObject::connect(fe.unit, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                     fe.echo, update);
+    QObject::connect(re.spin, &QDoubleSpinBox::valueChanged, fe.echo, update);
+    QObject::connect(re.unit, QOverload<int>::of(&QComboBox::currentIndexChanged),
+                     fe.echo, update);
+    update();
+}
+
+static FreqEntry addFreqRow(QFormLayout* fl, const QString& label,
+                            const RateEntry& re, double default_value,
+                            int default_unit, const QString& tooltip) {
+    FreqEntry fe;
+    fe.spin = new QDoubleSpinBox;
+    fe.spin->setRange(0.0, 1e9);
+    fe.spin->setDecimals(6);
+    fe.spin->setValue(default_value);
+    fe.spin->setToolTip(tooltip);
+    fe.unit = new QComboBox;
+    fe.unit->addItem("× Nyquist");
+    for (const char* u : kRateUnitName) fe.unit->addItem(u);
+    fe.unit->setCurrentIndex(default_unit);
+
+    auto* row = new QWidget;
+    auto* hl  = new QHBoxLayout(row);
+    hl->setContentsMargins(0, 0, 0, 0);
+    hl->addWidget(fe.spin);
+    hl->addWidget(fe.unit);
+    fl->addRow(label, row);
+
+    fe.echo = new QLabel;
+    fe.echo->setWordWrap(true);
+    fl->addRow("", fe.echo);
+    wireFreqEcho(fe, re);
+    return fe;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Harmonic Notch — a comb of notches at f0, 2·f0, …
+// ---------------------------------------------------------------------------
+std::shared_ptr<ITransform> MainWindow::createHarmonicNotchTransform() {
+    TrsHeader h{};
+    if (hasActiveDs() && activeDs().file) h = activeDs().file->header();
+
+    QDialog d(this);
+    d.setWindowTitle("Harmonic Notch — parameters");
+    auto* fl = new QFormLayout(&d);
+
+    auto* warn = new QLabel(
+        "<b>Measure before and after.</b> Leakage is not confined to clock "
+        "harmonics, so a comb can remove signal as easily as interference. "
+        "Run SNR or a t-test both ways rather than assuming this helped.");
+    warn->setWordWrap(true);
+    warn->setStyleSheet("background:#fdf3e3; color:#7a4a00; padding:6px; "
+                        "border:1px solid #e0c48a; border-radius:3px;");
+    fl->addRow(warn);
+
+    RateEntry re = addSampleRateRow(fl, h);
+    FreqEntry f0 = addFreqRow(fl, "Fundamental f0:", re, 1.0, 3,
+        "The interferer's fundamental frequency. Notches land on this and its "
+        "multiples.");
+
+    auto* sp_n = new QSpinBox;
+    sp_n->setRange(1, 64);
+    sp_n->setValue(5);
+    sp_n->setToolTip("How many multiples of f0 to notch. Multiples at or past "
+                     "Nyquist are dropped rather than aliased, so asking for "
+                     "more than fit costs nothing.");
+    fl->addRow("Harmonics:", sp_n);
+
+    auto* chk_odd = new QCheckBox("Odd harmonics only (f0, 3·f0, 5·f0, …)");
+    chk_odd->setToolTip(
+        "A square-ish clock or a switching converter puts most of its energy "
+        "into odd multiples of f0. Notching the even ones then spends passband "
+        "— which is where the leakage lives — for very little return.");
+    fl->addRow("", chk_odd);
+
+    auto* sp_q = new QDoubleSpinBox;
+    sp_q->setRange(0.5, 200.0);
+    sp_q->setDecimals(1);
+    sp_q->setValue(25.0);
+    sp_q->setToolTip("Higher Q = narrower notch = less passband sacrificed, but "
+                     "it must still be wide enough to cover the line, and a very "
+                     "high Q rings for a long time in causal mode.");
+    fl->addRow("Q (notch sharpness):", sp_q);
+
+    auto* chk_zp = new QCheckBox("Zero-phase (recommended)");
+    chk_zp->setChecked(true);
+    chk_zp->setToolTip(
+        "A notch has the steepest phase slope of any second-order section, "
+        "right where you are operating. Causal, that delays nearby frequencies "
+        "by a varying amount and smears leakage along the sample axis, which "
+        "every analysis here indexes by. Forward-backward filtering cancels "
+        "the phase exactly.\n\n"
+        "Uncheck only if the trace is too long to process in one piece.");
+    fl->addRow("", chk_zp);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow(bb);
+    connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    if (d.exec() != QDialog::Accepted) return nullptr;
+
+    const double nrm = f0.normalized(re.effectiveHz());
+    if (nrm <= 0.0) {
+        QMessageBox::critical(this, "Harmonic Notch",
+            "f0 could not be resolved to a frequency.\n\n"
+            "Either set a sample rate, or enter f0 in × Nyquist units.");
+        return nullptr;
+    }
+    if (nrm >= 1.0) {
+        QMessageBox::critical(this, "Harmonic Notch",
+            QString("f0 works out to %1 × Nyquist, which is at or above the "
+                     "highest frequency this data can represent.\n\n"
+                     "Check the sample rate.").arg(nrm, 0, 'f', 4));
+        return nullptr;
+    }
+
+    auto tx = std::make_shared<HarmonicNotchTransform>(
+        static_cast<float>(nrm), sp_n->value(), static_cast<float>(sp_q->value()),
+        chk_odd->isChecked(), chk_zp->isChecked());
+    if (tx->activeNotches() == 0) {
+        QMessageBox::critical(this, "Harmonic Notch",
+                              "No notch fits below Nyquist at that f0.");
+        return nullptr;
+    }
+    return tx;
+}
+
+// ---------------------------------------------------------------------------
+// Spectral Line Excision — edit the spectrum directly
+// ---------------------------------------------------------------------------
+std::shared_ptr<ITransform> MainWindow::createSpectralExciseTransform(
+    const std::vector<SpectralBand>& initial)
+{
+    TrsHeader h{};
+    if (hasActiveDs() && activeDs().file) h = activeDs().file->header();
+
+    QDialog d(this);
+    d.setWindowTitle("Spectral Line Excision — bands");
+    d.resize(640, 520);
+    auto* vl = new QVBoxLayout(&d);
+
+    auto* blurb = new QLabel(
+        "Replaces the magnitude inside each band with the floor either side of "
+        "it, leaving phase untouched — so unlike a notch filter this costs "
+        "<i>no</i> phase distortion and no time-axis smearing, and can be as "
+        "narrow as a single bin. Needs the whole trace per pass.");
+    blurb->setWordWrap(true);
+    vl->addWidget(blurb);
+
+    auto* form = new QFormLayout;
+    vl->addLayout(form);
+    RateEntry re = addSampleRateRow(form, h);
+
+    auto* tbl = new QTableWidget(0, 3);
+    tbl->setHorizontalHeaderLabels({"Centre (× Nyquist)", "Half-width (× Nyquist)",
+                                     "Centre (Hz)"});
+    tbl->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    tbl->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tbl->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    vl->addWidget(tbl, 1);
+
+    // The table is the single source of truth; this vector mirrors it so the
+    // Hz column can be recomputed whenever the sample rate changes without
+    // re-parsing display strings.
+    auto bands = std::make_shared<std::vector<SpectralBand>>(initial);
+
+    auto refresh = [&, bands, tbl]() {
+        const double fs = re.effectiveHz();
+        tbl->setRowCount(static_cast<int>(bands->size()));
+        for (int i = 0; i < static_cast<int>(bands->size()); ++i) {
+            const SpectralBand& b = (*bands)[static_cast<size_t>(i)];
+            tbl->setItem(i, 0, new QTableWidgetItem(QString::number(b.center, 'f', 6)));
+            tbl->setItem(i, 1, new QTableWidgetItem(QString::number(b.halfwidth, 'f', 6)));
+            QString hz = "—";
+            if (fs > 0.0) {
+                const double f = b.center * fs / 2.0;
+                int u = 0;
+                if      (f >= 1e9) u = 3;
+                else if (f >= 1e6) u = 2;
+                else if (f >= 1e3) u = 1;
+                hz = QString("%1 %2").arg(f / kRateUnitMul[u], 0, 'f', 4)
+                                      .arg(kRateUnitName[u]);
+            }
+            tbl->setItem(i, 2, new QTableWidgetItem(hz));
+        }
+    };
+    connect(re.spin, &QDoubleSpinBox::valueChanged, &d, [&]() { refresh(); });
+    connect(re.unit, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            &d, [&]() { refresh(); });
+
+    // --- Add one band -----------------------------------------------------
+    auto* add_form = new QFormLayout;
+    vl->addLayout(add_form);
+    FreqEntry fe_c = addFreqRow(add_form, "Add — centre:", re, 1.0, 3,
+        "Centre frequency of the line to remove.");
+    auto* sp_hw = new QDoubleSpinBox;
+    sp_hw->setRange(1e-7, 0.5);
+    sp_hw->setDecimals(7);
+    sp_hw->setValue(0.001);
+    sp_hw->setToolTip(
+        "Half-width, in fractions of Nyquist. Err on the generous side: an "
+        "interferer that does not land exactly on an FFT bin has its energy "
+        "spread across neighbours by the window's sinc skirts, and too narrow "
+        "a band leaves a visible residue.");
+    add_form->addRow("Add — half-width (× Nyquist):", sp_hw);
+
+    auto* btn_add   = new QPushButton("Add band");
+    auto* btn_comb  = new QPushButton("Add harmonic comb…");
+    auto* btn_del   = new QPushButton("Remove selected");
+    auto* btn_clear = new QPushButton("Clear all");
+    auto* hl_btn = new QHBoxLayout;
+    hl_btn->addWidget(btn_add);
+    hl_btn->addWidget(btn_comb);
+    hl_btn->addWidget(btn_del);
+    hl_btn->addWidget(btn_clear);
+    hl_btn->addStretch();
+    vl->addLayout(hl_btn);
+
+    connect(btn_add, &QPushButton::clicked, &d, [&, bands]() {
+        const double nrm = fe_c.normalized(re.effectiveHz());
+        if (nrm <= 0.0 || nrm >= 1.0) {
+            QMessageBox::warning(&d, "Spectral Excision",
+                "That centre frequency isn't usable — it must resolve to "
+                "somewhere strictly between DC and Nyquist.");
+            return;
+        }
+        bands->push_back(SpectralBand{nrm, sp_hw->value()});
+        refresh();
+    });
+
+    connect(btn_comb, &QPushButton::clicked, &d, [&, bands]() {
+        const double nrm = fe_c.normalized(re.effectiveHz());
+        if (nrm <= 0.0 || nrm >= 1.0) {
+            QMessageBox::warning(&d, "Spectral Excision",
+                "Set a usable centre frequency first — it is taken as the "
+                "comb's fundamental.");
+            return;
+        }
+        bool ok = false;
+        const int n = QInputDialog::getInt(&d, "Harmonic comb",
+            "How many multiples of the centre frequency?\n"
+            "(Multiples at or past Nyquist are dropped.)", 5, 1, 64, 1, &ok);
+        if (!ok) return;
+        const bool odd = QMessageBox::question(&d, "Harmonic comb",
+            "Odd harmonics only?\n\n"
+            "A square-ish clock or switching converter puts most of its energy "
+            "into odd multiples, so skipping the even ones preserves passband.",
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) == QMessageBox::Yes;
+        auto comb = harmonicComb(nrm, sp_hw->value(), n, odd);
+        bands->insert(bands->end(), comb.begin(), comb.end());
+        refresh();
+    });
+
+    connect(btn_del, &QPushButton::clicked, &d, [&, bands, tbl]() {
+        auto rows = tbl->selectionModel()->selectedRows();
+        std::vector<int> idx;
+        for (const auto& r : rows) idx.push_back(r.row());
+        std::sort(idx.rbegin(), idx.rend());
+        for (int i : idx)
+            if (i >= 0 && i < static_cast<int>(bands->size()))
+                bands->erase(bands->begin() + i);
+        refresh();
+    });
+
+    connect(btn_clear, &QPushButton::clicked, &d, [&, bands]() {
+        bands->clear();
+        refresh();
+    });
+
+    auto* cmb_phase = new QComboBox;
+    cmb_phase->addItem("Keep original phase");
+    cmb_phase->addItem("Randomise phase");
+    cmb_phase->setToolTip(
+        "Keeping the phase rewrites only each bin's magnitude, which leaves "
+        "the rest of the trace untouched and is the least surprising choice.\n\n"
+        "Randomising decorrelates the replacement from the interferer, which "
+        "matters when the line is strong enough that even a floor-level "
+        "residue at its original phase would still correlate across traces.");
+    auto* phase_form = new QFormLayout;
+    phase_form->addRow("Phase:", cmb_phase);
+    vl->addLayout(phase_form);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    vl->addWidget(bb);
+    connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+
+    refresh();
+    if (d.exec() != QDialog::Accepted) return nullptr;
+    if (bands->empty()) {
+        QMessageBox::information(this, "Spectral Excision",
+            "No bands were listed, so this stage would do nothing — not added.");
+        return nullptr;
+    }
+    return std::make_shared<SpectralExciseTransform>(
+        *bands,
+        cmb_phase->currentIndex() == 1 ? SpectralExciseTransform::PhaseMode::Randomize
+                                       : SpectralExciseTransform::PhaseMode::Preserve);
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Leakage vs Frequency — a t-test run per (time window, frequency bin)
+//
+// The counterpart to spectral line detection, and the reason the detector can
+// afford to be conservative. The detector answers "what narrowband energy is
+// in this capture"; this answers "which of it actually leaks". A tall line
+// that shows no t-statistic is interference, and excising it costs nothing;
+// a band that lights up here is signal, and filtering it away would be the
+// expensive mistake.
+//
+// It is also the frequency scan described in the screaming-channel literature,
+// where exploitable leakage was found spread over hundreds of MHz — and where
+// non-harmonic frequencies regularly beat the clock harmonics that
+// interference-focused hardening assumes are the only thing worth protecting.
+//
+// The STFT is applied here rather than being left to the pipeline, so the
+// window/bin geometry is known exactly and the result can be reshaped back
+// into a time-frequency plane instead of arriving as one flat vector.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct SpectralLeakageOut {
+    std::vector<float> t_plane;     // n_windows x n_bins, row-major
+    std::vector<float> max_abs_t;   // per bin, reduced over all windows
+    int32_t n_windows = 0;
+    int32_t n_bins    = 0;
+    int64_t n_group[2] = {0, 0};
+    int32_t skipped   = 0;
+    int32_t discarded = 0;
+    QString err;
+
+    // Every shift actually applied. Its spread is the *residual* misalignment
+    // this run had to live with, and that is the number which decides whether
+    // the time axis of the result means anything — see the warning that
+    // onRunSpectralLeakage() builds from it.
+    std::vector<int32_t> shift_seen;
+    double  shift_stddev = 0.0;
+    int32_t shift_span   = 0;
+};
+
+bool computeSpectralLeakageCore(
+    TrsFile* file,
+    const std::vector<std::shared_ptr<ITransform>>& pipeline,
+    int32_t first, int32_t count,
+    int64_t eff_first_sample, int64_t raw_ns,
+    int32_t byte_idx, int stft_window, int stft_hop, int win_fn,
+    const std::vector<int32_t>& shifts, int32_t shifts_first_trace,
+    int64_t read_lo, int64_t read_hi,
+    const std::function<bool(int64_t, int64_t)>& progress,
+    SpectralLeakageOut& out)
+{
+    const TrsHeader& h = file->header();
+    if (read_hi <= read_lo) { read_lo = 0; read_hi = h.num_samples; }
+
+    // Geometry is fixed up front from the *processed* sample count, so every
+    // trace contributes the same shape and the flat accumulator can be folded
+    // back into a plane at the end.
+    int64_t processed = raw_ns;
+    for (const auto& t : pipeline) processed = t->transformedCount(processed);
+
+    STFTMagnitudeTransform stft(stft_window, stft_hop,
+                                 static_cast<STFTMagnitudeTransform::Window>(win_fn));
+    const int64_t n_bins    = stft_window / 2 + 1;
+    const int64_t total     = stft.transformedCount(processed);
+    const int64_t n_windows = (n_bins > 0) ? total / n_bins : 0;
+    if (n_windows < 1) {
+        out.err = "The selected region is shorter than one STFT window after "
+                   "the pipeline. Use a smaller window or a wider region.";
+        return false;
+    }
+
+    TTestAccumulator acc(static_cast<int32_t>(total));
+    std::vector<float> buf(static_cast<size_t>(std::max<int64_t>(raw_ns, total)));
+
+    for (int32_t ti = 0; ti < count; ++ti) {
+        if (progress && !progress(ti, count)) { out.err = "Cancelled."; return false; }
+
+        const int32_t src_idx = first + ti;
+        auto data_bytes = file->readData(src_idx);
+        if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { out.skipped++; continue; }
+        const int group = (data_bytes[static_cast<size_t>(byte_idx)] != 0) ? 1 : 0;
+
+        // Per-trace alignment shift, looked up by the trace's position in the
+        // *alignment's own* range rather than by ti — `first` may start
+        // anywhere inside it. Same contract as the t-test: a trace outside
+        // that range, or one the aligner marked discarded, is excluded
+        // entirely rather than used unshifted.
+        int32_t shift = 0;
+        if (!shifts.empty()) {
+            const int64_t si = static_cast<int64_t>(src_idx) - shifts_first_trace;
+            if (si < 0 || si >= static_cast<int64_t>(shifts.size())) {
+                out.discarded++; continue;
+            }
+            shift = shifts[static_cast<size_t>(si)];
+            if (shift == kAlignDiscardShift) { out.discarded++; continue; }
+        }
+        out.shift_seen.push_back(shift);
+
+        const int64_t adj_start = eff_first_sample + shift;
+        std::fill(buf.begin(), buf.end(), 0.0f);
+        if (adj_start < read_hi && adj_start + raw_ns > read_lo) {
+            const int64_t s0  = std::max<int64_t>(read_lo, adj_start);
+            const int64_t s1  = std::min<int64_t>(read_hi, adj_start + raw_ns);
+            const int64_t off = s0 - adj_start;
+            if (file->readSamples(src_idx, s0, s1 - s0, buf.data() + off) <= 0) {
+                out.skipped++; continue;
+            }
+        }
+
+        for (const auto& t : pipeline) t->reset();
+        int64_t n = raw_ns;
+        for (const auto& t : pipeline) n = t->apply(buf.data(), n, 0);
+
+        stft.reset();
+        n = stft.apply(buf.data(), n, 0);
+        if (n != total) { out.skipped++; continue; }
+        acc.addTrace(group, buf.data(), static_cast<int32_t>(total));
+    }
+
+    std::vector<float> tv;
+    std::string cerr;
+    if (!acc.compute(tv, cerr)) { out.err = QString::fromStdString(cerr); return false; }
+
+    // Residual-misalignment summary. A spread comparable to (or larger than)
+    // the STFT window means an event does not stay inside one window across
+    // traces, so its energy is split between neighbouring windows and both
+    // t-statistics are diluted.
+    if (!out.shift_seen.empty()) {
+        double mean = 0.0;
+        for (int32_t v : out.shift_seen) mean += v;
+        mean /= static_cast<double>(out.shift_seen.size());
+        double var = 0.0;
+        for (int32_t v : out.shift_seen) { const double d = v - mean; var += d * d; }
+        out.shift_stddev = std::sqrt(var / static_cast<double>(out.shift_seen.size()));
+        const auto mm = std::minmax_element(out.shift_seen.begin(), out.shift_seen.end());
+        out.shift_span = *mm.second - *mm.first;
+    }
+
+    out.n_windows  = static_cast<int32_t>(n_windows);
+    out.n_bins     = static_cast<int32_t>(n_bins);
+    out.n_group[0] = acc.countGroup(0);
+    out.n_group[1] = acc.countGroup(1);
+    out.t_plane    = std::move(tv);
+
+    // Collapse time away: the largest |t| any window reached at each
+    // frequency. Max rather than mean because leakage is usually confined to a
+    // few windows — the moment the operation of interest happens — and
+    // averaging over a long quiet capture would bury it.
+    out.max_abs_t.assign(static_cast<size_t>(n_bins), 0.0f);
+    for (int64_t w = 0; w < n_windows; ++w)
+        for (int64_t b = 0; b < n_bins; ++b) {
+            const float v = std::abs(out.t_plane[static_cast<size_t>(w * n_bins + b)]);
+            if (v > out.max_abs_t[static_cast<size_t>(b)])
+                out.max_abs_t[static_cast<size_t>(b)] = v;
+        }
+    return true;
+}
+
+} // namespace
+
+void MainWindow::onRunSpectralLeakage() {
+    if (!hasActiveDs() || activeDs().is_result) {
+        QMessageBox::information(this, "Leakage vs Frequency", "No file loaded.");
+        return;
+    }
+    const TrsHeader& h = activeDs().file->header();
+    if (h.data_length <= 0) {
+        QMessageBox::critical(this, "Leakage vs Frequency",
+            "This TRS file has no per-trace data bytes.\n"
+            "A fixed-vs-random group label is needed, exactly as for the t-test.");
+        return;
+    }
+
+    const int n_total = h.num_traces;
+    QDialog cfg(this);
+    cfg.setWindowTitle("Leakage vs Frequency — configuration");
+    auto* fl = new QFormLayout(&cfg);
+
+    auto* blurb = new QLabel(
+        "Runs a Welch t-test at every (time window, frequency bin) of an STFT, "
+        "then reports the largest |t| each frequency ever reached.<br><br>"
+        "Use it to tell interference from signal before filtering anything: a "
+        "tall spectral line with no t-statistic is safe to excise, whereas a "
+        "band that lights up here is the leakage itself.");
+    blurb->setWordWrap(true);
+    fl->addRow(blurb);
+
+    auto* sp_first = new QSpinBox; sp_first->setRange(0, std::max(0, n_total - 1));
+    auto* sp_count = new QSpinBox; sp_count->setRange(2, n_total); sp_count->setValue(n_total);
+    fl->addRow("First trace:", sp_first);
+    fl->addRow("Count:", sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, n_total);
+
+    auto* sp_s_first = new QSpinBox;
+    sp_s_first->setRange(0, std::max(0, static_cast<int>(h.num_samples) - 1));
+    auto* sp_s_count = new QSpinBox;
+    sp_s_count->setRange(0, static_cast<int>(h.num_samples));
+    sp_s_count->setSpecialValueText("All");
+    fl->addRow("First sample:", sp_s_first);
+    fl->addRow("Sample count (0=all):", sp_s_count);
+
+    const bool have_param = h.param_map.count("ttest") > 0;
+    auto* sp_byte = new QSpinBox;
+    sp_byte->setRange(0, std::max(0, h.data_length - 1));
+    sp_byte->setValue(have_param
+        ? static_cast<int>(h.param_map.at("ttest").offset) : 0);
+    sp_byte->setEnabled(!have_param);
+    sp_byte->setToolTip("Group label byte: zero means group 0, anything else group 1 "
+                         "— the same rule the t-test uses.");
+    fl->addRow(have_param ? "Group byte (from \"ttest\" param):" : "Group byte:", sp_byte);
+
+    auto* sp_win = new QSpinBox;
+    sp_win->setRange(8, 65536);
+    sp_win->setValue(256);
+    sp_win->setToolTip("STFT window length. Longer = finer frequency resolution but "
+                        "coarser in time, and fewer windows to take a maximum over.");
+    fl->addRow("STFT window:", sp_win);
+
+    auto* sp_ov = new QDoubleSpinBox;
+    sp_ov->setRange(0.0, 0.95);
+    sp_ov->setDecimals(2);
+    sp_ov->setValue(0.5);
+    sp_ov->setToolTip("Window overlap. More overlap means more time windows, so a "
+                       "short leakage event is less likely to straddle a boundary "
+                       "and be split between two windows.");
+    fl->addRow("Overlap:", sp_ov);
+
+    auto* cmb_fn = new QComboBox;
+    cmb_fn->addItems({"Rectangular", "Hann", "Hamming", "Blackman"});
+    cmb_fn->setCurrentIndex(1);
+    fl->addRow("Window function:", cmb_fn);
+
+    RateEntry re = addSampleRateRow(fl, h);
+
+    const bool has_alignment = (activeDs().align_n_samples > 0);
+    const int  n_discarded = static_cast<int>(std::count(
+        activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
+    QSpinBox*  sp_tile  = nullptr;
+    QCheckBox* chk_crop = nullptr;
+    QCheckBox* chk_align = addAlignmentGroup(fl, has_alignment,
+        activeDs().align_first_trace, static_cast<int>(activeDs().align_shifts.size()),
+        n_discarded, activeDs().align_tile_size, h.num_samples,
+        activeDs().align_baked_tile, sp_first, sp_count, &sp_tile, &chk_crop);
+
+    // The one thing that most often makes this analysis lie. STFT magnitude
+    // discards phase, and a time shift is a phase ramp, so misalignment
+    // *smaller than the window* is largely absorbed — which is why
+    // frequency-domain SCA is often sold as alignment-free. That only holds
+    // while the leaking event stays inside the same window across traces.
+    // Once the residual jitter pushes it over a window boundary, its energy
+    // splits between two windows and both t-statistics are diluted.
+    auto* jitter_note = new QLabel(
+        "<b>With jittered traces, size the window for the jitter.</b> "
+        "STFT magnitude absorbs a shift smaller than one window — that is why "
+        "frequency-domain analysis tolerates misalignment at all — but only "
+        "while the leaking event stays inside the same window in every trace. "
+        "Aim for a window several times the residual shift spread, and raise "
+        "the overlap to 0.75 so an event near a boundary is still well inside "
+        "some window.<br><br>"
+        "If you aligned on a single pattern, alignment holds near that anchor "
+        "and decays away from it. Read the time-frequency map before trusting "
+        "the time axis: |t| falling off symmetrically either side of the "
+        "anchor is an alignment artefact, not a property of the device.");
+    jitter_note->setWordWrap(true);
+    jitter_note->setStyleSheet("background:#fdf3e3; color:#7a4a00; padding:6px; "
+                                "border:1px solid #e0c48a; border-radius:3px;");
+    fl->addRow(jitter_note);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow(bb);
+    connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    if (cfg.exec() != QDialog::Accepted) return;
+
+    const bool use_alignment = chk_align->isChecked();
+    std::vector<int32_t> use_shifts;
+    int64_t read_lo = 0, read_hi = 0;
+    if (use_alignment) {
+        ResolvedAlignment resolved =
+            resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
+        use_shifts = resolved.shifts;
+        // Tiled alignment: clamp reads to this tile's own bounds so a shift
+        // cannot pull in a neighbouring tile's samples.
+        if (activeDs().align_tile_size > 0) {
+            read_lo = resolved.first_sample;
+            read_hi = resolved.first_sample + resolved.n_samples;
+        }
+    }
+    const int32_t shifts_first_trace = activeDs().align_first_trace;
+
+    const int32_t first  = sp_first->value();
+    const int32_t count  = sp_count->value();
+    const int32_t byte_i = sp_byte->value();
+    const int     wlen   = sp_win->value();
+    const int     hop    = std::max(1, static_cast<int>(
+                              std::llround(wlen * (1.0 - sp_ov->value()))));
+    const int     win_fn = cmb_fn->currentIndex();
+    const double  fs_hz  = re.effectiveHz();
+
+    const int64_t eff_first_sample = sp_s_first->value();
+    const int64_t raw_ns = (sp_s_count->value() == 0)
+        ? (h.num_samples - eff_first_sample)
+        : std::min<int64_t>(sp_s_count->value(), h.num_samples - eff_first_sample);
+
+    std::shared_ptr<TrsFile> job_file = activeDs().file;
+    std::vector<std::shared_ptr<ITransform>> job_pipeline;
+    for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
+
+    auto out = std::make_shared<SpectralLeakageOut>();
+    const QString title = QString("Leakage vs Frequency — %1 (%2 traces)")
+                              .arg(activeDs().display_name).arg(count);
+
+    jobs_->submit(title,
+        [=](JobContext& ctx) {
+            return computeSpectralLeakageCore(
+                job_file.get(), job_pipeline, first, count,
+                eff_first_sample, raw_ns, byte_i, wlen, hop, win_fn,
+                use_shifts, shifts_first_trace, read_lo, read_hi,
+                [&ctx](int64_t done, int64_t total) {
+                    ctx.setProgress(done, total);
+                    return !ctx.cancelled();
+                }, *out);
+        },
+        [=](bool ok) {
+            if (!ok) {
+                if (!out->err.isEmpty() && out->err != "Cancelled.")
+                    QMessageBox::critical(this, "Leakage vs Frequency failed", out->err);
+                return;
+            }
+            if (out->skipped > 0 || out->discarded > 0)
+                QMessageBox::warning(this, "Leakage vs Frequency",
+                    QString("%1 trace(s) skipped, %2 excluded by the alignment.")
+                        .arg(out->skipped).arg(out->discarded));
+
+            // Say plainly whether the window was big enough for the residual
+            // jitter. Getting this wrong does not fail loudly — it just
+            // quietly lowers every t-statistic, which reads as "no leakage".
+            if (out->shift_stddev > 0.0) {
+                const double ratio = static_cast<double>(wlen) / out->shift_stddev;
+                if (ratio < 4.0) {
+                    QMessageBox::warning(this, "Leakage vs Frequency",
+                        QString("Residual misalignment is large for this window.\n\n"
+                                 "Shift spread: σ = %1 samples (full span %2), "
+                                 "STFT window: %3 samples — only %4× σ.\n\n"
+                                 "A leaking event will not stay inside the same window "
+                                 "across traces, so its energy is split between "
+                                 "neighbouring windows and every |t| here is diluted. "
+                                 "A flat result does not mean the device does not leak.\n\n"
+                                 "Try a window of at least %5 samples, raise the overlap "
+                                 "to 0.75, or align per tile so the alignment holds across "
+                                 "the whole region rather than only near one anchor.")
+                            .arg(out->shift_stddev, 0, 'f', 1)
+                            .arg(out->shift_span)
+                            .arg(wlen)
+                            .arg(ratio, 0, 'f', 1)
+                            .arg(static_cast<int64_t>(std::ceil(out->shift_stddev * 8.0))));
+                }
+            }
+
+            auto curve = std::make_shared<std::vector<float>>(out->max_abs_t);
+            addResultTab(*curve,
+                QString("Leakage vs Frequency — %1/%2 traces, STFT %3, %4 windows%5")
+                    .arg(out->n_group[0]).arg(out->n_group[1])
+                    .arg(wlen).arg(out->n_windows)
+                    .arg(out->shift_stddev > 0.0
+                             ? QString(", shift σ=%1").arg(out->shift_stddev, 0, 'f', 1)
+                             : QString()),
+                QColor("#e05c8a"), "max |t|");
+
+            PlotWidget* pw = plotWidget();
+            pw->setTraceFilled(0, true);
+            // One-sided threshold: this curve is already |t|, so the usual
+            // symmetric +-4.5 pair would put a line below the axis floor.
+            pw->setThresholdOneSided(true);
+            pw->setThresholds(true, 4.5, -4.5);
+
+            // Bin k of an STFT of length `wlen` sits at k * fs/wlen.
+            if (fs_hz > 0.0) {
+                const double df      = fs_hz / static_cast<double>(wlen);
+                const double nyquist = fs_hz / 2.0;
+                double  us = 1.0; QString un = "Hz";
+                if      (nyquist >= 1e9) { us = 1e9; un = "GHz"; }
+                else if (nyquist >= 1e6) { us = 1e6; un = "MHz"; }
+                else if (nyquist >= 1e3) { us = 1e3; un = "kHz"; }
+                pw->setXScale(df / us, 0.0);
+                pw->setAxisLabels(QString("Frequency (%1)").arg(un), "max |t|");
+            } else {
+                pw->setAxisLabels("Frequency Bin", "max |t|");
+            }
+            pw->resetView();
+
+            // The collapsed curve says *which* frequencies leak; the plane says
+            // when. Both matter — a band that only lights up in one window is a
+            // specific operation, whereas one lit throughout is more likely a
+            // property of the whole capture.
+            auto* btn_map = new QPushButton("Time-frequency map…");
+            const int32_t nw = out->n_windows, nb = out->n_bins;
+            auto plane = std::make_shared<std::vector<float>>(out->t_plane);
+            connect(btn_map, &QPushButton::clicked, pw, [this, plane, nw, nb, wlen]() {
+                auto* dlg = new QDialog(this);
+                dlg->setAttribute(Qt::WA_DeleteOnClose);
+                dlg->setWindowTitle(QString("Leakage t-plane — %1 windows × %2 bins")
+                                        .arg(nw).arg(nb));
+                dlg->resize(1100, 620);
+                auto* hm = new HeatmapWidget(dlg);
+                hm->setMatrix(*plane, nw, nb);
+                hm->setAbsValue(true);        // sign is not informative here
+                auto* v = new QVBoxLayout(dlg);
+                auto* lbl = new QLabel(QString(
+                    "Rows: STFT time windows (0 = start of the region). "
+                    "Columns: frequency bins, 0 = DC, %1 = Nyquist. "
+                    "Brightness is |t|.").arg(nb - 1));
+                lbl->setWordWrap(true);
+                v->addWidget(lbl);
+                v->addWidget(hm, 1);
+                v->addWidget(makeHeatmapAnnotateRow(hm, nw, nb, dlg));
+                dlg->show();
+            });
+            if (QWidget* bar = activeDs().extra_toolbar) {
+                if (auto* lay = qobject_cast<QHBoxLayout*>(bar->layout()))
+                    lay->insertWidget(0, btn_map);
+                else
+                    btn_map->setParent(bar);
+            } else {
+                btn_map->setParent(pw);
+                btn_map->move(8, 8);
+                btn_map->show();
+            }
+        });
+}
+
+// ---------------------------------------------------------------------------
+// Periodic Subtract — synchronous averaging of a periodic interferer
+// ---------------------------------------------------------------------------
+std::shared_ptr<ITransform> MainWindow::createPeriodicSubtractTransform() {
+    TrsHeader h{};
+    if (hasActiveDs() && activeDs().file) h = activeDs().file->header();
+    const double fs = fileSampleRateHz(h);
+
+    QDialog d(this);
+    d.setWindowTitle("Periodic Subtract — parameters");
+    auto* fl = new QFormLayout(&d);
+
+    auto* blurb = new QLabel(
+        "Folds the trace at the interferer's period, averages to recover its "
+        "waveform, and subtracts that. Removes the fundamental <i>and every "
+        "harmonic</i> in one pass, including whatever was never sinusoidal — "
+        "and unlike a comb of notches it leaves no holes in the spectrum.<br><br>"
+        "This works because the crypto operation is triggered and so repeats at "
+        "the <i>trace</i> rate, while a free-running interferer repeats at its "
+        "own. If the two are locked together — a converter clocked by the "
+        "device, say — this will remove signal, so check SNR or a t-test both "
+        "ways.");
+    blurb->setWordWrap(true);
+    fl->addRow(blurb);
+
+    RateEntry re = addSampleRateRow(fl, h);
+
+    auto* cmb_mode = new QComboBox;
+    cmb_mode->addItem("Detect the period automatically");
+    cmb_mode->addItem("Period, in samples");
+    cmb_mode->addItem("Interferer frequency");
+    fl->addRow("Specify by:", cmb_mode);
+
+    auto* sp_period = new QDoubleSpinBox;
+    sp_period->setRange(2.0, 1e9);
+    sp_period->setDecimals(4);
+    sp_period->setValue(1000.0);
+    sp_period->setToolTip("Period in samples. Fractional values are supported and "
+                          "often necessary — a switcher's period rarely lands on a "
+                          "whole number of samples.");
+    fl->addRow("Period (samples):", sp_period);
+
+    FreqEntry fe = addFreqRow(fl, "Interferer frequency:", re, 2.0, 3,
+        "The interferer's fundamental. Converted to a period using the sample "
+        "rate above.");
+
+    auto* sp_lo = new QSpinBox;
+    sp_lo->setRange(2, 10000000);
+    sp_lo->setValue(8);
+    auto* sp_hi = new QSpinBox;
+    sp_hi->setRange(3, 10000000);
+    sp_hi->setValue(std::max(16, static_cast<int>(std::min<int64_t>(h.num_samples / 2, 100000))));
+    sp_lo->setToolTip("Shortest period the automatic search will consider, in samples.");
+    sp_hi->setToolTip("Longest period the automatic search will consider. Capped at "
+                       "half the trace either way — a longer period leaves too few "
+                       "repetitions to average.");
+    fl->addRow("Auto: min period (samples):", sp_lo);
+    fl->addRow("Auto: max period (samples):", sp_hi);
+
+    auto* sp_corr = new QDoubleSpinBox;
+    sp_corr->setRange(0.0, 1.0);
+    sp_corr->setDecimals(2);
+    sp_corr->setValue(0.30);
+    sp_corr->setToolTip("How convincing the periodicity must be before anything is "
+                         "subtracted. Below this, the trace is left untouched — "
+                         "subtracting a template built from a period that isn't "
+                         "really there would just add shaped noise.");
+    fl->addRow("Auto: min correlation:", sp_corr);
+
+    auto sync = [&]() {
+        const int m = cmb_mode->currentIndex();
+        sp_period->setEnabled(m == 1);
+        fe.spin->setEnabled(m == 2);
+        fe.unit->setEnabled(m == 2);
+        fe.echo->setVisible(m == 2);
+        sp_lo->setEnabled(m == 0);
+        sp_hi->setEnabled(m == 0);
+        sp_corr->setEnabled(m == 0);
+    };
+    connect(cmb_mode, QOverload<int>::of(&QComboBox::currentIndexChanged), &d,
+            [&](int) { sync(); });
+    sync();
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow(bb);
+    connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    if (d.exec() != QDialog::Accepted) return nullptr;
+
+    double period = 0.0;      // 0 = auto
+    const int mode = cmb_mode->currentIndex();
+    if (mode == 1) {
+        period = sp_period->value();
+    } else if (mode == 2) {
+        const double eff_fs = re.effectiveHz() > 0.0 ? re.effectiveHz() : fs;
+        const double nrm = fe.normalized(eff_fs);
+        if (nrm <= 0.0 || eff_fs <= 0.0) {
+            QMessageBox::critical(this, "Periodic Subtract",
+                "Converting a frequency to a period needs a sample rate.\n\n"
+                "Set one, or specify the period in samples instead.");
+            return nullptr;
+        }
+        // period = fs / f, and f = nrm * fs/2, so period = 2 / nrm.
+        period = 2.0 / nrm;
+        if (period < 2.0) {
+            QMessageBox::critical(this, "Periodic Subtract",
+                "That frequency is at or above Nyquist — its period would be "
+                "under two samples, which this data cannot represent.");
+            return nullptr;
+        }
+    }
+
+    if (sp_hi->value() <= sp_lo->value() && mode == 0) {
+        QMessageBox::critical(this, "Periodic Subtract",
+                              "The maximum period must exceed the minimum.");
+        return nullptr;
+    }
+    return std::make_shared<PeriodicSubtractTransform>(
+        period, sp_lo->value(), sp_hi->value(), sp_corr->value());
+}
+
+// ---------------------------------------------------------------------------
+// Demodulate — shift a band to baseband and take its envelope
+// ---------------------------------------------------------------------------
+std::shared_ptr<ITransform> MainWindow::createDemodulateTransform() {
+    TrsHeader h{};
+    if (hasActiveDs() && activeDs().file) h = activeDs().file->header();
+
+    QDialog d(this);
+    d.setWindowTitle("Demodulate — parameters");
+    auto* fl = new QFormLayout(&d);
+
+    auto* blurb = new QLabel(
+        "For when a carrier is not interference but the <i>transport</i>. On a "
+        "mixed-signal chip, switching noise couples into the RF front end and is "
+        "amplified, modulated onto the carrier and broadcast — notching it there "
+        "would delete the signal. This selects the band around the carrier, "
+        "shifts it to baseband and reports its envelope.<br><br>"
+        "The same applies to clock-harmonic sidebands, where the activity is at "
+        "f<sub>clk</sub> ± n/T rather than at f<sub>clk</sub> itself — so centre "
+        "on the sideband, and make the bandwidth wide enough to contain it.");
+    blurb->setWordWrap(true);
+    fl->addRow(blurb);
+
+    RateEntry re = addSampleRateRow(fl, h);
+    FreqEntry fc = addFreqRow(fl, "Centre frequency:", re, 0.5, 0,
+        "Centre of the band to bring down to baseband — the carrier, or the "
+        "sideband you are after.");
+    FreqEntry bw = addFreqRow(fl, "Half-bandwidth:", re, 0.05, 0,
+        "How far either side of the centre to keep. Too narrow clips the "
+        "modulation and flattens the envelope; too wide lets neighbouring "
+        "interference back in. Start around the modulation bandwidth you expect.");
+
+    auto* cmb_out = new QComboBox;
+    cmb_out->addItem("Envelope (magnitude)");
+    cmb_out->addItem("Baseband (real part)");
+    cmb_out->setToolTip(
+        "Envelope is the usual choice and is what an AM demodulator produces — "
+        "the information rides on the carrier's amplitude.\n\n"
+        "Baseband keeps the band shifted down but still oscillating, which is "
+        "occasionally what you want to correlate against.");
+    fl->addRow("Output:", cmb_out);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    fl->addRow(bb);
+    connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+    if (d.exec() != QDialog::Accepted) return nullptr;
+
+    const double fs   = re.effectiveHz();
+    const double c    = fc.normalized(fs);
+    const double band = bw.normalized(fs);
+    if (c < 0.0 || band <= 0.0) {
+        QMessageBox::critical(this, "Demodulate",
+            "Centre and bandwidth could not both be resolved.\n\n"
+            "Either set a sample rate, or enter them in × Nyquist units.");
+        return nullptr;
+    }
+    if (c > 1.0) {
+        QMessageBox::critical(this, "Demodulate",
+            QString("The centre works out to %1 × Nyquist, above the highest "
+                     "frequency this data can represent.").arg(c, 0, 'f', 4));
+        return nullptr;
+    }
+    return std::make_shared<ComplexDemodulateTransform>(
+        static_cast<float>(c), static_cast<float>(band),
+        cmb_out->currentIndex() == 1 ? ComplexDemodulateTransform::Output::Baseband
+                                     : ComplexDemodulateTransform::Output::Envelope);
 }
 
 // ---------------------------------------------------------------------------
@@ -6658,6 +8105,22 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
                          "Bandpass/Notch: higher Q = narrower band/notch.");
         fl->addRow("Q:", sp_q);
 
+        auto* chk_zp = new QCheckBox("Zero-phase (filter forwards then backwards)");
+        chk_zp->setChecked(false);
+        chk_zp->setToolTip(
+            "A causal filter does not merely attenuate — it delays different "
+            "frequencies by different amounts, and a high-Q notch's delay "
+            "spikes right at the notch. Since the t-test, CPA, SNR and "
+            "alignment are all indexed by sample, that smears leakage along "
+            "the time axis and can look like a real change in where the "
+            "device leaks.\n\n"
+            "Running the filter forwards and then backwards cancels the phase "
+            "exactly: no delay, no smearing. Two things change:\n"
+            "  • the stop band gets twice as deep in dB, so design for half\n"
+            "  • the whole trace is needed at once, so a chunked export "
+            "switches to whole-trace reads");
+        fl->addRow("", chk_zp);
+
         auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
         fl->addRow(bb);
         connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
@@ -6672,9 +8135,15 @@ std::shared_ptr<ITransform> MainWindow::createTransform(int idx) {
             case 3: type = FT::Notch;    break;
             default: break;
         }
-        return std::make_shared<BiquadFilterTransform>(
+        auto filt = std::make_shared<BiquadFilterTransform>(
             type, static_cast<float>(sp_cutoff->value()), static_cast<float>(sp_q->value()));
+        filt->setZeroPhase(chk_zp->isChecked());
+        return filt;
     }
+    case 11: return createHarmonicNotchTransform();
+    case 12: return createSpectralExciseTransform();
+    case 13: return createPeriodicSubtractTransform();
+    case 14: return createDemodulateTransform();
     default: return nullptr;
     }
 }
@@ -9521,6 +10990,11 @@ void MainWindow::onRunFFT() {
         // files; if meaningful (or overridden above), show a real frequency
         // axis instead of raw bin indices.
         const bool has_freq_axis = file_has_freq_axis || rate_override_hz > 0.0;
+        // Same resolution the axis uses, hoisted out so the line detector
+        // below can report frequencies in Hz too. 0 = unknown.
+        const double fs_hz = (rate_override_hz > 0.0)
+            ? rate_override_hz
+            : (file_has_freq_axis ? 1.0 / static_cast<double>(h.scale_x) : 0.0);
         QString x_label;
         double  x_scale = 1.0;   // passed to setXScale() below — Hz per bin, in whatever unit x_label names
         if (has_freq_axis) {
@@ -9611,7 +11085,25 @@ void MainWindow::onRunFFT() {
                 painter.drawPixmap(painter.viewport(), px);
         });
 
+        // Phase output has no magnitude floor to stand a line against, so
+        // detection is only offered for the magnitude modes.
+        auto* btn_lines = new QPushButton("Detect spectral lines…");
+        btn_lines->setToolTip(
+            out_mode == 2
+                ? QString("Not available on a phase spectrum — re-run with a "
+                          "magnitude output.")
+                : QString("Find narrowband interference (radio carriers, "
+                          "switching-converter harmonics, reference clocks) "
+                          "standing above the local noise floor, and optionally "
+                          "excise it."));
+        btn_lines->setEnabled(out_mode != 2);
+        connect(btn_lines, &QPushButton::clicked, dlg, [=]() {
+            showSpectralLineDialog(dlg, pw, avg_ptr, /*spec_is_db=*/out_mode == 1,
+                                    fft_in_n, fs_hz);
+        });
+
         auto* hl = new QHBoxLayout;
+        hl->addWidget(btn_lines);
         hl->addWidget(btn_exp_npy);
         hl->addWidget(btn_exp_pdf);
         hl->addStretch();

@@ -19,7 +19,10 @@ result — each in its own tab, several files at a time.
 - **Viewing** — lazily memory-mapped browser, pan/zoom/measure, stacked lanes
 - **Pipeline** — filters, resampling, FFT/STFT, applied live to every analysis
 - **Alignment** — peak and cross-correlation, including per-tile alignment
-- **Analyses** — Welch t-test (TVLA), CPA, SNR, cross-correlation, FFT
+- **Analyses** — Welch t-test (TVLA), CPA, SNR, cross-correlation, FFT,
+  leakage-vs-frequency
+- **Interference** — find narrowband carriers, switcher combs and clock
+  harmonics, then excise, notch, subtract or demodulate them
 - **Export** — TRS, NPY, NPZ, plus a dataset export with labels
 - **Chains** — save a whole workflow and replay it with one click
 

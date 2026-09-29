@@ -183,6 +183,7 @@ private slots:
     void onRunCpa();
     void onRunSNR();
     void onRunStaticSNR();
+    void onRunSpectralLeakage();
     void onRunFFT();
     void onExportDataset();
     void onDragAlignChanged();
@@ -197,6 +198,36 @@ private:
     void updateTraceDataDisplay();
     void rebuildTransformList();
     std::shared_ptr<ITransform> createTransform(int combo_index);
+    // Split out of createTransform()'s switch because, unlike the other
+    // stages, these two are configured in real frequency units and so need
+    // the sample-rate plumbing (and, for excision, a band table) that would
+    // otherwise bloat that switch past reading.
+    std::shared_ptr<ITransform> createHarmonicNotchTransform();
+    std::shared_ptr<ITransform> createSpectralExciseTransform(
+        const std::vector<SpectralBand>& initial = {});
+    std::shared_ptr<ITransform> createPeriodicSubtractTransform();
+    std::shared_ptr<ITransform> createDemodulateTransform();
+
+    // Narrowband-line detection over an averaged spectrum, launched from the
+    // FFT result window. Detection has to come before removal: notching an
+    // assumed harmonic comb can delete leakage just as easily as interference,
+    // so this reports what is measurably there and hands the chosen lines to
+    // createSpectralExciseTransform().
+    //
+    // spec is the displayed spectrum (dB or linear per spec_is_db); fft_in_n
+    // is the transform length behind it, needed to turn bins into Hz; fs_hz is
+    // 0 when the sample rate is unknown, in which case bins are shown raw.
+    void showSpectralLineDialog(QWidget* parent, PlotWidget* pw,
+                                 std::shared_ptr<std::vector<float>> spec,
+                                 bool spec_is_db, int64_t fft_in_n, double fs_hz);
+
+    // Where showSpectralLineDialog()'s noise-floor overlay sits in the FFT
+    // plot's trace list, so a re-detect replaces it instead of stacking
+    // another copy. -1 = nothing overlaid.
+    int baseline_trace_marker_ = -1;
+
+    // Shared tail of onAddTransform() — see its definition.
+    void addTransformToPipeline(std::shared_ptr<ITransform> tx);
     static QString recentDir(const QString& key);
     static void    updateRecentDir(const QString& key, const QString& file_path);
     void saveSnapshot();

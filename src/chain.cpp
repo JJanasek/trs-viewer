@@ -9,10 +9,12 @@
 // Mirrors combo_transform_'s item list in mainwindow.cpp exactly (index ==
 // transform_type). Kept here rather than shared so chain.cpp/.h stay
 // independent of MainWindow's Qt widget setup.
-static const char* kTransformNames[11] = {
+static constexpr int kNumTransformTypes = 15;
+static const char* kTransformNames[kNumTransformTypes] = {
     "Absolute Value", "Negate", "Moving Average", "Window Resample (avg)",
     "Stride Resample", "Offset", "Scale", "FFT Magnitude", "STFT Magnitude",
-    "Gaussian Noise", "Filter",
+    "Gaussian Noise", "Filter", "Harmonic Notch", "Spectral Excise",
+    "Periodic Subtract", "Demodulate",
 };
 
 // ---------------------------------------------------------------------------
@@ -21,7 +23,7 @@ static const char* kTransformNames[11] = {
 QString ChainStep::summary() const {
     switch (kind) {
     case Kind::AddTransform: {
-        QString name = (transform_type >= 0 && transform_type < 11)
+        QString name = (transform_type >= 0 && transform_type < kNumTransformTypes)
             ? QString(kTransformNames[transform_type]) : QString("Unknown transform");
         switch (transform_type) {
         case 2: return QString("Add Transform → %1 (window=%2)").arg(name).arg(i_window);
@@ -34,8 +36,27 @@ QString ChainStep::summary() const {
         case 8: return QString("Add Transform → %1 (window=%2, hop=%3)")
                     .arg(name).arg(i_window).arg(i_hop);
         case 9: return QString("Add Transform → %1 (σ=%2)").arg(name).arg(d_value);
-        case 10: return QString("Add Transform → %1 (type#%2, cutoff=%3, Q=%4)")
-                    .arg(name).arg(i_choice).arg(d_cutoff, 0, 'f', 3).arg(d_q, 0, 'f', 2);
+        case 10: return QString("Add Transform → %1 (type#%2, cutoff=%3, Q=%4%5)")
+                     .arg(name).arg(i_choice).arg(d_cutoff).arg(d_q)
+                     .arg(zero_phase ? ", zero-phase" : "");
+        case 11: return QString("Add Transform → %1 (f0=%2, %3%4, Q=%5, %6)")
+                     .arg(name).arg(d_cutoff).arg(n_harmonics)
+                     .arg(odd_only ? " odd" : "").arg(d_q)
+                     .arg(zero_phase ? "zero-phase" : "causal");
+        case 12: {
+            std::vector<SpectralBand> b;
+            decodeSpectralBands(bands.toStdString(), b);
+            return QString("Add Transform → %1 (%2 band%3, %4 phase)")
+                     .arg(name).arg(b.size()).arg(b.size() == 1 ? "" : "s")
+                     .arg(phase_mode == 1 ? "random" : "keep");
+        }
+        case 13: return d_period > 0.0
+                     ? QString("Add Transform → %1 (T=%2 samples)").arg(name).arg(d_period)
+                     : QString("Add Transform → %1 (auto T in [%2, %3])")
+                           .arg(name).arg(period_min).arg(period_max);
+        case 14: return QString("Add Transform → %1 (f=%2, BW=±%3, %4)")
+                     .arg(name).arg(d_cutoff).arg(d_bandwidth)
+                     .arg(i_choice == 1 ? "baseband" : "envelope");
         default: return QString("Add Transform → %1").arg(name);
         }
     }
@@ -107,9 +128,36 @@ std::shared_ptr<ITransform> buildTransformFromStep(const ChainStep& step) {
                  step.i_window, step.i_hop,
                  static_cast<STFTMagnitudeTransform::Window>(step.i_choice));
     case 9: return std::make_shared<GaussianNoiseTransform>(static_cast<float>(step.d_value));
-    case 10: return std::make_shared<BiquadFilterTransform>(
-                 static_cast<BiquadFilterTransform::FilterType>(step.i_choice),
-                 static_cast<float>(step.d_cutoff), static_cast<float>(step.d_q));
+    case 10: {
+        auto f = std::make_shared<BiquadFilterTransform>(
+                     static_cast<BiquadFilterTransform::FilterType>(step.i_choice),
+                     static_cast<float>(step.d_cutoff), static_cast<float>(step.d_q));
+        f->setZeroPhase(step.zero_phase);
+        return f;
+    }
+    case 11: return std::make_shared<HarmonicNotchTransform>(
+                 static_cast<float>(step.d_cutoff), step.n_harmonics,
+                 static_cast<float>(step.d_q), step.odd_only, step.zero_phase);
+    case 12: {
+        std::vector<SpectralBand> b;
+        // A band list that fails to parse would silently become a no-op stage,
+        // which is the safe direction: an excision that does nothing is far
+        // better than one applied to bands nobody asked for.
+        decodeSpectralBands(step.bands.toStdString(), b);
+        return std::make_shared<SpectralExciseTransform>(
+                   std::move(b),
+                   step.phase_mode == 1 ? SpectralExciseTransform::PhaseMode::Randomize
+                                        : SpectralExciseTransform::PhaseMode::Preserve);
+    }
+    case 13: return std::make_shared<PeriodicSubtractTransform>(
+                 step.d_period, step.period_min, step.period_max, step.d_period_corr);
+    case 14: return std::make_shared<ComplexDemodulateTransform>(
+                 static_cast<float>(step.d_cutoff), static_cast<float>(step.d_bandwidth),
+                 step.i_choice == 1 ? ComplexDemodulateTransform::Output::Baseband
+                                    : ComplexDemodulateTransform::Output::Envelope);
+    // A chain written by a newer build can name a transform this one has never
+    // heard of. Returning nullptr lets the caller report that step as
+    // unavailable instead of replaying something arbitrary in its place.
     default: return nullptr;
     }
 }
@@ -158,9 +206,42 @@ ChainStep describeTransformStep(int transform_type, const ITransform& tx) {
         break;
     case 10: {
         const auto& t = static_cast<const BiquadFilterTransform&>(tx);
-        s.i_choice = static_cast<int>(t.type());
-        s.d_cutoff = t.cutoff();
-        s.d_q      = t.q();
+        s.i_choice   = static_cast<int>(t.type());
+        s.d_cutoff   = t.cutoff();
+        s.d_q        = t.q();
+        s.zero_phase = t.zeroPhase();
+        break;
+    }
+    case 11: {
+        const auto& t = static_cast<const HarmonicNotchTransform&>(tx);
+        s.d_cutoff    = t.f0();
+        s.n_harmonics = t.harmonics();
+        s.d_q         = t.q();
+        s.odd_only    = t.oddOnly();
+        s.zero_phase  = t.zeroPhase();
+        break;
+    }
+    case 12: {
+        const auto& t = static_cast<const SpectralExciseTransform&>(tx);
+        s.bands      = QString::fromStdString(encodeSpectralBands(t.bands()));
+        s.phase_mode =
+            (t.phaseMode() == SpectralExciseTransform::PhaseMode::Randomize) ? 1 : 0;
+        break;
+    }
+    case 13: {
+        const auto& t = static_cast<const PeriodicSubtractTransform&>(tx);
+        s.d_period      = t.period();
+        s.period_min    = t.autoMin();
+        s.period_max    = t.autoMax();
+        s.d_period_corr = t.autoMinCorrelation();
+        break;
+    }
+    case 14: {
+        const auto& t = static_cast<const ComplexDemodulateTransform&>(tx);
+        s.d_cutoff    = t.center();
+        s.d_bandwidth = t.bandwidth();
+        s.i_choice    =
+            (t.output() == ComplexDemodulateTransform::Output::Baseband) ? 1 : 0;
         break;
     }
     default:
@@ -214,6 +295,16 @@ bool saveChain(const QString& path, const std::vector<ChainStep>& steps, QString
             o["d_q"]       = s.d_q;
             o["d_cutoff"]  = s.d_cutoff;
             o["i_choice"]  = s.i_choice;
+            o["zero_phase"]  = s.zero_phase;
+            o["odd_only"]    = s.odd_only;
+            o["n_harmonics"] = s.n_harmonics;
+            o["phase_mode"]  = s.phase_mode;
+            o["bands"]       = s.bands;
+            o["d_period"]      = s.d_period;
+            o["period_min"]    = static_cast<double>(s.period_min);
+            o["period_max"]    = static_cast<double>(s.period_max);
+            o["d_period_corr"] = s.d_period_corr;
+            o["d_bandwidth"]   = s.d_bandwidth;
             break;
         case ChainStep::Kind::ClearPipeline:
         case ChainStep::Kind::Reload:
@@ -312,6 +403,16 @@ bool loadChain(const QString& path, std::vector<ChainStep>& steps, QString& err)
             s.d_q       = o.value("d_q").toDouble();
             s.d_cutoff  = o.value("d_cutoff").toDouble();
             s.i_choice  = o.value("i_choice").toInt();
+            s.zero_phase  = o.value("zero_phase").toBool(false);
+            s.odd_only    = o.value("odd_only").toBool(false);
+            s.n_harmonics = o.value("n_harmonics").toInt(1);
+            s.phase_mode  = o.value("phase_mode").toInt(0);
+            s.bands       = o.value("bands").toString();
+            s.d_period      = o.value("d_period").toDouble(0.0);
+            s.period_min    = static_cast<int64_t>(o.value("period_min").toDouble(8));
+            s.period_max    = static_cast<int64_t>(o.value("period_max").toDouble(100000));
+            s.d_period_corr = o.value("d_period_corr").toDouble(0.3);
+            s.d_bandwidth   = o.value("d_bandwidth").toDouble(0.0);
             break;
         case ChainStep::Kind::ClearPipeline:
         case ChainStep::Kind::Reload:

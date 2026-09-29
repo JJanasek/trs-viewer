@@ -112,6 +112,15 @@ public:
     void addTrace(std::shared_ptr<std::vector<float>> data,
                   QColor color, const QString& label = {}, bool no_pipeline = false);
     void clearTraces();
+    // How many traces are currently shown, and a way to drop a trailing run of
+    // them. Needed by overlays that are added and removed repeatedly on top of
+    // a plot someone else owns — the spectral-line detector's noise-floor
+    // curve, which must not stack a new copy on every re-detect, and must not
+    // take the underlying spectrum (or its min/max envelope) with it when it
+    // goes. Out-of-range values are clamped, so removeTracesFrom(-1) is a
+    // harmless no-op for callers whose "nothing added yet" marker is -1.
+    int  traceCount() const { return static_cast<int>(traces_.size()); }
+    void removeTracesFrom(int first);
     void setTransforms(const std::vector<std::shared_ptr<ITransform>>& tx);
 
     void setTheme(const PlotTheme& theme);
