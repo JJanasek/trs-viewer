@@ -25,4 +25,4 @@ Results are shown in a table and previewed in a separate plot. Click **Apply to 
 
 Alternatively, use the **↔ Drag-shift** drag mode in the main toolbar — drag any trace left or right to manually shift it one sample at a time.
 
-Once alignment is applied (either method), the stored shifts are available to all SCA tools. Every SCA dialog shows an **"Apply last alignment shifts"** checkbox (pre-ticked when shifts are available) that locks the trace/sample range to the aligned values and applies per-trace shifts during analysis. Alignment state is automatically cleared when a new file is loaded or the trace set is changed.
+Once alignment is applied (either method), the stored shifts are available to all SCA tools. Every SCA dialog shows an **"Apply last alignment shifts"** checkbox (pre-ticked when shifts are available) that locks the trace/sample range to the aligned values and applies per-trace shifts during analysis. Alignment state belongs to the file: it survives Reload Traces with a different range and is only reset when the file is opened again. To drop it by hand, click **Discard** in the side panel's *Alignment & View* box (undoable with Ctrl+Z).

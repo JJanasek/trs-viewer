@@ -236,6 +236,7 @@ private:
     // Status bar, window title, tab labels and side-panel enablement — all
     // derived from the active dataset's state. Called from updateUndoButton().
     void updateStateIndicators();
+    void onDiscardAlignment();
 
     // Switches the active plot's interaction mode back to Pan and re-checks
     // the "Pan" toolbar button (unchecking "↔ Align"/Measure/Box Zoom via
@@ -436,6 +437,11 @@ private:
     QLabel*       lbl_state_        = nullptr;   // status-bar state summary
     QWidget*      grp_trace_        = nullptr;   // disabled on result tabs
     QWidget*      grp_pipeline_     = nullptr;   // disabled on result tabs
+    QWidget*      grp_align_        = nullptr;   // alignment + live/baked state
+    QLabel*       lbl_align_state_  = nullptr;
+    QPushButton*  btn_align_discard_ = nullptr;
+    QLabel*       lbl_view_state_   = nullptr;
+    QPushButton*  btn_go_live_      = nullptr;
     int           theme_idx_        = 0;         // 0 = dark, 1 = light; persisted
     QButtonGroup* mode_group_       = nullptr;
 

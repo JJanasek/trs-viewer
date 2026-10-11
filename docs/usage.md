@@ -23,9 +23,22 @@
 The status bar always shows the active tab's state: which traces are drawn
 out of how many, how many pipeline steps are applied, whether an alignment
 is stored, and **Baked** when the view is a frozen "Apply to Main View" copy
-(click **Reload Traces** to go back to the live view). Baked tabs are also
+(click **Back to Live View** in the side panel to return to the live view). Baked tabs are also
 marked `[baked]` in the tab bar, and result tabs (t-test, SNR, …) are drawn
 in a different colour.
+
+
+## Alignment & View panel
+
+Below the pipeline, the side panel shows the alignment stored for the
+active file, which Reload, export and the analyses all reuse, and whether
+the plot is live or baked.
+
+- **Align…** opens Process › Align Traces.
+- **Discard** forgets the stored alignment, so everything goes back to
+  unshifted traces. Ctrl+Z undoes it.
+- **Back to Live View** appears only while the view is baked. It replaces the
+  frozen copy with live, file-backed traces and keeps the alignment.
 
 
 ## Interaction modes

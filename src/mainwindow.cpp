@@ -247,6 +247,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     list_transforms_ = new QListWidget;
     list_transforms_->setSelectionMode(QAbstractItemView::SingleSelection);
+    list_transforms_->setMaximumHeight(140);   // leave room for Alignment & View below
 
     QHBoxLayout* tx_btns = new QHBoxLayout;
     btn_add_tx_ = new QPushButton("Add");
@@ -266,6 +267,35 @@ MainWindow::MainWindow(QWidget* parent)
     txl->addWidget(combo_transform_);
     txl->addWidget(list_transforms_);
     txl->addLayout(tx_btns);
+
+    // Alignment & view state — the layers on top of the pipeline that used
+    // to be invisible: a stored alignment (reused by reload, export and the
+    // analyses) and whether the plot is a baked "Apply to Main View" copy.
+    QGroupBox*   grp_align = new QGroupBox("Alignment && View");
+    grp_align_ = grp_align;
+    QVBoxLayout* al        = new QVBoxLayout(grp_align);
+    lbl_align_state_ = new QLabel("No alignment");
+    lbl_align_state_->setWordWrap(true);
+    auto* btn_align_run = new QPushButton("Align…");
+    btn_align_run->setToolTip("Open Process › Align Traces");
+    connect(btn_align_run, &QPushButton::clicked, this, &MainWindow::onAlignTraces);
+    btn_align_discard_ = new QPushButton("Discard");
+    btn_align_discard_->setToolTip("Forget the stored alignment, so reload, export and the "
+                                   "analyses use unshifted traces again (Ctrl+Z undoes)");
+    connect(btn_align_discard_, &QPushButton::clicked, this, &MainWindow::onDiscardAlignment);
+    auto* align_btns = new QHBoxLayout;
+    align_btns->addWidget(btn_align_run);
+    align_btns->addWidget(btn_align_discard_);
+    lbl_view_state_ = new QLabel;
+    lbl_view_state_->setWordWrap(true);
+    btn_go_live_ = new QPushButton("Back to Live View");
+    btn_go_live_->setToolTip("Replace the baked \"Apply to Main View\" copy with the live, "
+                             "file-backed traces. The alignment is kept and shown as shifts.");
+    connect(btn_go_live_, &QPushButton::clicked, this, &MainWindow::onApplyTraces);
+    al->addWidget(lbl_align_state_);
+    al->addLayout(align_btns);
+    al->addWidget(lbl_view_state_);
+    al->addWidget(btn_go_live_);
 
     // Trace data inspector
     QGroupBox*   grp_data = new QGroupBox("Trace Data");
@@ -309,6 +339,7 @@ MainWindow::MainWindow(QWidget* parent)
     side_l->addWidget(grp_file);
     side_l->addWidget(grp_trace);
     side_l->addWidget(grp_tx);
+    side_l->addWidget(grp_align);
     side_l->addWidget(grp_meas);
     side_l->addWidget(lbl_view_);
     side_l->addWidget(grp_data);
@@ -1036,6 +1067,7 @@ void MainWindow::updateStateIndicators() {
         if (lbl_state_) lbl_state_->setText("No file open — File › Open TRS File… (Ctrl+O)");
         if (grp_trace_)    grp_trace_->setEnabled(false);
         if (grp_pipeline_) grp_pipeline_->setEnabled(false);
+        if (grp_align_)    grp_align_->setEnabled(false);
         return;
     }
 
@@ -1043,8 +1075,12 @@ void MainWindow::updateStateIndicators() {
     const bool file_tab = !ds.is_result && ds.file;
     if (grp_trace_)    grp_trace_->setEnabled(file_tab);
     if (grp_pipeline_) grp_pipeline_->setEnabled(file_tab);
+    if (grp_align_)    grp_align_->setEnabled(file_tab);
 
     if (!file_tab) {
+        if (lbl_align_state_) lbl_align_state_->setText("–");
+        if (lbl_view_state_)  lbl_view_state_->clear();
+        if (btn_go_live_)     btn_go_live_->setVisible(false);
         setWindowTitle(ds.display_name + " — TRS Viewer");
         if (lbl_state_) lbl_state_->setText("Analysis result");
         return;
@@ -1052,6 +1088,39 @@ void MainWindow::updateStateIndicators() {
 
     const bool aligned = !ds.align_shifts.empty();
     const bool baked   = !ds.plot_file_backed;
+
+    if (lbl_align_state_) {
+        if (aligned) {
+            int32_t max_abs = 0;
+            size_t  discarded = 0;
+            for (int32_t v : ds.align_shifts) {
+                if (v == kAlignDiscardShift) { discarded++; continue; }
+                max_abs = std::max(max_abs, v < 0 ? -v : v);
+            }
+            const QLocale l;
+            QString txt;
+            if (ds.align_tile_size > 0) {
+                txt = QString("Tiled alignment · tile %1 samples").arg(l.toString(ds.align_tile_size));
+            } else {
+                txt = QString("%1 traces from #%2 · samples %3–%4")
+                          .arg(l.toString(static_cast<qlonglong>(ds.align_shifts.size())))
+                          .arg(ds.align_first_trace)
+                          .arg(l.toString(static_cast<qlonglong>(ds.align_first_sample)))
+                          .arg(l.toString(static_cast<qlonglong>(ds.align_first_sample + ds.align_n_samples)));
+            }
+            txt += QString("\nMax shift ±%1").arg(max_abs);
+            if (discarded) txt += QString(" · %1 discarded").arg(discarded);
+            lbl_align_state_->setText(txt);
+        } else {
+            lbl_align_state_->setText("No alignment");
+        }
+    }
+    if (btn_align_discard_) btn_align_discard_->setEnabled(aligned);
+    if (lbl_view_state_)
+        lbl_view_state_->setText(baked ? "View: <b>Baked</b> — a frozen aligned copy, rebuilt "
+                                         "after pipeline edits"
+                                       : "View: Live (read from the file)");
+    if (btn_go_live_) btn_go_live_->setVisible(baked);
     QStringList parts;
     const QLocale loc;
     const int total = ds.file->header().num_traces;
@@ -1068,13 +1137,28 @@ void MainWindow::updateStateIndicators() {
                                   : QString("Pipeline: %1 step%2").arg(ds.pipeline.size())
                                         .arg(ds.pipeline.size() == 1 ? "" : "s"));
     parts << (aligned ? "Aligned" : "Not aligned");
-    if (baked) parts << "<b>Baked</b> (Reload Traces to go live)";
+    if (baked) parts << "<b>Baked</b> (Back to Live View to undo)";
     if (lbl_state_) lbl_state_->setText(parts.join("  ·  "));
 
     QString title = ds.display_name;
     if (baked)        title += " (baked)";
     else if (aligned) title += " (aligned)";
     setWindowTitle(title + " — TRS Viewer");
+}
+
+void MainWindow::onDiscardAlignment() {
+    if (!hasActiveDs() || activeDs().is_result || activeDs().align_shifts.empty()) return;
+    saveSnapshot();   // undoable — snapshots carry every align_* field
+    Dataset& ds = activeDs();
+    ds.align_shifts.clear();
+    ds.align_first_trace  = 0;
+    ds.align_first_sample = 0;
+    ds.align_n_samples    = 0;
+    ds.align_tile_size    = 0;
+    ds.align_baked_tile   = 0;
+    // A baked view *is* the alignment, so it goes back to live too; a live
+    // view just loses its displayed shifts. onApplyTraces() covers both.
+    onApplyTraces();
 }
 
 void MainWindow::resetInteractionModeToPan() {
@@ -1376,6 +1460,7 @@ void MainWindow::onDragAlignChanged() {
     // prior tiled alignment's leftover align_tile_size would otherwise make
     // resolveAlignmentTile() misinterpret it via tiled indexing.
     activeDs().align_tile_size    = 0;
+    updateStateIndicators();
 }
 
 void MainWindow::rebakeAlignedView() {
