@@ -45,6 +45,10 @@
 #include <QPushButton>
 #include <QShortcut>
 #include <QRadioButton>
+#include <QGuiApplication>
+#include <QScreen>
+#include <QScrollArea>
+#include <QScrollBar>
 #include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSplitter>
@@ -119,7 +123,15 @@ MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
     setWindowTitle("TRS Viewer");
-    resize(1440, 860);
+    // Never open larger than the screen's usable area — a window created
+    // bigger than the work area is mis-placed and can't be maximized or
+    // tiled properly under GNOME/Mutter.
+    {
+        QSize want(1440, 860);
+        if (QScreen* scr = QGuiApplication::primaryScreen())
+            want = want.boundedTo(scr->availableGeometry().size() * 0.95);
+        resize(want);
+    }
 
     // Background analysis jobs + the dock that reports them.
     jobs_ = new JobManager(this);
@@ -303,10 +315,14 @@ MainWindow::MainWindow(QWidget* parent)
     right_l->setSpacing(2);
 
     // Toolbar row
-    QWidget*     toolbar   = new QWidget;
-    QHBoxLayout* toolbar_l = new QHBoxLayout(toolbar);
+    // FlowLayout, not QHBoxLayout: a single row of every button forces a
+    // ~1300 px minimum window width, which on a scaled display (GNOME at
+    // 125-150%) is wider than half or even all of the screen — the window
+    // then refuses to shrink, tile or fit. Wrapping onto a second row lets
+    // it get as narrow as the user likes.
+    QWidget*    toolbar   = new QWidget;
+    FlowLayout* toolbar_l = new FlowLayout(toolbar, /*margin=*/0, /*h_spacing=*/4, /*v_spacing=*/2);
     toolbar_l->setContentsMargins(4, 2, 4, 2);
-    toolbar_l->setSpacing(4);
 
     // Mode buttons (checkable, exclusive)
     btn_mode_pan_      = new QPushButton("Pan");
@@ -420,7 +436,6 @@ MainWindow::MainWindow(QWidget* parent)
     toolbar_l->addWidget(sep3);
     toolbar_l->addWidget(new QLabel("Theme:"));
     toolbar_l->addWidget(combo_theme_);
-    toolbar_l->addStretch();
 
     // "Tile Vertically" — show every open tab's plot stacked at once instead
     // of one at a time. Independent of everything else on the toolbar.
@@ -436,29 +451,10 @@ MainWindow::MainWindow(QWidget* parent)
     tab_bar_->setTabsClosable(true);
     tab_bar_->setMovable(true);
     tab_bar_->setExpanding(false);
+    tab_bar_->setUsesScrollButtons(true);
     connect(tab_bar_, &QTabBar::currentChanged, this, &MainWindow::onSwitchDataset);
     connect(tab_bar_, &QTabBar::tabMoved, this, &MainWindow::onTabMoved);
-    connect(tab_bar_, &QTabBar::tabCloseRequested, this, [this](int idx) {
-        // Select a neighbour before removing so onSwitchDataset fires cleanly.
-        if (tab_bar_->count() > 1) {
-            int next = (idx > 0) ? idx - 1 : 1;
-            tab_bar_->setCurrentIndex(next);
-        }
-        datasets_[static_cast<size_t>(idx)].plot_widget->deleteLater();
-        if (datasets_[static_cast<size_t>(idx)].extra_toolbar)
-            datasets_[static_cast<size_t>(idx)].extra_toolbar->deleteLater();
-        datasets_.erase(datasets_.begin() + idx);
-        tab_bar_->removeTab(idx);
-        // Recompute active_idx_ after removal.
-        active_idx_ = tab_bar_->currentIndex();
-        if (active_idx_ < 0) {
-            // No datasets left
-            active_idx_ = -1;
-            updateFileInfo();
-            rebuildTransformList();
-        }
-        updateViewLayout();
-    });
+    connect(tab_bar_, &QTabBar::tabCloseRequested, this, &MainWindow::closeDatasetAt);
 
     // View container: holds every tab's own PlotWidget. Single-view mode
     // shows only the active one; tiled mode stacks all of them.
@@ -474,7 +470,18 @@ MainWindow::MainWindow(QWidget* parent)
     right_l->addWidget(toolbar);
     right_l->addWidget(view_container_, 1);
 
-    splitter->addWidget(side);
+    // Scrollable so the panel's stacked group boxes don't impose their full
+    // height as the window's minimum height on short (laptop) screens.
+    auto* side_scroll = new QScrollArea;
+    side_scroll->setWidget(side);
+    side_scroll->setWidgetResizable(true);
+    side_scroll->setFrameShape(QFrame::NoFrame);
+    side_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    const int sb_w = side_scroll->verticalScrollBar()->sizeHint().width();
+    side_scroll->setMinimumWidth(side->minimumWidth() + sb_w);
+    side_scroll->setMaximumWidth(side->maximumWidth() + sb_w);
+
+    splitter->addWidget(side_scroll);
     splitter->addWidget(right_pane);
     splitter->setStretchFactor(0, 0);
     splitter->setStretchFactor(1, 1);
@@ -536,24 +543,54 @@ void MainWindow::onSwitchDataset(int idx) {
 }
 
 void MainWindow::onCloseDataset() {
-    if (!hasActiveDs()) return;
-    int idx = active_idx_;
-    if (tab_bar_->count() > 1) {
-        int next = (idx > 0) ? idx - 1 : 1;
-        tab_bar_->setCurrentIndex(next);
+    if (hasActiveDs()) closeDatasetAt(active_idx_);
+}
+
+// Shared by File > Close Dataset and the tab bar's close button.
+void MainWindow::closeDatasetAt(int idx) {
+    if (idx < 0 || idx >= static_cast<int>(datasets_.size())) return;
+
+    // Detach the dying widgets first. The PlotWidget holds raw TrsFile*
+    // pointers into ds.file, which is released by the erase below, while
+    // deleteLater() only destroys the widget on the next event-loop pass —
+    // a repaint or its wheel-debounce timer in between would read unmapped
+    // memory. Emptying it now leaves nothing to dereference.
+    Dataset& ds = datasets_[static_cast<size_t>(idx)];
+    PlotWidget* pw = ds.plot_widget;
+    QWidget*    tb = ds.extra_toolbar;
+    if (pw) {
+        disconnect(pw, nullptr, this, nullptr);   // e.g. a pending debounced viewChanged
+        view_layout_->removeWidget(pw);
+        pw->hide();
+        pw->clearTraces();
+        pw->deleteLater();
     }
-    datasets_[static_cast<size_t>(idx)].plot_widget->deleteLater();
-    if (datasets_[static_cast<size_t>(idx)].extra_toolbar)
-        datasets_[static_cast<size_t>(idx)].extra_toolbar->deleteLater();
+    if (tb) {
+        view_layout_->removeWidget(tb);
+        tb->hide();
+        tb->deleteLater();
+    }
+
+    // removeTab() emits currentChanged(), which lands in onSwitchDataset()
+    // and indexes datasets_, so the tab bar and datasets_ must agree before
+    // it runs. Block that signal and settle active_idx_ ourselves instead.
     datasets_.erase(datasets_.begin() + idx);
-    tab_bar_->removeTab(idx);
-    active_idx_ = tab_bar_->currentIndex();
-    if (active_idx_ < 0 || datasets_.empty()) {
-        active_idx_ = -1;
+    {
+        QSignalBlocker block(tab_bar_);
+        tab_bar_->removeTab(idx);
+    }
+
+    // Force onSwitchDataset() to treat the surviving tab as new and refresh
+    // the side panel for it.
+    active_idx_ = -1;
+    if (datasets_.empty()) {
         updateFileInfo();
         rebuildTransformList();
+        updateUndoButton();
+        updateViewLayout();
+    } else {
+        onSwitchDataset(tab_bar_->currentIndex());
     }
-    updateViewLayout();
 }
 
 // ---------------------------------------------------------------------------
@@ -1424,6 +1461,7 @@ void MainWindow::onThemeChanged(int index) {
 
 void MainWindow::rebuildTransformList() {
     list_transforms_->clear();
+    if (!hasActiveDs()) return;
     for (int i = 0; i < static_cast<int>(activeDs().pipeline.size()); i++) {
         list_transforms_->addItem(
             QString("%1. %2").arg(i + 1)

@@ -259,6 +259,7 @@ private:
     // Arranges tab widgets in the view container: only the active tab's
     // widget when single-view, every tab's widget stacked when tiled_.
     void updateViewLayout();
+    void closeDatasetAt(int idx);
     // Finds which dataset owns `pw` (its plot_widget), or -1.
     int  datasetIndexForWidget(PlotWidget* pw) const;
     // If `pw` belongs to a non-active tab, makes it active (side panel only
