@@ -224,7 +224,15 @@ bool currentThemeIsDark() { return g_dark; }
 bool themeChoiceIsDark(ThemeChoice c) {
     if (c == ThemeChoice::Dark)  return true;
     if (c == ThemeChoice::Light) return false;
-    return QGuiApplication::styleHints()->colorScheme() == Qt::ColorScheme::Dark;
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    const Qt::ColorScheme cs = QGuiApplication::styleHints()->colorScheme();
+    if (cs != Qt::ColorScheme::Unknown) return cs == Qt::ColorScheme::Dark;
+#endif
+    // Qt < 6.5 (or a platform that doesn't report a scheme): judge by the
+    // desktop palette the app started with, before our own palette is set.
+    static const bool dark_desktop =
+        QGuiApplication::palette().color(QPalette::Window).lightness() < 128;
+    return dark_desktop;
 }
 
 void applyAppTheme(bool dark) {

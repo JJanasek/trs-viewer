@@ -344,10 +344,13 @@ MainWindow::MainWindow(QWidget* parent)
 
     theme_idx_ = std::clamp(QSettings("trs-viewer", "trs-viewer").value("ui/theme", 2).toInt(), 0, 2);
     applyAppTheme(themeChoiceIsDark(static_cast<ThemeChoice>(theme_idx_)));
-    // "System" follows the desktop's light/dark switch live.
+#if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
+    // "System" follows the desktop's light/dark switch live (Qt 6.5+; older
+    // Qt picks the scheme once at startup, see themeChoiceIsDark()).
     connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this]() {
         if (theme_idx_ == static_cast<int>(ThemeChoice::System)) onThemeChanged(theme_idx_);
     });
+#endif
     setupMenuBar();
 
     // ----------------------------------------------------------------
