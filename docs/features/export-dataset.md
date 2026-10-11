@@ -1,6 +1,6 @@
 # Export Dataset
 
-**Export → Export Dataset (NPZ)…**
+**File → Export → Dataset (NPZ)…**
 
 Writes an NPZ holding the processed trace matrix plus **any number of named label arrays derived from the auxiliary data bytes** — the machine-learning-friendly counterpart to plain NPZ export, which can only dump the raw data block.
 

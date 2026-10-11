@@ -1,6 +1,6 @@
 # Signal-to-Noise Ratio
 
-**SCA → SNR…**
+**Analyze → SNR…**
 
 Per-sample SNR — `SNR[s] = Var(E[T[s] | class]) / E[Var(T[s] | class)]` — computed with an online accumulator, so trace count is not bounded by RAM.
 

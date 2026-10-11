@@ -15,7 +15,7 @@ carrying the leakage rather than burying it, demodulated instead.
 
     See *Leakage vs Frequency* below for the tool that tells the two apart.
 
-**SCA → FFT Spectrum… → Detect spectral lines…**
+**Analyze → FFT Spectrum… → Detect spectral lines…**
 
 Runs over the averaged spectrum and reports every narrowband line standing above
 the **local** noise floor.
@@ -112,7 +112,7 @@ change:
 
 ## Leakage vs Frequency
 
-**SCA → Leakage vs Frequency…**
+**Analyze → Leakage vs Frequency…**
 
 Runs a Welch t-test at every *(time window, frequency bin)* of an STFT, then
 reports the largest `|t|` each frequency ever reached.
@@ -194,10 +194,10 @@ rate — which is also why each dialog has a sample-rate row. If the file's own
 A capture from a board whose DC-DC converter runs near 2 MHz, sampled at
 125 MS/s:
 
-1. **SCA → FFT Spectrum…**, output *Magnitude (dB)*, run over the whole trace.
+1. **Analyze → FFT Spectrum…**, output *Magnitude (dB)*, run over the whole trace.
 2. **Detect spectral lines…** — a comb at 2 MHz and its multiples is listed,
    strongest first.
-3. **SCA → Leakage vs Frequency…** — the comb bins show no t-statistic, so they
+3. **Analyze → Leakage vs Frequency…** — the comb bins show no t-statistic, so they
    are interference rather than signal.
 4. Back in the spectrum window, **Excise checked…**, then **OK**.
 5. Re-run the t-test. On a synthetic capture built this way, peak `|t|` in the

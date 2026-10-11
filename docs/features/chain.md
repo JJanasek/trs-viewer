@@ -1,6 +1,6 @@
 # Chain Editor
 
-**Chain → Chain Editor…**
+**Process → Chain Editor…**
 
 A **chain** is a saved, ordered sequence of operations — build it once, then run it with one click instead of redoing the same dialogs by hand every time. Chains are stored as JSON and can be loaded back later, so a whole workflow (add helper transforms → align → strip the helper transforms → reload the raw traces with the shift still applied → export) becomes one button.
 

@@ -1,6 +1,6 @@
 # Welch T-Test
 
-**SCA → Run Welch T-Test…**
+**Analyze → Welch t-test (TVLA)…**
 
 Computes the per-sample Welch t-statistic between two trace groups. No special header fields are required — group assignment is configured in the dialog by choosing which data byte to use as the group label (0 = group 0, non-zero = group 1). If the file's parameter map contains a `ttest` entry, its `offset` field is used automatically and the byte selector is hidden.
 
@@ -12,6 +12,6 @@ Computes the per-sample Welch t-statistic between two trace groups. No special h
 - **Export PDF…** — A4 landscape vector PDF
 - Export result as `.npy` or `.trs`
 
-**SCA → Load T-Test NPY…** — load a pre-computed 1-D `float32` t-statistic vector.
+**File → Load Result → t-test Curve (NPY)…** — load a pre-computed 1-D `float32` t-statistic vector.
 
 ![T-test result and PDF export](../ttest_export.gif)

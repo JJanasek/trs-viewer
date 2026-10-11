@@ -16,7 +16,10 @@
 #include <QProgressBar>
 #include <set>
 
+#include <QActionGroup>
 #include <QApplication>
+#include <QDesktopServices>
+#include <QUrl>
 #include <QButtonGroup>
 #include <QCheckBox>
 #include <QComboBox>
@@ -36,6 +39,7 @@
 #include <QLabel>
 #include <QMenu>
 #include <QMenuBar>
+#include <QLocale>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPdfWriter>
@@ -149,6 +153,7 @@ MainWindow::MainWindow(QWidget* parent)
     jobs_dock_->hide();   // shown only while something is actually running
     connect(jobs_, &JobManager::jobsChanged, this, &MainWindow::refreshJobsDock);
 
+    theme_idx_ = QSettings("trs-viewer", "trs-viewer").value("ui/theme", 0).toInt() == 1 ? 1 : 0;
     setupMenuBar();
 
     // ----------------------------------------------------------------
@@ -162,7 +167,6 @@ MainWindow::MainWindow(QWidget* parent)
     QVBoxLayout* side_l = new QVBoxLayout(side);
     side_l->setSpacing(8);
     side->setMinimumWidth(230);
-    side->setMaximumWidth(320);
 
     // File info
     QGroupBox*   grp_file = new QGroupBox("File");
@@ -176,6 +180,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     // Trace selector
     QGroupBox*   grp_trace = new QGroupBox("Traces");
+    grp_trace_ = grp_trace;
     QFormLayout* tfl       = new QFormLayout(grp_trace);
     spin_first_ = new QSpinBox;
     spin_first_->setMinimum(0);
@@ -184,12 +189,10 @@ MainWindow::MainWindow(QWidget* parent)
     spin_count_->setMinimum(1);
     spin_count_->setMaximum(1000);
     spin_count_->setValue(1);
-    btn_apply_ = new QPushButton("Load / Refresh");
-    btn_apply_->setToolTip("(Re)load the live, file-backed view for the trace range above.\n"
-                           "Any previously computed alignment is kept and re-shown visually, "
-                           "but a baked \"Apply to Main View\" result reverts to live — same "
-                           "effect as \"Un-apply Shifts\" on the toolbar. Also switches the "
-                           "plot back to Pan mode if it was left in Align/Measure/Box Zoom.");
+    btn_apply_ = new QPushButton("Reload Traces");
+    btn_apply_->setToolTip("Load the trace range above from the file.\n"
+                           "A computed alignment is kept and shown as shifts; a baked "
+                           "\"Apply to Main View\" copy goes back to the live view.");
     connect(btn_apply_, &QPushButton::clicked, this, &MainWindow::onApplyTraces);
     connect(spin_first_, QOverload<int>::of(&QSpinBox::valueChanged),
             this, [this](int v){ spin_data_idx_->setValue(v); });
@@ -197,7 +200,7 @@ MainWindow::MainWindow(QWidget* parent)
     tfl->addRow("Count:", spin_count_);
     auto* btn_select_all = new QPushButton("Select All Traces");
     btn_select_all->setToolTip("First trace = 0, Count = every trace in the file. "
-                               "Click \"Load / Refresh\" afterward to apply it.");
+                               "Click \"Reload Traces\" afterward to apply it.");
     connect(btn_select_all, &QPushButton::clicked, this, [this]() {
         if (!hasActiveDs() || !activeDs().file) return;
         spin_first_->setValue(0);
@@ -220,6 +223,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     // Processing pipeline
     QGroupBox*   grp_tx = new QGroupBox("Processing Pipeline");
+    grp_pipeline_ = grp_tx;
     QVBoxLayout* txl    = new QVBoxLayout(grp_tx);
 
     combo_transform_ = new QComboBox;
@@ -300,12 +304,14 @@ MainWindow::MainWindow(QWidget* parent)
         spin_data_idx_->setValue(spin_data_idx_->value() + 1);
     });
 
+    // Work order: what's loaded, which traces, how they're processed —
+    // then the read-only inspectors.
     side_l->addWidget(grp_file);
     side_l->addWidget(grp_trace);
-    side_l->addWidget(grp_data);
-    side_l->addWidget(lbl_view_);
-    side_l->addWidget(grp_meas);
     side_l->addWidget(grp_tx);
+    side_l->addWidget(grp_meas);
+    side_l->addWidget(lbl_view_);
+    side_l->addWidget(grp_data);
     side_l->addStretch();
 
     // ---- Right pane: toolbar + plot ----
@@ -328,7 +334,7 @@ MainWindow::MainWindow(QWidget* parent)
     btn_mode_pan_      = new QPushButton("Pan");
     btn_mode_measure_  = new QPushButton("Measure");
     btn_mode_box_zoom_ = new QPushButton("⬚ Box Zoom");
-    btn_mode_align_    = new QPushButton("↔ Align");
+    btn_mode_align_    = new QPushButton("↔ Drag-shift");
     btn_mode_pan_->setCheckable(true);
     btn_mode_measure_->setCheckable(true);
     btn_mode_box_zoom_->setCheckable(true);
@@ -337,7 +343,9 @@ MainWindow::MainWindow(QWidget* parent)
     btn_mode_pan_->setToolTip("Drag to pan, scroll wheel to zoom");
     btn_mode_measure_->setToolTip("Click two points to measure distance (P)");
     btn_mode_box_zoom_->setToolTip("Drag to select a region and zoom into it (Z)");
-    btn_mode_align_->setToolTip("Click and drag a trace left/right to shift it");
+    btn_mode_align_->setToolTip("Drag a trace left/right to shift it by hand — this changes "
+                                "the alignment (undo with Ctrl+Z). For automatic alignment "
+                                "use Process › Align Traces.");
 
     mode_group_ = new QButtonGroup(this);
     mode_group_->addButton(btn_mode_pan_,      0);
@@ -375,11 +383,8 @@ MainWindow::MainWindow(QWidget* parent)
     btn_reset_    = new QPushButton("⟳ Reset  [R]");
     btn_zoom_in_->setToolTip("Zoom in X (also: scroll wheel up)");
     btn_zoom_out_->setToolTip("Zoom out X (also: scroll wheel down)");
-    btn_reset_->setToolTip("Pan/zoom back to the full range, clear crop ranges, and switch "
-                           "back to Pan mode (out of Align/Measure/Box Zoom).\n"
-                           "Does NOT touch traces, the pipeline, or alignment — a baked "
-                           "\"Apply to Main View\" result and any computed shifts are left alone. "
-                           "Use \"Load / Refresh\" or \"Un-apply Shifts\" for that.");
+    btn_reset_->setToolTip("Back to the full range in Pan mode, and clear crop ranges.\n"
+                           "Traces, pipeline and alignment are left alone.");
 
     auto* btn_yzoom_in  = new QPushButton("↑ Amp");
     auto* btn_yzoom_out = new QPushButton("↓ Amp");
@@ -399,25 +404,6 @@ MainWindow::MainWindow(QWidget* parent)
     btn_undo_->setEnabled(false);
     connect(btn_undo_, &QPushButton::clicked, this, &MainWindow::onUndoAction);
 
-    // Reverts "Align Traces -> Apply to Main View"'s baked-in static traces
-    // back to normal, live, file-backed ones (same rebuild Load/Refresh
-    // already does) — the computed alignment itself (align_shifts etc.) is
-    // kept, just no longer frozen into the plot, so pipeline edits and
-    // t-test/CPA/xcorr reuse still work as if nothing changed.
-    btn_unapply_ = new QPushButton("Un-apply Shifts");
-    btn_unapply_->setToolTip("Restore the live, file-backed view after \"Apply to Main "
-                             "View\" — keeps the computed alignment for later reuse, "
-                             "just stops it being baked into the plot. Only enabled while "
-                             "baked; identical to clicking \"Load / Refresh\" in the "
-                             "Traces panel, just labeled for this specific situation.");
-    btn_unapply_->setEnabled(false);
-    connect(btn_unapply_, &QPushButton::clicked, this, &MainWindow::onApplyTraces);
-
-    // Theme selector
-    combo_theme_ = new QComboBox;
-    combo_theme_->addItems({"Dark", "Light"});
-    connect(combo_theme_, &QComboBox::currentIndexChanged,
-            this, &MainWindow::onThemeChanged);
 
     toolbar_l->addWidget(btn_mode_pan_);
     toolbar_l->addWidget(btn_mode_measure_);
@@ -432,10 +418,7 @@ MainWindow::MainWindow(QWidget* parent)
     toolbar_l->addWidget(btn_yzoom_out);
     toolbar_l->addWidget(sep2);
     toolbar_l->addWidget(btn_undo_);
-    toolbar_l->addWidget(btn_unapply_);
     toolbar_l->addWidget(sep3);
-    toolbar_l->addWidget(new QLabel("Theme:"));
-    toolbar_l->addWidget(combo_theme_);
 
     // "Tile Vertically" — show every open tab's plot stacked at once instead
     // of one at a time. Independent of everything else on the toolbar.
@@ -464,6 +447,7 @@ MainWindow::MainWindow(QWidget* parent)
     view_layout_->setSpacing(4);
 
     placeholder_widget_ = new PlotWidget(view_container_);
+    if (theme_idx_ == 1) placeholder_widget_->setTheme(PlotTheme::light());
     view_layout_->addWidget(placeholder_widget_, 1);
 
     right_l->addWidget(tab_bar_);
@@ -479,12 +463,20 @@ MainWindow::MainWindow(QWidget* parent)
     side_scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     const int sb_w = side_scroll->verticalScrollBar()->sizeHint().width();
     side_scroll->setMinimumWidth(side->minimumWidth() + sb_w);
-    side_scroll->setMaximumWidth(side->maximumWidth() + sb_w);
 
     splitter->addWidget(side_scroll);
     splitter->addWidget(right_pane);
     splitter->setStretchFactor(0, 0);
     splitter->setStretchFactor(1, 1);
+    // No hard maximum on the side panel (QSplitter leaves a dead gap beside
+    // a pane capped below its share); start it at a sensible width instead
+    // and let the user drag the handle.
+    splitter->setSizes({300 + sb_w, 1100});
+
+    lbl_state_ = new QLabel;
+    lbl_state_->setTextFormat(Qt::RichText);
+    statusBar()->addWidget(lbl_state_, 1);
+    updateStateIndicators();
 
     // Keyboard shortcuts
     auto* sc_undo = new QShortcut(QKeySequence::Undo, this);  // Ctrl+Z
@@ -599,6 +591,7 @@ void MainWindow::closeDatasetAt(int idx) {
 
 PlotWidget* MainWindow::createPlotWidgetForTab() {
     auto* pw = new PlotWidget(view_container_);
+    if (theme_idx_ == 1) pw->setTheme(PlotTheme::light());
 
     // Interaction signals from any tab's widget can fire while that tab is
     // not the active one (tiled mode shows every widget at once) — route
@@ -735,14 +728,25 @@ void MainWindow::onTabMoved(int from, int to) {
 // ---------------------------------------------------------------------------
 
 void MainWindow::setupMenuBar() {
-    QMenu* file_menu = menuBar()->addMenu("&File");
+    // Menus are grouped by task — File (in/out), View, Process (change the
+    // traces), Analyze (compute a result), Help. Every menu shows its
+    // actions' tooltips: several entries are only explained there.
+    auto addMenu = [this](const QString& title) {
+        QMenu* m = menuBar()->addMenu(title);
+        m->setToolTipsVisible(true);
+        return m;
+    };
 
-    auto* act_open = new QAction("&Open TRS file…", this);
+    // ---- File ----
+    QMenu* file_menu = addMenu("&File");
+    auto* act_open = new QAction("&Open TRS File…", this);
     act_open->setShortcut(QKeySequence::Open);
     connect(act_open, &QAction::triggered, this, &MainWindow::onOpenFile);
     file_menu->addAction(act_open);
-
-    auto* act_import_subset = new QAction("Import Trace &Subset (TRS)…", this);
+    auto* act_open_npy = new QAction("Open &NPY/NPZ as Traces…", this);
+    connect(act_open_npy, &QAction::triggered, this, &MainWindow::onOpenNpyTraces);
+    file_menu->addAction(act_open_npy);
+    auto* act_import_subset = new QAction("&Import Trace Subset (TRS)…", this);
     act_import_subset->setToolTip(
         "Pick a trace range from a (possibly huge) source TRS file and open "
         "only that range as a new file — writes it out first, same as Export "
@@ -751,10 +755,47 @@ void MainWindow::setupMenuBar() {
     connect(act_import_subset, &QAction::triggered, this, &MainWindow::onImportTraceSubset);
     file_menu->addAction(act_import_subset);
 
-    auto* act_open_npy = new QAction("Open NPY/NPZ as &traces…", this);
-    connect(act_open_npy, &QAction::triggered, this, &MainWindow::onOpenNpyTraces);
-    file_menu->addAction(act_open_npy);
+    QMenu* load_menu = file_menu->addMenu("&Load Result");
+    load_menu->setToolTipsVisible(true);
+    auto* act_load_npy_ttest = new QAction("&t-test Curve (NPY)…", this);
+    connect(act_load_npy_ttest, &QAction::triggered, this, &MainWindow::onLoadNpyTTest);
+    load_menu->addAction(act_load_npy_ttest);
+    auto* act_load_npy_heatmap = new QAction("&Heatmap (NPY)…", this);
+    connect(act_load_npy_heatmap, &QAction::triggered, this, &MainWindow::onLoadNpyHeatmap);
+    load_menu->addAction(act_load_npy_heatmap);
+    auto* act_load_spectrum = new QAction("&Spectrum Curves (NPZ)…", this);
+    act_load_spectrum->setToolTip(
+        "Load an NPZ holding one or more precomputed 1-D curves (e.g. from "
+        "an external FFT/PSD comparison script) and overlay them — every "
+        "1-D array becomes a curve; one named freq/frequency/x/etc. (if "
+        "present) becomes the shared X axis instead of its own curve.");
+    connect(act_load_spectrum, &QAction::triggered, this, &MainWindow::onLoadSpectrumNpz);
+    load_menu->addAction(act_load_spectrum);
 
+    QMenu* export_menu = file_menu->addMenu("&Export");
+    export_menu->setToolTipsVisible(true);
+    auto* act_exp_trs = new QAction("&TRS (processed traces)…", this);
+    connect(act_exp_trs, &QAction::triggered, this, &MainWindow::onExportTrs);
+    export_menu->addAction(act_exp_trs);
+    auto* act_exp_npy_traces = new QAction("Traces as &NPY (2-D matrix)…", this);
+    connect(act_exp_npy_traces, &QAction::triggered, this, &MainWindow::onExportNpy);
+    export_menu->addAction(act_exp_npy_traces);
+    auto* act_exp_npz = new QAction("Traces as NP&Z (traces + data)…", this);
+    connect(act_exp_npz, &QAction::triggered, this, &MainWindow::onExportNpz);
+    export_menu->addAction(act_exp_npz);
+    auto* act_exp_dataset = new QAction("&Dataset (NPZ)…", this);
+    connect(act_exp_dataset, &QAction::triggered, this, &MainWindow::onExportDataset);
+    export_menu->addAction(act_exp_dataset);
+    export_menu->addSeparator();
+    auto* act_exp_png = new QAction("Plot as &PNG…", this);
+    act_exp_png->setShortcut(QKeySequence("Ctrl+Shift+S"));
+    connect(act_exp_png, &QAction::triggered, this, &MainWindow::onExportPng);
+    export_menu->addAction(act_exp_png);
+    auto* act_exp_pdf = new QAction("Plot as P&DF…", this);
+    connect(act_exp_pdf, &QAction::triggered, this, &MainWindow::onExportPdf);
+    export_menu->addAction(act_exp_pdf);
+
+    file_menu->addSeparator();
     auto* act_warm_cache = new QAction("&Warm Page Cache", this);
     act_warm_cache->setToolTip(
         "Opening a file never reads its data up front — every trace is read "
@@ -767,115 +808,129 @@ void MainWindow::setupMenuBar() {
         "predictable pass, than have it show up as stutter later. Cancellable.");
     connect(act_warm_cache, &QAction::triggered, this, &MainWindow::onWarmPageCache);
     file_menu->addAction(act_warm_cache);
-
     auto* act_close = new QAction("&Close Dataset", this);
     act_close->setShortcut(QKeySequence("Ctrl+W"));
     connect(act_close, &QAction::triggered, this, &MainWindow::onCloseDataset);
     file_menu->addAction(act_close);
-
     file_menu->addSeparator();
-
     auto* act_quit = new QAction("&Quit", this);
     act_quit->setShortcut(QKeySequence::Quit);
     connect(act_quit, &QAction::triggered, this, &QWidget::close);
     file_menu->addAction(act_quit);
 
-    QMenu* export_menu = menuBar()->addMenu("&Export");
+    // ---- View ----
+    // The plot keys (P, Z, R, +, -, Ctrl+Z) stay bound to the window-level
+    // QShortcuts in the constructor; "\t<key>" only *displays* the key here,
+    // so binding it twice can't make Qt report an ambiguous shortcut.
+    QMenu* view_menu = addMenu("&View");
+    auto viewAct = [this, view_menu](const QString& text, auto fn) {
+        QAction* a = view_menu->addAction(text);
+        connect(a, &QAction::triggered, this, fn);
+        return a;
+    };
+    viewAct("&Pan", [this]() { btn_mode_pan_->click(); });
+    viewAct("&Measure\tP", [this]() { btn_mode_measure_->click(); });
+    viewAct("&Box Zoom\tZ", [this]() { btn_mode_box_zoom_->click(); });
+    viewAct("&Drag-shift Traces", [this]() { btn_mode_align_->click(); })
+        ->setToolTip("Drag a trace left/right with the mouse to shift it by hand. "
+                     "Changes the alignment (undo with Ctrl+Z).");
+    view_menu->addSeparator();
+    viewAct("&Reset View\tR", [this]() { onResetView(); });
+    viewAct("Zoom &In\t+", [this]() { plotWidget()->zoomIn(); });
+    viewAct("Zoom &Out\t-", [this]() { plotWidget()->zoomOut(); });
+    viewAct("&Undo\tCtrl+Z", [this]() { onUndoAction(); });
+    view_menu->addSeparator();
+    viewAct("&Stack Traces in Lanes", [this]() { btn_stack_->toggle(); });
+    viewAct("&Tile Tabs", [this]() { btn_tile_->toggle(); });
+    QMenu* theme_menu = view_menu->addMenu("T&heme");
+    auto* theme_group = new QActionGroup(this);
+    const QStringList theme_names = {"&Dark", "&Light"};
+    for (int i = 0; i < theme_names.size(); i++) {
+        QAction* a = theme_menu->addAction(theme_names[i]);
+        a->setCheckable(true);
+        a->setChecked(i == theme_idx_);
+        theme_group->addAction(a);
+        connect(a, &QAction::triggered, this, [this, i]() { onThemeChanged(i); });
+    }
 
-    auto* act_exp_trs = new QAction("Export &TRS (processed traces)…", this);
-    connect(act_exp_trs, &QAction::triggered, this, &MainWindow::onExportTrs);
-    export_menu->addAction(act_exp_trs);
+    // ---- Process ----
+    QMenu* proc_menu = addMenu("&Process");
+    auto* act_align = new QAction("&Align Traces…", this);
+    connect(act_align, &QAction::triggered, this, &MainWindow::onAlignTraces);
+    proc_menu->addAction(act_align);
+    auto* act_crop = new QAction("&Range Editor…", this);
+    connect(act_crop, &QAction::triggered, this, &MainWindow::onCropEdit);
+    proc_menu->addAction(act_crop);
+    proc_menu->addSeparator();
+    auto* act_chain = new QAction("&Chain Editor…", this);
+    act_chain->setToolTip("Build, save/load, and run a saved sequence of steps (add "
+                          "transform, align, clear pipeline, reload, export) instead "
+                          "of redoing the same clicks by hand every time.");
+    connect(act_chain, &QAction::triggered, this, &MainWindow::onChainEditor);
+    proc_menu->addAction(act_chain);
 
-    auto* act_exp_npy_traces = new QAction("Export traces as &NPY (2-D matrix)…", this);
-    connect(act_exp_npy_traces, &QAction::triggered, this, &MainWindow::onExportNpy);
-    export_menu->addAction(act_exp_npy_traces);
-
-    auto* act_exp_npz = new QAction("Export traces as NP&Z (traces + data)…", this);
-    connect(act_exp_npz, &QAction::triggered, this, &MainWindow::onExportNpz);
-    export_menu->addAction(act_exp_npz);
-
-    auto* act_exp_dataset = new QAction("Export &Dataset (NPZ)…", this);
-    connect(act_exp_dataset, &QAction::triggered, this, &MainWindow::onExportDataset);
-    export_menu->addAction(act_exp_dataset);
-
-    export_menu->addSeparator();
-
-    auto* act_exp_png = new QAction("Export plot as &PNG…", this);
-    act_exp_png->setShortcut(QKeySequence("Ctrl+Shift+S"));
-    connect(act_exp_png, &QAction::triggered, this, &MainWindow::onExportPng);
-    export_menu->addAction(act_exp_png);
-
-    auto* act_exp_pdf = new QAction("Export plot as P&DF…", this);
-    connect(act_exp_pdf, &QAction::triggered, this, &MainWindow::onExportPdf);
-    export_menu->addAction(act_exp_pdf);
-
-    QMenu* sca_menu = menuBar()->addMenu("&SCA");
-    auto* act_ttest = new QAction("Run &Welch t-test…", this);
+    // ---- Analyze ----
+    QMenu* sca_menu = addMenu("&Analyze");
+    auto* act_ttest = new QAction("Welch &t-test (TVLA)…", this);
     connect(act_ttest, &QAction::triggered, this, &MainWindow::onRunTTest);
     sca_menu->addAction(act_ttest);
-
-    auto* act_xcorr = new QAction("&Cross-Correlation…", this);
-    connect(act_xcorr, &QAction::triggered, this, &MainWindow::onRunXCorr);
-    sca_menu->addAction(act_xcorr);
-
-    auto* act_dpa = new QAction("&CPA…", this);
-    connect(act_dpa, &QAction::triggered, this, &MainWindow::onRunCpa);
-    sca_menu->addAction(act_dpa);
-
-    auto* act_snr = new QAction("&SNR…", this);
-    connect(act_snr, &QAction::triggered, this, &MainWindow::onRunSNR);
-    sca_menu->addAction(act_snr);
-
-    auto* act_spec_leak = new QAction("Leakage vs &Frequency…", this);
+    auto* act_spec_leak = new QAction("&Leakage vs Frequency…", this);
     act_spec_leak->setToolTip("Welch t-test per (time window, frequency bin) — tells "
                                "which frequencies actually leak, as opposed to which "
                                "merely carry energy.");
     connect(act_spec_leak, &QAction::triggered, this, &MainWindow::onRunSpectralLeakage);
     sca_menu->addAction(act_spec_leak);
-
-    auto* act_static_snr = new QAction("Static SNR |μ/σ|…", this);
+    sca_menu->addSeparator();
+    auto* act_snr = new QAction("&SNR…", this);
+    connect(act_snr, &QAction::triggered, this, &MainWindow::onRunSNR);
+    sca_menu->addAction(act_snr);
+    auto* act_static_snr = new QAction("Static SN&R |μ/σ|…", this);
     connect(act_static_snr, &QAction::triggered, this, &MainWindow::onRunStaticSNR);
     sca_menu->addAction(act_static_snr);
-
+    sca_menu->addSeparator();
+    auto* act_dpa = new QAction("C&PA…", this);
+    connect(act_dpa, &QAction::triggered, this, &MainWindow::onRunCpa);
+    sca_menu->addAction(act_dpa);
+    auto* act_xcorr = new QAction("&Cross-Correlation…", this);
+    connect(act_xcorr, &QAction::triggered, this, &MainWindow::onRunXCorr);
+    sca_menu->addAction(act_xcorr);
     auto* act_fft = new QAction("&FFT Spectrum…", this);
     connect(act_fft, &QAction::triggered, this, &MainWindow::onRunFFT);
     sca_menu->addAction(act_fft);
 
-    auto* act_align = new QAction("&Align Traces…", this);
-    connect(act_align, &QAction::triggered, this, &MainWindow::onAlignTraces);
-    sca_menu->addAction(act_align);
-
-    sca_menu->addSeparator();
-
-    auto* act_load_npy_ttest = new QAction("Load t-test &NPY…", this);
-    connect(act_load_npy_ttest, &QAction::triggered, this, &MainWindow::onLoadNpyTTest);
-    sca_menu->addAction(act_load_npy_ttest);
-
-    auto* act_load_npy_heatmap = new QAction("Load heatmap &NPY…", this);
-    connect(act_load_npy_heatmap, &QAction::triggered, this, &MainWindow::onLoadNpyHeatmap);
-    sca_menu->addAction(act_load_npy_heatmap);
-
-    auto* act_load_spectrum = new QAction("Load &Spectrum NPZ…", this);
-    act_load_spectrum->setToolTip(
-        "Load an NPZ holding one or more precomputed 1-D curves (e.g. from "
-        "an external FFT/PSD comparison script) and overlay them — every "
-        "1-D array becomes a curve; one named freq/frequency/x/etc. (if "
-        "present) becomes the shared X axis instead of its own curve.");
-    connect(act_load_spectrum, &QAction::triggered, this, &MainWindow::onLoadSpectrumNpz);
-    sca_menu->addAction(act_load_spectrum);
-
-    QMenu* crop_menu = menuBar()->addMenu("C&rop");
-    auto* act_crop = new QAction("&Range Editor…", this);
-    connect(act_crop, &QAction::triggered, this, &MainWindow::onCropEdit);
-    crop_menu->addAction(act_crop);
-
-    QMenu* chain_menu = menuBar()->addMenu("&Chain");
-    auto* act_chain = new QAction("Chain &Editor…", this);
-    act_chain->setToolTip("Build, save/load, and run a saved sequence of steps (add "
-                          "transform, align, clear pipeline, reload, export) instead "
-                          "of redoing the same clicks by hand every time.");
-    connect(act_chain, &QAction::triggered, this, &MainWindow::onChainEditor);
-    chain_menu->addAction(act_chain);
+    // ---- Help ----
+    QMenu* help_menu = addMenu("&Help");
+    QAction* act_docs = help_menu->addAction("&Documentation");
+    act_docs->setShortcut(QKeySequence::HelpContents);
+    connect(act_docs, &QAction::triggered, this, []() {
+        QDesktopServices::openUrl(QUrl("https://github.com/JJanasek/trs-viewer/tree/main/docs"));
+    });
+    QAction* act_keys = help_menu->addAction("&Keyboard Shortcuts");
+    connect(act_keys, &QAction::triggered, this, [this]() {
+        QMessageBox::information(this, "Keyboard Shortcuts",
+            "<table cellspacing=6>"
+            "<tr><td><b>Ctrl+O</b></td><td>Open TRS file</td></tr>"
+            "<tr><td><b>Ctrl+W</b></td><td>Close dataset</td></tr>"
+            "<tr><td><b>Ctrl+Shift+S</b></td><td>Export plot as PNG</td></tr>"
+            "<tr><td><b>P</b></td><td>Toggle Measure mode</td></tr>"
+            "<tr><td><b>Z</b></td><td>Toggle Box Zoom mode</td></tr>"
+            "<tr><td><b>R</b></td><td>Reset view</td></tr>"
+            "<tr><td><b>+ / -</b></td><td>Zoom in / out</td></tr>"
+            "<tr><td><b>Wheel</b></td><td>Zoom X</td></tr>"
+            "<tr><td><b>Ctrl/Shift+Wheel</b></td><td>Zoom Y (amplitude)</td></tr>"
+            "<tr><td><b>Ctrl+Z</b></td><td>Undo</td></tr>"
+            "<tr><td><b>F1</b></td><td>Documentation</td></tr>"
+            "</table>");
+    });
+    help_menu->addSeparator();
+    QAction* act_about = help_menu->addAction("&About TRS Viewer");
+    connect(act_about, &QAction::triggered, this, [this]() {
+        QMessageBox::about(this, "About TRS Viewer",
+            QString("<b>TRS Viewer %1</b><br>Power-trace viewer and side-channel "
+                    "analysis toolkit for Riscure .trs and NumPy trace sets."
+                    "<br><br>MIT License")
+                .arg(QApplication::applicationVersion()));
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -959,9 +1014,67 @@ void MainWindow::updateUndoButton() {
     // Piggybacks on the same call sites as the undo button — every one of
     // them is a point where plot_file_backed could plausibly have changed
     // (tab switch, undo/redo, Apply to Main View, Load/Refresh itself).
-    if (btn_unapply_)
-        btn_unapply_->setEnabled(hasActiveDs() && !activeDs().is_result
-                                  && !activeDs().plot_file_backed);
+    updateStateIndicators();
+}
+
+void MainWindow::updateStateIndicators() {
+    // Tab labels: mark derived results and baked views so the tab bar alone
+    // tells file tabs from result tabs.
+    const QColor result_col = palette().color(QPalette::Link);
+    for (int i = 0; i < tab_bar_->count() && i < static_cast<int>(datasets_.size()); i++) {
+        const Dataset& d = datasets_[static_cast<size_t>(i)];
+        QString text = d.display_name;
+        if (!d.is_result && !d.plot_file_backed && d.file) text += "  [baked]";
+        if (tab_bar_->tabText(i) != text) tab_bar_->setTabText(i, text);
+        tab_bar_->setTabTextColor(i, d.is_result ? result_col : QColor());
+        tab_bar_->setTabToolTip(i, d.is_result ? "Analysis result (no source file)"
+                                               : QString());
+    }
+
+    if (!hasActiveDs()) {
+        setWindowTitle("TRS Viewer");
+        if (lbl_state_) lbl_state_->setText("No file open — File › Open TRS File… (Ctrl+O)");
+        if (grp_trace_)    grp_trace_->setEnabled(false);
+        if (grp_pipeline_) grp_pipeline_->setEnabled(false);
+        return;
+    }
+
+    const Dataset& ds = activeDs();
+    const bool file_tab = !ds.is_result && ds.file;
+    if (grp_trace_)    grp_trace_->setEnabled(file_tab);
+    if (grp_pipeline_) grp_pipeline_->setEnabled(file_tab);
+
+    if (!file_tab) {
+        setWindowTitle(ds.display_name + " — TRS Viewer");
+        if (lbl_state_) lbl_state_->setText("Analysis result");
+        return;
+    }
+
+    const bool aligned = !ds.align_shifts.empty();
+    const bool baked   = !ds.plot_file_backed;
+    QStringList parts;
+    const QLocale loc;
+    const int total = ds.file->header().num_traces;
+    const int shown = plotWidget()->traceCount();
+    if (shown == 1)
+        parts << QString("Showing trace %1 of %2").arg(loc.toString(ds.plot_first_trace))
+                     .arg(loc.toString(total));
+    else if (shown > 1)
+        parts << QString("Showing traces %1–%2 of %3").arg(loc.toString(ds.plot_first_trace))
+                     .arg(loc.toString(ds.plot_first_trace + shown - 1)).arg(loc.toString(total));
+    else
+        parts << QString("%1 traces").arg(loc.toString(total));
+    parts << (ds.pipeline.empty() ? QString("No pipeline")
+                                  : QString("Pipeline: %1 step%2").arg(ds.pipeline.size())
+                                        .arg(ds.pipeline.size() == 1 ? "" : "s"));
+    parts << (aligned ? "Aligned" : "Not aligned");
+    if (baked) parts << "<b>Baked</b> (Reload Traces to go live)";
+    if (lbl_state_) lbl_state_->setText(parts.join("  ·  "));
+
+    QString title = ds.display_name;
+    if (baked)        title += " (baked)";
+    else if (aligned) title += " (aligned)";
+    setWindowTitle(title + " — TRS Viewer");
 }
 
 void MainWindow::resetInteractionModeToPan() {
@@ -1456,7 +1569,14 @@ void MainWindow::onMeasurementUpdated(int64_t s1, double v1,
 }
 
 void MainWindow::onThemeChanged(int index) {
-    plotWidget()->setTheme(index == 0 ? PlotTheme::dark() : PlotTheme::light());
+    theme_idx_ = (index == 1) ? 1 : 0;
+    QSettings("trs-viewer", "trs-viewer").setValue("ui/theme", theme_idx_);
+    // Result tabs pick their own (usually light) theme for readability;
+    // only file tabs and the empty placeholder follow the global setting.
+    const PlotTheme th = theme_idx_ == 0 ? PlotTheme::dark() : PlotTheme::light();
+    placeholder_widget_->setTheme(th);
+    for (auto& ds : datasets_)
+        if (!ds.is_result && ds.plot_widget) ds.plot_widget->setTheme(th);
 }
 
 void MainWindow::rebuildTransformList() {
@@ -1467,6 +1587,7 @@ void MainWindow::rebuildTransformList() {
             QString("%1. %2").arg(i + 1)
                              .arg(QString::fromStdString(activeDs().pipeline[i]->name())));
     }
+    updateStateIndicators();
 }
 
 // ---------------------------------------------------------------------------
@@ -1956,6 +2077,7 @@ void MainWindow::onExportTrs() {
 
     auto* bb = new QDialogButtonBox(
         QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    bb->button(QDialogButtonBox::Ok)->setText("Export");
     fl->addRow(bb);
     connect(bb, &QDialogButtonBox::accepted, &range_dlg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &range_dlg, &QDialog::reject);
@@ -4403,6 +4525,7 @@ void MainWindow::onExportNpy() {
         sp_first, sp_count, &sp_tile, &chk_crop);
 
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    bb->button(QDialogButtonBox::Ok)->setText("Export");
     fl->addRow(bb);
     connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
@@ -4486,6 +4609,7 @@ void MainWindow::onExportNpz() {
         sp_first, sp_count, &sp_tile, &chk_crop);
 
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    bb->button(QDialogButtonBox::Ok)->setText("Export");
     if (h.data_length > 0)
         fl->addRow(new QLabel(QString("<i>Will also export data.npy (%1 bytes/trace)</i>")
                                   .arg(h.data_length)));
@@ -4886,6 +5010,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     }
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    cfg_bb->button(QDialogButtonBox::Ok)->setText("Run t-test");
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
@@ -6020,6 +6145,7 @@ void MainWindow::onRunXCorr() {
     updateEstimate();
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    cfg_bb->button(QDialogButtonBox::Ok)->setText("Run cross-correlation");
     connect(cfg_bb, &QDialogButtonBox::accepted, cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, cfg, &QDialog::reject);
 
@@ -7589,6 +7715,7 @@ void MainWindow::onRunSpectralLeakage() {
     fl->addRow(jitter_note);
 
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    bb->button(QDialogButtonBox::Ok)->setText("Run");
     fl->addRow(bb);
     connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
@@ -9731,7 +9858,7 @@ void MainWindow::onChainEditor() {
         QAction* act_tx      = menu.addAction("Add Transform…");
         QAction* act_clear   = menu.addAction("Clear Pipeline");
         QAction* act_align   = menu.addAction("Align Traces…");
-        QAction* act_reload  = menu.addAction("Reload (Load / Refresh)");
+        QAction* act_reload  = menu.addAction("Reload Traces");
         QAction* act_export  = menu.addAction("Export…");
         QAction* act_exp_sh  = menu.addAction("Export Shifts…");
         QAction* act_load_sh = menu.addAction("Load Shifts…");
@@ -9943,6 +10070,7 @@ void MainWindow::onRunCpa() {
     if (has_alignment) applyAlignmentToSpinboxes(true);  // apply immediately if pre-checked
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    cfg_bb->button(QDialogButtonBox::Ok)->setText("Run CPA");
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
     // CPA is the one analysis that still blocks. Its leakage model is
@@ -10394,6 +10522,7 @@ void MainWindow::onRunSNR() {
     });
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    cfg_bb->button(QDialogButtonBox::Ok)->setText("Run SNR");
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
@@ -10618,6 +10747,7 @@ void MainWindow::onRunStaticSNR() {
     fl->addRow("Sample count (0=all):", sp_s_count);
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    cfg_bb->button(QDialogButtonBox::Ok)->setText("Run Static SNR");
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
@@ -10880,6 +11010,7 @@ void MainWindow::onRunFFT() {
     fl->addRow("", chk_envelope);
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    cfg_bb->button(QDialogButtonBox::Ok)->setText("Run FFT");
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::rejected, cfg, &QDialog::reject);
     connect(cfg_bb, &QDialogButtonBox::accepted, cfg, [=]() {
@@ -11461,6 +11592,7 @@ void MainWindow::onExportDataset() {
     });
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    cfg_bb->button(QDialogButtonBox::Ok)->setText("Export");
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, [&]() {
         if (labels.isEmpty()) {
             if (QMessageBox::question(&cfg, "No labels",

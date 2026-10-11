@@ -679,7 +679,7 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
 
     if (rows_ <= 0 || cols_ <= 0 || display_matrix_.empty()) {
         p.setPen(QColor(180, 180, 200));
-        p.drawText(rect(), Qt::AlignCenter, "No data.\nRun SCA → Cross-Correlation.");
+        p.drawText(rect(), Qt::AlignCenter, "No data.\nRun Analyze › Cross-Correlation or CPA.");
         return;
     }
 

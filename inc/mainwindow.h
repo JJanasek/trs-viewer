@@ -233,6 +233,9 @@ private:
     void saveSnapshot();
     void restoreSnapshot(DatasetSnapshot snap);
     void updateUndoButton();
+    // Status bar, window title, tab labels and side-panel enablement — all
+    // derived from the active dataset's state. Called from updateUndoButton().
+    void updateStateIndicators();
 
     // Switches the active plot's interaction mode back to Pan and re-checks
     // the "Pan" toolbar button (unchecking "↔ Align"/Measure/Box Zoom via
@@ -430,8 +433,10 @@ private:
     QPushButton*  btn_zoom_out_     = nullptr;
     QPushButton*  btn_reset_        = nullptr;
     QPushButton*  btn_undo_         = nullptr;
-    QPushButton*  btn_unapply_      = nullptr;
-    QComboBox*    combo_theme_      = nullptr;
+    QLabel*       lbl_state_        = nullptr;   // status-bar state summary
+    QWidget*      grp_trace_        = nullptr;   // disabled on result tabs
+    QWidget*      grp_pipeline_     = nullptr;   // disabled on result tabs
+    int           theme_idx_        = 0;         // 0 = dark, 1 = light; persisted
     QButtonGroup* mode_group_       = nullptr;
 
     static const QColor TRACE_COLORS[];

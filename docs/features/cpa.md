@@ -1,6 +1,6 @@
 # Correlation Power Analysis (CPA)
 
-**SCA → CPA…**
+**Analyze → CPA…**
 
 CPA correlates a user-defined leakage model with every sample column of the trace matrix and ranks the results across M hypotheses. The correlation engine uses an online accumulator — the full trace matrix is never held in RAM, making it practical for large trace sets.
 

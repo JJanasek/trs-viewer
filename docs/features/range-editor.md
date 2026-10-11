@@ -1,6 +1,6 @@
 # Range Editor
 
-**Crop → Range Editor…**
+**Process → Range Editor…**
 
 Mark sample regions and write them out as a new `.trs`.
 

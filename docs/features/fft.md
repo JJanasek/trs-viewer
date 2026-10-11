@@ -1,6 +1,6 @@
 # FFT Spectrum
 
-**SCA → FFT Spectrum…**
+**Analyze → FFT Spectrum…**
 
 Averaged one-sided spectrum over a range of traces.
 

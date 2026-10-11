@@ -1,6 +1,6 @@
 # Export (TRS / NPY / NPZ)
 
-**Export → Export TRS… / Export traces as NPY… / Export traces as NPZ…**
+**File → Export → TRS… / Traces as NPY… / Traces as NPZ…**
 
 Each writes out the currently-configured pipeline applied to a chosen trace range:
 

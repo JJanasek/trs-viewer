@@ -918,7 +918,7 @@ void PlotWidget::paintEvent(QPaintEvent*) {
     if (traces_.empty() || view_end_ <= view_start_) {
         QColor tc = theme_.axis_text; tc.setAlpha(160);
         p.setPen(tc);
-        p.drawText(pr, Qt::AlignCenter, "No traces loaded.\nUse File › Open to load a .trs file.");
+        p.drawText(pr, Qt::AlignCenter, "No traces loaded.\nFile › Open TRS File… (Ctrl+O), or Open NPY/NPZ as Traces…");
         return;
     }
 

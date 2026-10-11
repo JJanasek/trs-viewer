@@ -1,6 +1,6 @@
 # Cross-Correlation Matrix
 
-**SCA → Cross-Correlation…**
+**Analyze → Cross-Correlation…**
 
 Computes the M×M normalised Pearson correlation matrix `C[i,j] = Corr(sᵢ, sⱼ)`, or a rectangular search×ref matrix for template matching.
 

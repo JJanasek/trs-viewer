@@ -78,7 +78,7 @@ QString ChainStep::summary() const {
             .arg(search_half).arg(extra);
     }
     case Kind::Reload:
-        return "Reload (Load / Refresh)";
+        return "Reload Traces";
     case Kind::Export: {
         static const char* kFmt[3] = {"TRS", "NPY", "NPZ"};
         QString fmt = (export_format >= 0 && export_format < 3) ? kFmt[export_format] : QString("?");
