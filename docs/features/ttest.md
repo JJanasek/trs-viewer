@@ -47,13 +47,16 @@ job carries on.
 
 ## Result tab
 
-**Result dialog features:**
-- Adjustable ±threshold line (orange dashed)
-- **One-sided mode** — show only the positive threshold (for abs-preprocessed signals)
+The result tab has a single row of controls; pan, zoom, measure and amplitude
+come from the main toolbar, as for any tab.
+
+- **Threshold ±**: adjustable threshold line (orange dashed)
+- **One-sided**: show only the positive threshold (for abs-preprocessed signals)
 - **Calc TH…** — significance-threshold calculator. The per-sample level for an overall type-I error rate α over `n_L` samples uses the **Šidák** correction `α_TH = 1 − (1 − α)^(1/n_L)`, and the threshold is `TH = CDF_t⁻¹(1 − α_TH/2, ν̂)` with Welch–Satterthwaite degrees of freedom computed from the trace data. The dialog reports both the median and approximate ν̂. Follows Zhang, Ding, Durvaux, Standaert & Fei, *Towards Sound and Optimal Leakage Detection Procedure* (IACR ePrint 2017/287, EuroS&P 2018)
-- **Style…** — set plot title, line width, trace colour, dark/light theme
-- **Export PDF…** — A4 landscape vector PDF
-- Export result as `.npy` or `.trs`
+- **Cut**: drag across the plot to cut a region out of the exported result
+- **Trim ▾**: exclude a number of samples at the start or end; the exported length is shown next to it while trimmed
+- **Style…**: plot title, line width, trace colour, dark/light theme
+- **Export ▾**: PNG image, PDF (A4 landscape vector), curve as `.npz`, or curve as TRS
 
 **File → Load Result → t-test Curve (NPY)…** — load a pre-computed 1-D `float32` t-statistic vector.
 

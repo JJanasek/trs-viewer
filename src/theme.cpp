@@ -116,8 +116,25 @@ QPushButton {
 QPushButton:hover    { border-color: @accent; }
 QPushButton:pressed  { background: @accent_bg; }
 QPushButton:checked  { background: @accent_bg; border-color: @accent; }
-QPushButton:default  { background: @accent; color: #ffffff; border-color: @accent; }
+/* Accent only for real primary actions: a dialog's OK/Run, or a button
+   marked primary="true". Plain :default would also catch whichever button
+   Qt auto-defaults in a dialog, e.g. "Reset View". */
+QDialogButtonBox QPushButton:default,
+QPushButton[primary="true"] { background: @accent; color: #ffffff; border-color: @accent; }
 QPushButton:disabled { color: @muted; background: @panel; border-color: @border; }
+/* Drop-down buttons (Export, Trim, …) look like push buttons. Scoped to
+   InstantPopup (popupMode 2) so Qt's own tool buttons — tab-bar scroll
+   arrows, dock title buttons — keep their native look. */
+QToolButton[popupMode="2"] {
+    background: @raised;
+    border: 1px solid @border_strong;
+    border-radius: 4px;
+    padding: 3px 18px 3px 10px;
+    min-height: 20px;
+}
+QToolButton[popupMode="2"]:hover   { border-color: @accent; }
+QToolButton[popupMode="2"]:pressed { background: @accent_bg; border-color: @accent; }
+QToolButton[popupMode="2"]::menu-indicator { subcontrol-position: right center; right: 5px; }
 QTabBar::tab {
     background: transparent;
     border: 1px solid transparent;

@@ -203,6 +203,7 @@ LeakageModelDialog::LeakageModelDialog(TrsFile* file, int32_t first_trace,
     btn_run_ = new QPushButton("Run CPA");
     btn_run_->setEnabled(false);
     btn_run_->setDefault(true);   // the theme's accent marks the primary action
+    btn_run_->setProperty("primary", true);
     auto* btn_cancel = new QPushButton("Cancel");
 
     auto* bottom = new QHBoxLayout;

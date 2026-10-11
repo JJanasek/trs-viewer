@@ -9,6 +9,14 @@ Interactive false-colour heatmap for correlation matrices:
 - **Abs value** mode and **binary threshold** on `|v|`
 - Export as PNG or `.npy`
 
+The window keeps the heatmap as large as possible: a slim bar on top holds the
+value readout, **Reset View**, **Export ▾** and the **Display** toggle. All the
+other settings sit in a panel on the right, in sections: **Colour** (scheme,
+range, auto-clip, abs value, blur, power, binary threshold), **Tone** (contrast,
+brightness, region boost), **Navigate** (zoomed-out mode, hotspots, go to a
+cell) and **Annotate**. **Display** hides the panel, and the app remembers your
+choice.
+
 ## Contrast and brightness
 
 The two are coupled, and that is the point. Together they map a normalised
@@ -40,7 +48,7 @@ flat.
 
 ## PNG export
 
-**Export PNG…** writes the *current view* at up to 2400 px on the longer side —
+**Export ▾ → PNG image…** writes the *current view* at up to 2400 px on the longer side —
 the zoom, colour range, contrast, brightness, colour scheme, region boost and
 any annotation boxes, exactly as shown.
 

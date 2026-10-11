@@ -19,6 +19,8 @@
 #include <set>
 
 #include <QActionGroup>
+#include <QWidgetAction>
+#include <QToolButton>
 #include <QStyleHints>
 #include <QAbstractButton>
 #include <QPointer>
@@ -1095,6 +1097,7 @@ QWidget* MainWindow::buildStartPage() {
     auto* b_npy    = new QPushButton("Open NPY/NPZ…");
     auto* b_subset = new QPushButton("Import Subset…");
     b_open->setDefault(true);
+    b_open->setProperty("primary", true);
     connect(b_open,   &QPushButton::clicked, this, &MainWindow::onOpenFile);
     connect(b_npy,    &QPushButton::clicked, this, &MainWindow::onOpenNpyTraces);
     connect(b_subset, &QPushButton::clicked, this, &MainWindow::onImportTraceSubset);
@@ -1503,6 +1506,8 @@ void MainWindow::updateStateIndicators() {
     if (grp_trace_)    grp_trace_->setEnabled(file_tab);
     if (grp_pipeline_) grp_pipeline_->setEnabled(file_tab);
     if (grp_align_)    grp_align_->setEnabled(file_tab);
+    // Drag-shift edits a file's alignment; it means nothing on a result tab.
+    if (btn_mode_align_) btn_mode_align_->setVisible(file_tab);
 
     if (!file_tab) {
         if (lbl_align_state_) lbl_align_state_->setText("–");
@@ -3806,6 +3811,126 @@ void MainWindow::onLoadNpyTTest() {
 // so 98 discards the 2 % of outliers at each tail. The percentile used to be
 // fixed at 98; how much to clip depends on how heavy the matrix's tails are,
 // so it is a spinbox now.
+// ---------------------------------------------------------------------------
+// Heatmap window layout: a slim top bar, then the heatmap with a collapsible
+// settings panel to its right. Used by the cross-correlation, loaded-heatmap
+// and leakage-plane windows so their many display controls don't stack up
+// as rows above the matrix.
+// ---------------------------------------------------------------------------
+static QWidget* widgetRow(std::initializer_list<QWidget*> ws) {
+    auto* w = new QWidget;
+    auto* l = new QHBoxLayout(w);
+    l->setContentsMargins(0, 0, 0, 0);
+    l->setSpacing(6);
+    for (QWidget* x : ws) l->addWidget(x);
+    l->addStretch();
+    return w;
+}
+
+static QLabel* sectionCaption(const QString& text) {
+    auto* l = new QLabel(text);
+    QFont f = l->font();
+    f.setBold(true);
+    l->setFont(f);
+    l->setContentsMargins(0, 6, 0, 0);
+    return l;
+}
+
+static QWidget* panelSection(const QString& title, QWidget* content) {
+    auto* g = new QGroupBox(title);
+    auto* l = new QVBoxLayout(g);
+    l->addWidget(content);
+    return g;
+}
+
+// The colour controls every heatmap window has, as one form.
+static QWidget* makeHeatmapColourSection(QComboBox* scheme, QDoubleSpinBox* vmin,
+                                         QDoubleSpinBox* vmax, QWidget* autoclip,
+                                         QCheckBox* abs, QDoubleSpinBox* sigma,
+                                         QDoubleSpinBox* gamma, QCheckBox* thresh_chk,
+                                         QDoubleSpinBox* thresh)
+{
+    auto* w = new QWidget;
+    auto* f = new QFormLayout(w);
+    f->setContentsMargins(0, 0, 0, 0);
+    f->addRow("Scheme:", scheme);
+    f->addRow("Min:", vmin);
+    f->addRow("Max:", vmax);
+    f->addRow(autoclip);
+    f->addRow(abs);
+    f->addRow(sectionCaption("Filter"));
+    f->addRow("Gaussian σ:", sigma);
+    f->addRow("Power γ:", gamma);
+    f->addRow(thresh_chk);
+    f->addRow("Level:", thresh);
+    return w;
+}
+
+// A drop-down button whose entries click existing (hidden) buttons, so their
+// handlers stay exactly as they were.
+static QToolButton* makeMenuButton(const QString& text, QWidget* parent,
+                                   std::initializer_list<std::pair<QString, QPushButton*>> items)
+{
+    auto* tb = new QToolButton(parent);
+    tb->setText(text);
+    tb->setPopupMode(QToolButton::InstantPopup);
+    tb->setToolButtonStyle(Qt::ToolButtonTextOnly);
+    auto* m = new QMenu(tb);
+    for (const auto& [label, target] : items) {
+        target->setParent(parent);
+        target->hide();
+        QObject::connect(m->addAction(label), &QAction::triggered, target, &QPushButton::click);
+    }
+    tb->setMenu(m);
+    return tb;
+}
+
+static void layoutHeatmapWindow(QDialog* dlg, HeatmapWidget* heatmap,
+                                const std::vector<QWidget*>& top_rows,
+                                QBoxLayout* toolbar_l,
+                                const std::vector<QWidget*>& sections)
+{
+    auto* panel = new QWidget;
+    auto* pl    = new QVBoxLayout(panel);
+    pl->setContentsMargins(2, 0, 4, 0);
+    pl->setSpacing(6);
+    for (QWidget* sct : sections) pl->addWidget(sct);
+    pl->addStretch();
+
+    auto* scroll = new QScrollArea;
+    scroll->setWidget(panel);
+    scroll->setWidgetResizable(true);
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scroll->setMinimumWidth(280);
+
+    auto* split = new QSplitter(Qt::Horizontal);
+    split->addWidget(heatmap);
+    split->addWidget(scroll);
+    split->setStretchFactor(0, 1);
+    split->setStretchFactor(1, 0);
+    split->setCollapsible(0, false);
+    split->setSizes({900, 300});
+
+    auto* toggle = new QPushButton("Display");
+    toggle->setCheckable(true);
+    toggle->setToolTip("Show or hide the colour, region, navigation and annotation settings");
+    const bool shown = QSettings("trs-viewer", "trs-viewer").value("heatmap/panel", true).toBool();
+    toggle->setChecked(shown);
+    scroll->setVisible(shown);
+    QObject::connect(toggle, &QPushButton::toggled, scroll, [scroll](bool on) {
+        scroll->setVisible(on);
+        QSettings("trs-viewer", "trs-viewer").setValue("heatmap/panel", on);
+    });
+    toolbar_l->addWidget(toggle);
+
+    auto* vl = new QVBoxLayout(dlg);
+    vl->setContentsMargins(4, 4, 4, 4);
+    vl->setSpacing(4);
+    for (QWidget* r : top_rows) if (r) vl->addWidget(r);
+    vl->addWidget(split, 1);
+}
+
 static QWidget* makeAutoClipRow(HeatmapWidget* heatmap,
                                 QDoubleSpinBox* sp_vmin, QDoubleSpinBox* sp_vmax,
                                 QDoubleSpinBox** sp_pct_out = nullptr)
@@ -3855,8 +3980,8 @@ static QWidget* makeHeatmapToneRow(HeatmapWidget* heatmap,
                                    QDoubleSpinBox* sp_clip_pct)
 {
     auto* row = new QWidget;
-    auto* hl  = new QHBoxLayout(row);
-    hl->setContentsMargins(4, 2, 4, 2);
+    auto* hl  = new QFormLayout(row);
+    hl->setContentsMargins(0, 0, 0, 0);
 
     auto* sp_contrast = new QDoubleSpinBox;
     sp_contrast->setRange(0.1, 10.0); sp_contrast->setDecimals(2);
@@ -3963,20 +4088,13 @@ static QWidget* makeHeatmapToneRow(HeatmapWidget* heatmap,
         sp_vmax->setValue(init_vmax);
     });
 
-    hl->addWidget(new QLabel("Contrast:"));
-    hl->addWidget(sp_contrast);
-    hl->addSpacing(8);
-    hl->addWidget(new QLabel("Brightness:"));
-    hl->addWidget(sp_bright);
-    hl->addSpacing(12);
-    hl->addWidget(btn_reset);
-    hl->addSpacing(12);
-    hl->addWidget(btn_select);
-    hl->addWidget(new QLabel("Boost:"));
-    hl->addWidget(sp_boost);
-    hl->addWidget(chk_dim);
-    hl->addWidget(btn_clear);
-    hl->addStretch();
+    hl->addRow("Contrast:", sp_contrast);
+    hl->addRow("Brightness:", sp_bright);
+    hl->addRow(btn_reset);
+    hl->addRow(sectionCaption("Region"));
+    hl->addRow(widgetRow({btn_select, btn_clear}));
+    hl->addRow("Boost:", sp_boost);
+    hl->addRow(chk_dim);
     return row;
 }
 
@@ -3996,8 +4114,8 @@ static QWidget* makeHeatmapAnnotateRow(HeatmapWidget* heatmap,
                                         int32_t rows, int32_t cols, QWidget* dlg)
 {
     auto* row = new QWidget;
-    auto* hl  = new QHBoxLayout(row);
-    hl->setContentsMargins(4, 2, 4, 2);
+    auto* hl  = new QFormLayout(row);
+    hl->setContentsMargins(0, 0, 0, 0);
 
     auto* btn_mode = new QPushButton("Annotate");
     btn_mode->setCheckable(true);
@@ -4070,17 +4188,11 @@ static QWidget* makeHeatmapAnnotateRow(HeatmapWidget* heatmap,
     QObject::connect(heatmap, &HeatmapWidget::annotationsChanged, lbl_count, refresh);
     refresh();
 
-    hl->addWidget(btn_mode);
-    hl->addSpacing(8);
-    hl->addWidget(new QLabel("Top:"));
-    hl->addWidget(sp_top);
-    hl->addWidget(new QLabel("±cells:"));
-    hl->addWidget(sp_pad);
-    hl->addWidget(btn_peaks);
-    hl->addWidget(btn_sel);
-    hl->addWidget(btn_clear);
-    hl->addWidget(lbl_count);
-    hl->addStretch();
+    hl->addRow(btn_mode);
+    hl->addRow("Top peaks:", sp_top);
+    hl->addRow("± cells:", sp_pad);
+    hl->addRow(widgetRow({btn_peaks, btn_sel}));
+    hl->addRow(widgetRow({btn_clear, lbl_count}));
     return row;
 }
 
@@ -4088,8 +4200,8 @@ static QWidget* makeHeatmapNavRow(HeatmapWidget* heatmap, int32_t rows, int32_t 
                                   QWidget* dlg)
 {
     auto* row = new QWidget;
-    auto* hl  = new QHBoxLayout(row);
-    hl->setContentsMargins(4, 2, 4, 2);
+    auto* hl  = new QFormLayout(row);
+    hl->setContentsMargins(0, 0, 0, 0);
 
     auto* cmb_ds = new QComboBox;
     cmb_ds->addItem("Peak |v|");
@@ -4166,17 +4278,13 @@ static QWidget* makeHeatmapNavRow(HeatmapWidget* heatmap, int32_t rows, int32_t 
         d->show();
     });
 
-    hl->addWidget(new QLabel("Zoomed-out:"));
-    hl->addWidget(cmb_ds);
-    hl->addSpacing(12);
-    hl->addWidget(new QLabel("Row:"));  hl->addWidget(sp_row);
-    hl->addWidget(new QLabel("Col:"));  hl->addWidget(sp_col);
-    hl->addWidget(new QLabel("Size:")); hl->addWidget(sp_size);
-    hl->addWidget(btn_goto);
-    hl->addWidget(btn_zoom_sel);
-    hl->addSpacing(12);
-    hl->addWidget(btn_find);
-    hl->addStretch();
+    hl->addRow("Zoomed-out:", cmb_ds);
+    hl->addRow(btn_find);
+    hl->addRow(sectionCaption("Go to"));
+    hl->addRow("Row:", sp_row);
+    hl->addRow("Col:", sp_col);
+    hl->addRow("Size:", sp_size);
+    hl->addRow(widgetRow({btn_goto, btn_zoom_sel}));
     return row;
 }
 
@@ -4347,48 +4455,25 @@ void MainWindow::onLoadNpyHeatmap() {
         QMessageBox::information(dlg, "Saved", "Saved: " + p);
     });
 
-    auto* row1   = new QWidget(dlg);
-    auto* row1_l = new QHBoxLayout(row1);
-    row1_l->setContentsMargins(4, 2, 4, 2);
-    row1_l->addWidget(lbl_hover, 1);
-    row1_l->addWidget(lbl_vmin);
-    row1_l->addWidget(sp_vmin);
-    row1_l->addWidget(lbl_vmax);
-    row1_l->addWidget(sp_vmax);
-    row1_l->addWidget(btn_autoclip);
-    row1_l->addWidget(btn_reset_view);
-    row1_l->addWidget(btn_exp_png);
-    row1_l->addWidget(btn_exp_npy);
-
-    auto* row2   = new QWidget(dlg);
-    auto* row2_l = new QHBoxLayout(row2);
-    row2_l->setContentsMargins(4, 2, 4, 2);
-    row2_l->addWidget(lbl_scheme);
-    row2_l->addWidget(combo_scheme);
-    row2_l->addSpacing(12);
-    row2_l->addWidget(lbl_sigma);
-    row2_l->addWidget(sp_sigma);
-    row2_l->addSpacing(8);
-    row2_l->addWidget(chk_abs);
-    row2_l->addSpacing(8);
-    row2_l->addWidget(lbl_gamma);
-    row2_l->addWidget(sp_gamma);
-    row2_l->addSpacing(8);
-    row2_l->addWidget(chk_thresh);
-    row2_l->addWidget(sp_thresh);
-    row2_l->addStretch();
-
     auto* tone_row = makeHeatmapToneRow(heatmap, combo_scheme, sp_sigma, chk_abs, sp_gamma,
                                         chk_thresh, sp_thresh, sp_vmin, sp_vmax, sp_clip_pct);
 
-    auto* vl = new QVBoxLayout(dlg);
-    vl->setContentsMargins(4, 4, 4, 4); vl->setSpacing(4);
-    vl->addWidget(row1);
-    vl->addWidget(row2);
-    vl->addWidget(tone_row);
-    vl->addWidget(makeHeatmapNavRow(heatmap, M, M, dlg));
-    vl->addWidget(makeHeatmapAnnotateRow(heatmap, M, M, dlg));
-    vl->addWidget(heatmap, 1);
+    auto* bar   = new QWidget(dlg);
+    auto* bar_l = new QHBoxLayout(bar);
+    bar_l->setContentsMargins(4, 2, 4, 2);
+    bar_l->addWidget(lbl_hover, 1);
+    bar_l->addWidget(btn_reset_view);
+    bar_l->addWidget(makeMenuButton("Export", dlg, {{"PNG image…", btn_exp_png},
+                                                    {"Matrix as .npy…", btn_exp_npy}}));
+    delete lbl_vmin; delete lbl_vmax; delete lbl_scheme; delete lbl_sigma; delete lbl_gamma;
+
+    layoutHeatmapWindow(dlg, heatmap, {bar}, bar_l, {
+        panelSection("Colour", makeHeatmapColourSection(combo_scheme, sp_vmin, sp_vmax, btn_autoclip,
+                                                        chk_abs, sp_sigma, sp_gamma, chk_thresh, sp_thresh)),
+        panelSection("Tone", tone_row),
+        panelSection("Navigate", makeHeatmapNavRow(heatmap, M, M, dlg)),
+        panelSection("Annotate", makeHeatmapAnnotateRow(heatmap, M, M, dlg)),
+    });
     dlg->show();
 }
 
@@ -5857,8 +5942,9 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
 
     // Controls row
     auto* lbl_groups = new QLabel(
-        QString("Group 0: <b>%1</b> traces    Group 1: <b>%2</b> traces")
-            .arg(n0).arg(n1));
+        QString("G0 <b>%1</b> · G1 <b>%2</b> traces")
+            .arg(QLocale().toString(static_cast<qlonglong>(n0)))
+            .arg(QLocale().toString(static_cast<qlonglong>(n1))));
     lbl_groups->setTextFormat(Qt::RichText);
 
     auto* lbl_thr  = new QLabel("Threshold ±:");
@@ -6068,76 +6154,58 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     auto* ctrl_l = new FlowLayout(ctrl, /*margin=*/0, /*h_spacing=*/6, /*v_spacing=*/4);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
 
-    // Mode buttons
-    auto* btn_pan_tt  = new QPushButton("Pan");
-    auto* btn_meas_tt = new QPushButton("Measure");
-    auto* btn_bz_tt   = new QPushButton("⬚ Zoom");
-    auto* btn_crop_tt = new QPushButton("✂ Cut");
-    auto* btn_rst_tt  = new QPushButton("Reset");
-    btn_pan_tt->setCheckable(true);  btn_pan_tt->setChecked(true);
-    btn_meas_tt->setCheckable(true);
-    btn_bz_tt->setCheckable(true);
-    btn_crop_tt->setCheckable(true);
-    btn_pan_tt->setToolTip("Drag to pan, scroll to zoom");
-    btn_meas_tt->setToolTip("Click two points to measure distance");
-    btn_bz_tt->setToolTip("Drag to rubber-band zoom");
-    btn_crop_tt->setToolTip("Drag to select a region to cut (exclude from export)");
-    btn_rst_tt->setToolTip("Reset view");
-    auto* mg_tt = new QButtonGroup(pw);
-    mg_tt->addButton(btn_pan_tt,  0);
-    mg_tt->addButton(btn_meas_tt, 1);
-    mg_tt->addButton(btn_bz_tt,   2);
-    mg_tt->addButton(btn_crop_tt, 3);
-    connect(mg_tt, QOverload<int>::of(&QButtonGroup::idClicked), pw, [pw](int id) {
-        InteractionMode m = id == 0 ? InteractionMode::Pan
-                          : id == 1 ? InteractionMode::Measure
-                          : id == 2 ? InteractionMode::BoxZoom
-                                    : InteractionMode::CropSelect;
-        pw->setMode(m);
+    // One row: the analysis controls on the left, Style/Export on the right.
+    // Pan/Measure/Zoom/Reset/Amp come from the main toolbar (they act on
+    // the active tab), so only Cut — a mode the main toolbar lacks — lives
+    // here.
+    auto* btn_cut = new QPushButton("Cut");
+    btn_cut->setCheckable(true);
+    btn_cut->setToolTip("Drag across the plot to cut a region out of the exported result");
+    connect(btn_cut, &QPushButton::toggled, pw, [this, pw](bool on) {
+        if (on) {
+            // Clear the main toolbar's exclusive mode buttons while cutting.
+            mode_group_->setExclusive(false);
+            for (QAbstractButton* b : mode_group_->buttons()) b->setChecked(false);
+            mode_group_->setExclusive(true);
+            pw->setMode(InteractionMode::CropSelect);
+        } else if (pw->mode() == InteractionMode::CropSelect) {
+            resetInteractionModeToPan();
+        }
     });
-    connect(btn_rst_tt, &QPushButton::clicked, pw, [pw]() { pw->resetView(); });
+    connect(mode_group_, &QButtonGroup::idClicked, btn_cut, [btn_cut]() {
+        QSignalBlocker block(btn_cut);
+        btn_cut->setChecked(false);
+    });
 
-    ctrl_l->addWidget(btn_pan_tt);
-    ctrl_l->addWidget(btn_meas_tt);
-    ctrl_l->addWidget(btn_bz_tt);
-    ctrl_l->addWidget(btn_crop_tt);
-    ctrl_l->addWidget(btn_rst_tt);
-    ctrl_l->addItem(new QSpacerItem(8, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
     ctrl_l->addWidget(lbl_groups);
-    auto* btn_yzi = new QPushButton("↑ Amp");
-    auto* btn_yzo = new QPushButton("↓ Amp");
-    btn_yzi->setToolTip("Zoom in Y (Ctrl/Shift+scroll up)");
-    btn_yzo->setToolTip("Zoom out Y / shorter traces (Ctrl/Shift+scroll down)");
-    connect(btn_yzi, &QPushButton::clicked, pw, [pw](){ pw->zoomInY(); });
-    connect(btn_yzo, &QPushButton::clicked, pw, [pw](){ pw->zoomOutY(); });
-
+    ctrl_l->addItem(new QSpacerItem(10, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
     ctrl_l->addWidget(lbl_thr);
     ctrl_l->addWidget(spin_thr);
     ctrl_l->addWidget(chk_onesided);
     ctrl_l->addWidget(btn_calc_th);
-    ctrl_l->addItem(new QSpacerItem(8, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
-    ctrl_l->addWidget(btn_yzi);
-    ctrl_l->addWidget(btn_yzo);
-    ctrl_l->addItem(new QSpacerItem(8, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
-    ctrl_l->addWidget(btn_style);
-    ctrl_l->addWidget(btn_exp_trs);
-    ctrl_l->addWidget(btn_exp_npy);
-    ctrl_l->addWidget(btn_exp_pdf);
-    ctrl_l->addWidget(btn_exp_png);
+    ctrl_l->addItem(new QSpacerItem(10, 1, QSizePolicy::Fixed, QSizePolicy::Minimum));
+    ctrl_l->addWidget(btn_cut);
 
-    // Trim row
+    // Trim: exclude samples at either end of the exported result. Lives in
+    // a small popup instead of its own toolbar row.
     int64_t n_full_tt = static_cast<int64_t>(tstat_ptr->size());
     auto* trim_row = new QWidget;
-    auto* trim_l   = new QHBoxLayout(trim_row);
-    trim_l->setContentsMargins(4, 0, 4, 0);
+    auto* trim_l   = new QFormLayout(trim_row);
+    trim_l->setContentsMargins(8, 6, 8, 6);
     auto* sp_excl_start = new QSpinBox; sp_excl_start->setRange(0, static_cast<int>(n_full_tt / 2));
     auto* sp_excl_end   = new QSpinBox; sp_excl_end->setRange(0, static_cast<int>(n_full_tt / 2));
     sp_excl_start->setToolTip("Samples to exclude from the start");
     sp_excl_end->setToolTip("Samples to exclude from the end");
     auto* lbl_vis_tt = new QLabel; lbl_vis_tt->setTextFormat(Qt::RichText);
 
+    auto* lbl_vis_tt_short = new QLabel;
+    lbl_vis_tt_short->setTextFormat(Qt::RichText);
     auto upd_lbl_tt = [=]() {
         lbl_vis_tt->setText(QString("Exporting <b>%1</b> / %2 samples")
+            .arg(current_ptr->size()).arg(n_full_tt));
+        const bool trimmed = static_cast<int64_t>(current_ptr->size()) != n_full_tt;
+        lbl_vis_tt_short->setVisible(trimmed);
+        lbl_vis_tt_short->setText(QString("<b>%1</b> / %2 samples")
             .arg(current_ptr->size()).arg(n_full_tt));
     };
     auto skip_tt = std::make_shared<bool>(false);
@@ -6177,22 +6245,31 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     connect(sp_excl_end,   QOverload<int>::of(&QSpinBox::valueChanged), pw, [=](int){ do_trim_tt(); });
     upd_lbl_tt();
 
-    trim_l->addWidget(new QLabel("Exclude:"));
-    trim_l->addWidget(new QLabel("start"));
-    trim_l->addWidget(sp_excl_start);
-    trim_l->addWidget(new QLabel("end"));
-    trim_l->addWidget(sp_excl_end);
-    trim_l->addWidget(new QLabel("samples  —"));
-    trim_l->addWidget(lbl_vis_tt);
-    trim_l->addStretch();
+    trim_l->addRow("Exclude at start:", sp_excl_start);
+    trim_l->addRow("Exclude at end:",   sp_excl_end);
+    trim_l->addRow(lbl_vis_tt);
 
-    auto* extra = new QWidget;
-    auto* extra_l = new QVBoxLayout(extra);
-    extra_l->setContentsMargins(0, 0, 0, 0);
-    extra_l->setSpacing(4);
-    extra_l->addWidget(ctrl);
-    extra_l->addWidget(trim_row);
-    activeDs().extra_toolbar = extra;
+    auto* btn_trim = new QToolButton;
+    btn_trim->setText("Trim");
+    btn_trim->setToolTip("Exclude samples at the start or end of the exported result");
+    btn_trim->setPopupMode(QToolButton::InstantPopup);
+    auto* trim_menu = new QMenu(btn_trim);
+    auto* trim_act  = new QWidgetAction(trim_menu);
+    trim_act->setDefaultWidget(trim_row);
+    trim_menu->addAction(trim_act);
+    btn_trim->setMenu(trim_menu);
+    ctrl_l->addWidget(btn_trim);
+    ctrl_l->addWidget(lbl_vis_tt_short);
+
+    // Right-hand side: one Style button and one Export menu.
+    ctrl_l->addWidget(btn_style);
+    ctrl_l->addWidget(makeMenuButton("Export", ctrl, {
+        {"PNG image…",         btn_exp_png},
+        {"PDF (vector)…",      btn_exp_pdf},
+        {"Curve as .npz…",     btn_exp_npy},
+        {"Curve as TRS…",      btn_exp_trs}}));
+
+    activeDs().extra_toolbar = ctrl;
     updateViewLayout();
 }
 
@@ -7272,34 +7349,13 @@ void MainWindow::onRunXCorr() {
     auto* ctrl_l = new QHBoxLayout(ctrl);
     ctrl_l->setContentsMargins(4, 2, 4, 2);
     ctrl_l->addWidget(lbl_hover, 1);
-    ctrl_l->addWidget(lbl_vmin);
-    ctrl_l->addWidget(sp_vmin);
-    ctrl_l->addWidget(lbl_vmax);
-    ctrl_l->addWidget(sp_vmax);
-    ctrl_l->addWidget(btn_autoclip2);
     ctrl_l->addWidget(btn_reset_view);
-    ctrl_l->addWidget(btn_exp_png);
-    ctrl_l->addWidget(btn_exp_npy);
     ctrl_l->addWidget(btn_show_traces);
-    ctrl_l->addWidget(btn_exp_corr_trs);
-
-    auto* proc_row  = new QWidget(dlg);
-    auto* proc_row_l = new QHBoxLayout(proc_row);
-    proc_row_l->setContentsMargins(4, 2, 4, 2);
-    proc_row_l->addWidget(lbl_scheme2);
-    proc_row_l->addWidget(combo_scheme2);
-    proc_row_l->addSpacing(12);
-    proc_row_l->addWidget(lbl_sigma2);
-    proc_row_l->addWidget(sp_sigma2);
-    proc_row_l->addSpacing(8);
-    proc_row_l->addWidget(chk_abs2);
-    proc_row_l->addSpacing(8);
-    proc_row_l->addWidget(lbl_gamma2);
-    proc_row_l->addWidget(sp_gamma2);
-    proc_row_l->addSpacing(8);
-    proc_row_l->addWidget(chk_thresh2);
-    proc_row_l->addWidget(sp_thresh2);
-    proc_row_l->addStretch();
+    ctrl_l->addWidget(makeMenuButton("Export", dlg, {
+        {"PNG image…",                 btn_exp_png},
+        {"Matrix as .npy…",            btn_exp_npy},
+        {"Correlation traces as .trs…", btn_exp_corr_trs}}));
+    delete lbl_vmin; delete lbl_vmax; delete lbl_scheme2; delete lbl_sigma2; delete lbl_gamma2;
 
     // Info bar (λ+, n_signal for MP-Cleaned)
     QWidget* info_bar = nullptr;
@@ -7407,19 +7463,18 @@ void MainWindow::onRunXCorr() {
         pl->addStretch();
     }
 
-    auto* vl = new QVBoxLayout(dlg);
-    vl->setContentsMargins(4, 4, 4, 4);
-    vl->setSpacing(4);
-    if (info_bar) vl->addWidget(info_bar);
-    if (peak_row) vl->addWidget(peak_row);
-    vl->addWidget(ctrl);
-    vl->addWidget(proc_row);
-    vl->addWidget(makeHeatmapToneRow(heatmap, combo_scheme2, sp_sigma2, chk_abs2, sp_gamma2,
-                                     chk_thresh2, sp_thresh2, sp_vmin, sp_vmax, sp_clip_pct2));
-    vl->addWidget(makeHeatmapNavRow(heatmap, result_ptr->rows, result_ptr->cols, dlg));
-    vl->addWidget(makeHeatmapAnnotateRow(heatmap, result_ptr->rows,
-                                          result_ptr->cols, dlg));
-    vl->addWidget(heatmap, 1);
+    layoutHeatmapWindow(dlg, heatmap, {info_bar, peak_row, ctrl}, ctrl_l, {
+        panelSection("Colour", makeHeatmapColourSection(combo_scheme2, sp_vmin, sp_vmax,
+                                                        btn_autoclip2, chk_abs2, sp_sigma2,
+                                                        sp_gamma2, chk_thresh2, sp_thresh2)),
+        panelSection("Tone", makeHeatmapToneRow(heatmap, combo_scheme2, sp_sigma2, chk_abs2,
+                                                sp_gamma2, chk_thresh2, sp_thresh2,
+                                                sp_vmin, sp_vmax, sp_clip_pct2)),
+        panelSection("Navigate", makeHeatmapNavRow(heatmap, result_ptr->rows,
+                                                   result_ptr->cols, dlg)),
+        panelSection("Annotate", makeHeatmapAnnotateRow(heatmap, result_ptr->rows,
+                                                        result_ptr->cols, dlg)),
+    });
 
     dlg->show();
     };
@@ -7695,6 +7750,7 @@ void MainWindow::showSpectralLineDialog(QWidget* parent, PlotWidget* pw,
     auto* btn_none   = new QPushButton("Uncheck all");
     auto* btn_close  = new QPushButton("Close");
     btn_run->setDefault(true);
+    btn_run->setProperty("primary", true);
 
     connect(btn_run, &QPushButton::clicked, d, run);
     connect(btn_none, &QPushButton::clicked, d, [tbl]() {
@@ -8603,15 +8659,18 @@ void MainWindow::onRunSpectralLeakage() {
                 hm->setMatrix(*plane, nw, nb);
                 hm->setAbsValue(true);        // sign is not informative here
                 hm->setColorScheme(ColorScheme::Viridis);   // magnitudes: sequential map
-                auto* v = new QVBoxLayout(dlg);
                 auto* lbl = new QLabel(QString(
                     "Rows: STFT time windows (0 = start of the region). "
                     "Columns: frequency bins, 0 = DC, %1 = Nyquist. "
                     "Brightness is |t|.").arg(nb - 1));
                 lbl->setWordWrap(true);
-                v->addWidget(lbl);
-                v->addWidget(hm, 1);
-                v->addWidget(makeHeatmapAnnotateRow(hm, nw, nb, dlg));
+                auto* bar   = new QWidget(dlg);
+                auto* bar_l = new QHBoxLayout(bar);
+                bar_l->setContentsMargins(4, 2, 4, 2);
+                bar_l->addWidget(lbl, 1);
+                layoutHeatmapWindow(dlg, hm, {bar}, bar_l, {
+                    panelSection("Annotate", makeHeatmapAnnotateRow(hm, nw, nb, dlg)),
+                });
                 dlg->show();
             });
             if (QWidget* bar = activeDs().extra_toolbar) {
