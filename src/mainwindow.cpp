@@ -74,6 +74,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <mutex>
 #include <cmath>
 #include <cstdio>
 #include <limits>
@@ -5198,6 +5199,281 @@ static bool confirmTTestMemory(QWidget* parent,
         QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes;
 }
 
+// ---------------------------------------------------------------------------
+// Live t-test view — the result tab shown while a live t-test job runs.
+// Everything here lives on the GUI thread; snapshots arrive through the
+// latest-only mailbox (m / pending / posted) filled by the worker.
+// ---------------------------------------------------------------------------
+struct LiveTTestView {
+    QPointer<QWidget>      holder;    // the tab's extra toolbar; null once the tab is closed
+    QPointer<PlotWidget>   curve;     // t-curve: current snapshot + faded earlier ones
+    QPointer<PlotWidget>   history;   // max|t| vs traces processed
+    QPointer<QLabel>       status;
+    QPointer<QProgressBar> bar;
+    QPointer<QPushButton>  btn_pause, btn_stop, btn_cancel;
+    QPointer<QCheckBox>    chk_overlay;
+
+    std::shared_ptr<TTestLive> live;
+    int     job_id    = -1;
+    int32_t total     = 0;
+    float   threshold = 4.5f;
+    bool    finished  = false;
+
+    struct Curve { std::shared_ptr<std::vector<float>> t; int64_t done = 0; };
+    std::deque<Curve> earlier;   // oldest first, ≤ 3
+    Curve current;
+    std::shared_ptr<std::vector<float>> hist = std::make_shared<std::vector<float>>();
+    int64_t first_cross     = -1;
+    bool    curve_started   = false;
+    bool    history_started = false;
+    std::shared_ptr<const LiveTTestSnapshot> last;
+
+    std::mutex m;
+    std::shared_ptr<const LiveTTestSnapshot> pending;
+    bool posted = false;
+};
+
+static QString formatEta(double secs) {
+    if (!(secs >= 0.0) || secs > 359999.0) return "–";
+    const int s = static_cast<int>(secs + 0.5);
+    return s >= 3600 ? QString("%1:%2:%3").arg(s / 3600).arg((s / 60) % 60, 2, 10, QChar('0'))
+                                          .arg(s % 60, 2, 10, QChar('0'))
+                     : QString("%1:%2").arg(s / 60).arg(s % 60, 2, 10, QChar('0'));
+}
+
+static void finishLiveTTestView(LiveTTestView& v, bool ok, const QString& err) {
+    v.finished = true;
+    for (QPushButton* b : {v.btn_pause.data(), v.btn_stop.data(), v.btn_cancel.data()})
+        if (b) b->setEnabled(false);
+    if (!v.status) return;
+    const QLocale l;
+    QString head;
+    if (!ok)
+        head = (err == "Cancelled.") ? QString("<b>Cancelled</b> — nothing was kept.")
+                                     : QString("<b>Failed:</b> %1").arg(err.toHtmlEscaped());
+    else if (v.live && v.live->stopped_early)
+        head = QString("<b>Stopped early</b> after %1 of %2 traces — the full result tab "
+                       "covers those traces.")
+                   .arg(l.toString(static_cast<qlonglong>(v.live->processed)))
+                   .arg(l.toString(v.total));
+    else
+        head = QString("<b>Finished</b> — %1 traces. The full result opened in its own tab; "
+                       "this tab keeps the history.").arg(l.toString(v.total));
+    if (v.first_cross >= 0)
+        head += QString("<br>|t| first exceeded %1 at ~%2 traces (indicative).")
+                    .arg(v.threshold).arg(l.toString(static_cast<qlonglong>(v.first_cross)));
+    v.status->setText(head);
+    if (v.bar && ok && !(v.live && v.live->stopped_early)) v.bar->setValue(v.bar->maximum());
+}
+
+std::shared_ptr<LiveTTestView> MainWindow::createLiveTTestTab(const QString& title, int32_t total,
+                                                               bool abs_value,
+                                                               const std::shared_ptr<TTestLive>& live)
+{
+    auto v = std::make_shared<LiveTTestView>();
+    v->live      = live;
+    v->total     = total;
+    v->threshold = live->threshold;
+
+    const QString value_label = abs_value ? "|t|-value" : "t-value";
+    addResultTab(std::vector<float>{0.0f}, title, QColor("#1f77b4"), value_label);
+    PlotWidget* pw = plotWidget();
+    pw->setTheme(PlotTheme::light());
+    pw->setAxisLabels("Sample Index", value_label);
+    pw->setThresholds(true, v->threshold, -v->threshold);
+    if (abs_value) pw->setThresholdOneSided(true);
+    pw->setTitle("Waiting for the first snapshot…");
+    v->curve = pw;
+
+    auto* holder = new QWidget;
+    auto* vl     = new QVBoxLayout(holder);
+    vl->setContentsMargins(6, 4, 6, 2);
+    vl->setSpacing(4);
+
+    auto* row = new QWidget;
+    auto* rl  = new FlowLayout(row, 0, 8, 4);
+    auto* bar = new QProgressBar;
+    bar->setRange(0, std::max(1, total));
+    bar->setValue(0);
+    bar->setFixedWidth(200);
+    auto* btn_pause  = new QPushButton("Pause");
+    auto* btn_stop   = new QPushButton("Stop && Keep Result");
+    auto* btn_cancel = new QPushButton("Cancel");
+    btn_pause->setToolTip("Hold the run between batches; Resume continues where it left off.");
+    btn_stop->setToolTip("End now and open the full result for the traces processed so far.");
+    btn_cancel->setToolTip("Abort and discard the run.");
+    auto* chk_overlay = new QCheckBox("Show earlier snapshots");
+    chk_overlay->setChecked(true);
+    chk_overlay->setToolTip("Draw the previous three snapshots faded behind the current one, "
+                            "so you can see peaks grow as traces accumulate.");
+    rl->addWidget(bar);
+    rl->addWidget(btn_pause);
+    rl->addWidget(btn_stop);
+    rl->addWidget(btn_cancel);
+    rl->addWidget(chk_overlay);
+
+    auto* status = new QLabel("Starting…");
+    status->setTextFormat(Qt::RichText);
+    status->setWordWrap(true);
+
+    auto* hist = new PlotWidget(holder);
+    hist->setTheme(PlotTheme::light());
+    hist->setFixedHeight(180);
+    hist->setAxisLabels("Traces processed", "max |t|");
+    hist->setTitle("max |t| vs traces processed");
+    hist->setThresholds(true, v->threshold, -v->threshold);
+    hist->setThresholdOneSided(true);
+
+    auto* note = new QLabel(QString(
+        "Checking against %1 after every update raises the false-positive rate, so the first "
+        "crossing is only indicative. Judge the final result (Calc TH in the result tab).")
+        .arg(v->threshold));
+    note->setWordWrap(true);
+    {
+        QFont f = note->font();
+        f.setPointSizeF(f.pointSizeF() * 0.9);
+        note->setFont(f);
+    }
+
+    vl->addWidget(row);
+    vl->addWidget(status);
+    vl->addWidget(hist);
+    vl->addWidget(note);
+
+    v->holder = holder;  v->history = hist;  v->status = status;  v->bar = bar;
+    v->btn_pause = btn_pause;  v->btn_stop = btn_stop;  v->btn_cancel = btn_cancel;
+    v->chk_overlay = chk_overlay;
+
+    std::weak_ptr<LiveTTestView> wv = v;
+    connect(btn_pause, &QPushButton::clicked, holder, [wv]() {
+        auto v = wv.lock();
+        if (!v || !v->live) return;
+        const bool now_paused = !v->live->paused.load();
+        v->live->paused = now_paused;
+        v->btn_pause->setText(now_paused ? "Resume" : "Pause");
+        if (now_paused && v->status) v->status->setText("<b>Paused</b> — press Resume to continue.");
+    });
+    connect(btn_stop, &QPushButton::clicked, holder, [wv]() {
+        auto v = wv.lock();
+        if (!v || !v->live) return;
+        v->live->stop_keep = true;
+        v->live->paused    = false;
+        v->btn_stop->setEnabled(false);
+        v->btn_pause->setEnabled(false);
+        if (v->status) v->status->setText("Stopping after the current batch…");
+    });
+    connect(btn_cancel, &QPushButton::clicked, holder, [this, wv]() {
+        auto v = wv.lock();
+        if (!v) return;
+        if (v->live) v->live->paused = false;
+        if (v->job_id >= 0) jobs_->cancel(v->job_id);
+        v->btn_cancel->setEnabled(false);
+    });
+    connect(chk_overlay, &QCheckBox::toggled, holder, [this, wv]() {
+        auto v = wv.lock();
+        if (v && v->last) {
+            // Redraw the last snapshot without pushing it into the history again.
+            v->current = {};
+            applyLiveTTestSnapshot(*v, *v->last);
+        }
+    });
+
+    activeDs().extra_toolbar = holder;
+    updateViewLayout();
+    return v;
+}
+
+void MainWindow::applyLiveTTestSnapshot(LiveTTestView& v, const LiveTTestSnapshot& s) {
+    if (!v.holder) return;   // tab was closed; the job just runs to completion
+    const QLocale l;
+
+    if (v.bar) v.bar->setValue(static_cast<int>(std::min<int64_t>(s.done, v.total)));
+
+    // --- t-curve ---
+    if (!s.tstat.empty() && v.curve) {
+        auto cur = std::make_shared<std::vector<float>>(s.tstat);
+        // Overlays cost a full copy of the curve each; past a couple of
+        // million samples that is hundreds of MB for a cosmetic feature.
+        if (s.tstat.size() > 2'000'000 && v.chk_overlay && v.chk_overlay->isEnabled()) {
+            QSignalBlocker block(v.chk_overlay.data());   // don't re-enter via toggled()
+            v.chk_overlay->setChecked(false);
+            v.chk_overlay->setEnabled(false);
+            v.chk_overlay->setToolTip("Turned off for traces this long, to save memory.");
+            v.earlier.clear();
+        }
+        // The final snapshot can repeat the last periodic one's trace count;
+        // replace instead of pushing a duplicate into the overlays.
+        if (v.current.t && v.current.done != s.done
+            && v.chk_overlay && v.chk_overlay->isEnabled()) {
+            v.earlier.push_back(v.current);
+            while (v.earlier.size() > 3) v.earlier.pop_front();
+        }
+        v.current = {cur, s.done};
+
+        PlotWidget* pw = v.curve;
+        const PlotViewState vs = pw->captureViewState();
+        pw->clearTraces();
+        if (v.chk_overlay && v.chk_overlay->isChecked()) {
+            int k = 0;
+            for (const auto& e : v.earlier) {
+                const int alpha = 45 + 30 * k++;   // older = fainter
+                pw->addTrace(e.t, QColor(31, 119, 180, alpha),
+                             QString("after %1").arg(l.toString(static_cast<qlonglong>(e.done))));
+            }
+        }
+        pw->addTrace(cur, QColor("#1f77b4"),
+                     QString("after %1 traces").arg(l.toString(static_cast<qlonglong>(s.done))));
+        if (!v.curve_started) pw->resetView();
+        else                  pw->restoreViewState(vs);
+        pw->setTitle(QString("Welch t after %1 of %2 traces")
+                         .arg(l.toString(static_cast<qlonglong>(s.done))).arg(l.toString(v.total)));
+        v.curve_started = true;
+    }
+
+    // --- max|t| history: one value per trace processed (step-filled) ---
+    const float value = s.tstat.empty() ? 0.0f : s.max_abs;
+    if (s.done > static_cast<int64_t>(v.hist->size())) {
+        v.hist->resize(static_cast<size_t>(s.done), value);
+        if (PlotWidget* hp = v.history) {
+            if (!v.history_started) {
+                hp->addTrace(v.hist, QColor("#d0582a"), "max |t|");
+                hp->resetView();
+                v.history_started = true;
+            } else {
+                // Keep following the growing range unless the user zoomed in.
+                const bool following = hp->viewStart() == 0;
+                hp->replaceMemTrace(0, v.hist);
+                if (following) hp->setViewRange(0, static_cast<int64_t>(v.hist->size()));
+            }
+        }
+    }
+    if (v.first_cross < 0 && !s.tstat.empty() && s.max_abs > v.threshold)
+        v.first_cross = s.done;
+
+    // --- status line ---
+    if (v.finished || !v.status) return;
+    QString st;
+    if (s.tstat.empty()) {
+        st = QString("Waiting for both groups to reach 2 traces (G0: %1, G1: %2)…")
+                 .arg(s.n0).arg(s.n1);
+    } else {
+        const double eta = s.traces_per_s > 0.0 ? (v.total - s.done) / s.traces_per_s : -1.0;
+        st = QString("<b>%1 / %2</b> traces · G0 %3 · G1 %4 · %5 traces/s · ETA %6"
+                     " · max |t| <b>%7</b> · %8 samples over %9")
+                 .arg(l.toString(static_cast<qlonglong>(s.done))).arg(l.toString(v.total))
+                 .arg(l.toString(static_cast<qlonglong>(s.n0)))
+                 .arg(l.toString(static_cast<qlonglong>(s.n1)))
+                 .arg(l.toString(s.traces_per_s, 'f', 0)).arg(formatEta(eta))
+                 .arg(s.max_abs, 0, 'f', 2)
+                 .arg(l.toString(static_cast<qlonglong>(s.n_exceed))).arg(v.threshold);
+        if (v.first_cross >= 0)
+            st += QString(" · first over %1 at ~%2 traces")
+                      .arg(v.threshold).arg(l.toString(static_cast<qlonglong>(v.first_cross)));
+    }
+    if (v.live && v.live->paused.load()) st = "<b>Paused</b> · " + st;
+    v.status->setText(st);
+}
+
 void MainWindow::onRunTTest() {
     showTTestDialog(nullptr);
 }
@@ -5331,6 +5607,33 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                         "symmetric and comparable regardless of leakage direction.");
     fl->addRow(chk_abs);
 
+    // Live progress: intermediate t-curves while the job runs (ttest_run.h).
+    auto* grp_live = new QGroupBox("Live progress");
+    auto* fl_live  = new QFormLayout(grp_live);
+    auto* chk_live = mem.bind(new QCheckBox("Show intermediate results while it runs"), "live");
+    chk_live->setChecked(true);
+    chk_live->setToolTip("Opens the result tab immediately and redraws the t-curve as traces "
+                         "come in, with a max |t| vs traces-processed plot underneath. "
+                         "Pause, or stop early and keep the result so far.");
+    auto* sp_every = mem.bind(new QSpinBox, "live_every");
+    sp_every->setRange(50, 10000000);
+    sp_every->setSingleStep(500);
+    sp_every->setValue(std::clamp(n_total / 25, 100, 5000));
+    sp_every->setToolTip("Recompute the t-curve after this many traces. The display is "
+                         "also limited to a few updates per second.");
+    auto* chk_shuffle = mem.bind(new QCheckBox("Random trace order (recommended)"), "live_shuffle");
+    chk_shuffle->setChecked(true);
+    chk_shuffle->setToolTip("Process the traces in a fixed pseudo-random order. If the file "
+                            "stores one group first and then the other, file order would make "
+                            "early results lopsided or impossible to compute. The final result "
+                            "is the same either way.");
+    fl_live->addRow(chk_live);
+    fl_live->addRow("Update every (traces):", sp_every);
+    fl_live->addRow(chk_shuffle);
+    connect(chk_live, &QCheckBox::toggled, sp_every, &QWidget::setEnabled);
+    connect(chk_live, &QCheckBox::toggled, chk_shuffle, &QWidget::setEnabled);
+    fl->addRow(grp_live);
+
     QCheckBox* chk_add_chain = nullptr;
     if (onAddToChain) {
         chk_add_chain = new QCheckBox("Add to Chain");
@@ -5400,7 +5703,10 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     const int64_t prompt_ns = (eff_n_samples == 0)
         ? (h.num_samples - eff_first_sample)
         : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
-    if (!confirmTTestMemory(this, job_pipeline, prompt_ns, jobs_->plannedThreadBudget()))
+    const bool want_live = chk_live->isChecked();
+    // A live run merges into one extra scratch accumulator for snapshots.
+    if (!confirmTTestMemory(this, job_pipeline, prompt_ns,
+                            jobs_->plannedThreadBudget() + (want_live ? 1 : 0)))
         return;
 
     struct TTestOut {
@@ -5413,7 +5719,43 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     const QString job_title = QString("T-test — %1 (%2 traces)")
                                   .arg(activeDs().display_name).arg(eff_count);
 
-    jobs_->submit(job_title,
+    std::shared_ptr<TTestLive>     live;
+    std::shared_ptr<LiveTTestView> view;
+    if (want_live) {
+        live = std::make_shared<TTestLive>();
+        live->snapshot_every = sp_every->value();
+        if (chk_shuffle->isChecked())
+            live->order = makeInterleavedOrder(eff_count, 0x7e57'5eedULL);
+        view = createLiveTTestTab(QString("Live t-test — %1").arg(activeDs().display_name),
+                                  eff_count, abs_value, live);
+        // Worker thread → GUI: keep only the newest snapshot and post at
+        // most one redraw at a time, so a slow repaint drops intermediate
+        // snapshots instead of queueing them up.
+        std::weak_ptr<LiveTTestView> wv = view;
+        live->on_snapshot = [this, wv](std::shared_ptr<const LiveTTestSnapshot> snap) {
+            auto v = wv.lock();
+            if (!v) return;
+            {
+                std::lock_guard<std::mutex> lk(v->m);
+                v->pending = std::move(snap);
+                if (v->posted) return;
+                v->posted = true;
+            }
+            QMetaObject::invokeMethod(this, [this, wv]() {
+                auto v = wv.lock();
+                if (!v) return;
+                std::shared_ptr<const LiveTTestSnapshot> s;
+                {
+                    std::lock_guard<std::mutex> lk(v->m);
+                    s = std::move(v->pending);
+                    v->posted = false;
+                }
+                if (s) { v->last = s; applyLiveTTestSnapshot(*v, *s); }
+            }, Qt::QueuedConnection);
+        };
+    }
+
+    const int job_id = jobs_->submit(job_title,
         [=](JobContext& ctx) {
             return computeTTestCore(job_file.get(), job_pipeline,
                                      eff_first, eff_count, eff_first_sample, eff_n_samples,
@@ -5424,18 +5766,26 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                                          return !ctx.cancelled();
                                      },
                                      out->acc, out->tstat, out->n0, out->n1,
-                                     out->warn, out->err);
+                                     out->warn, out->err, live.get());
         },
         [=](bool ok) {
+            if (view) finishLiveTTestView(*view, ok, ok ? QString() : out->err);
             if (!ok) {
                 if (!out->err.isEmpty() && out->err != "Cancelled.")
                     QMessageBox::critical(this, "T-test failed", out->err);
                 return;
             }
-            if (!out->warn.isEmpty()) QMessageBox::warning(this, "T-test", out->warn);
+            // Stopping early is the user's own choice and already shown in
+            // the live tab — only pop up for the other warnings.
+            QStringList warn = out->warn.split('\n', Qt::SkipEmptyParts);
+            warn.erase(std::remove_if(warn.begin(), warn.end(),
+                [](const QString& l) { return l.startsWith("Stopped early"); }), warn.end());
+            if (!warn.isEmpty()) QMessageBox::warning(this, "T-test", warn.join('\n'));
+            const int32_t n_used = live ? static_cast<int32_t>(live->processed) : eff_count;
             buildTTestResultTab(out->acc, std::move(out->tstat), out->n0, out->n1,
-                                 eff_count, abs_value);
+                                 n_used, abs_value);
         });
+    if (view) view->job_id = job_id;
 }
 
 // ---------------------------------------------------------------------------

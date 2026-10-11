@@ -27,6 +27,9 @@ class QDockWidget;
 class QProgressBar;
 class JobManager;
 struct ChainStep;
+struct TTestLive;
+struct LiveTTestSnapshot;
+struct LiveTTestView;
 
 // ---------------------------------------------------------------------------
 // Snapshot of mutable per-dataset state, used for undo.
@@ -378,6 +381,12 @@ private:
     void buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& acc_ptr,
                               std::vector<float> tstat, int64_t n0, int64_t n1,
                               int32_t eff_count, bool abs_value);
+    // Live t-test: a result tab that shows intermediate t-curves and the
+    // max|t|-vs-traces history while the job runs. See ttest_run.h.
+    std::shared_ptr<LiveTTestView> createLiveTTestTab(const QString& title, int32_t total,
+                                                       bool abs_value,
+                                                       const std::shared_ptr<TTestLive>& live);
+    void applyLiveTTestSnapshot(LiveTTestView& v, const LiveTTestSnapshot& s);
 
     // Chain "Run T-test" step: resolves the step's trace range (the last
     // alignment's range if use_last_alignment and one exists, else the
