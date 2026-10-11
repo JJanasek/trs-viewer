@@ -4,6 +4,7 @@
 // mirrored into PlotTheme so plots match the widgets around them.
 
 #include <QColor>
+#include <QString>
 #include <array>
 
 struct ThemeTokens {
@@ -35,3 +36,9 @@ void applyAppTheme(bool dark);
 
 // Trace colour for trace index i in the current theme.
 QColor themeTraceColor(int i);
+
+// Ready-made style sheets for the few widgets that need an explicit colour
+// (built from the current theme when the widget is created).
+QString themeNoteStyle();    // amber "measure before and after" call-out box
+QString themeHintStyle();    // small muted hint text
+QString themeErrorStyle();   // small danger-coloured text

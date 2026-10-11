@@ -175,3 +175,17 @@ QColor themeTraceColor(int i) {
     const int n = static_cast<int>(tr.size());
     return tr[static_cast<size_t>(((i % n) + n) % n)];
 }
+
+QString themeNoteStyle() {
+    const ThemeTokens& t = currentTheme();
+    return QString("background:%1; color:%2; padding:6px; border:1px solid %2; border-radius:4px;")
+        .arg(t.warn_bg.name(), t.warn.name());
+}
+
+QString themeHintStyle() {
+    return QString("color:%1; font-size:9pt;").arg(currentTheme().muted.name());
+}
+
+QString themeErrorStyle() {
+    return QString("color:%1; font-size:9pt;").arg(currentTheme().danger.name());
+}

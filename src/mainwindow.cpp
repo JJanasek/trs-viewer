@@ -3455,7 +3455,7 @@ void MainWindow::onLoadNpyTTest() {
     dlg->resize(1100, 520);
 
     auto* pw = new PlotWidget(dlg);
-    pw->addTrace(current_ptr, QColor("#1f77b4"), "t-value");
+    pw->addTrace(current_ptr, themeTraceColor(0), "t-value");
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", "t-value");
     pw->setThresholds(true, 4.5, -4.5);
@@ -3597,9 +3597,9 @@ void MainWindow::onLoadNpyTTest() {
                 [pw](double v) { pw->setTraceWidth(static_cast<float>(v)); });
 
         auto* btn_color = new QPushButton("Pick color…");
-        btn_color->setStyleSheet(QString("background:%1").arg(QColor("#4fc3f7").name()));
+        btn_color->setStyleSheet(QString("background:%1").arg(themeTraceColor(0).name()));
         connect(btn_color, &QPushButton::clicked, sd, [=]() {
-            QColor c = QColorDialog::getColor(QColor("#4fc3f7"), sd);
+            QColor c = QColorDialog::getColor(themeTraceColor(0), sd);
             if (!c.isValid()) return;
             pw->setTraceColor(0, c);
             btn_color->setStyleSheet(QString("background:%1").arg(c.name()));
@@ -4044,7 +4044,7 @@ static QWidget* makeHeatmapAnnotateRow(HeatmapWidget* heatmap,
     });
 
     auto* lbl_count = new QLabel;
-    lbl_count->setStyleSheet("color: gray;");
+    lbl_count->setStyleSheet(QString("color:%1;").arg(currentTheme().muted.name()));
     auto refresh = [=]() {
         const int n = static_cast<int>(heatmap->annotations().size());
         lbl_count->setText(n == 0 ? QString("no boxes")
@@ -5301,7 +5301,7 @@ std::shared_ptr<LiveTTestView> MainWindow::createLiveTTestTab(const QString& tit
     v->threshold = live->threshold;
 
     const QString value_label = abs_value ? "|t|-value" : "t-value";
-    addResultTab(std::vector<float>{0.0f}, title, QColor("#1f77b4"), value_label);
+    addResultTab(std::vector<float>{0.0f}, title, themeTraceColor(0), value_label);
     PlotWidget* pw = plotWidget();
     pw->setAxisLabels("Sample Index", value_label);
     pw->setThresholds(true, v->threshold, -v->threshold);
@@ -5440,11 +5440,11 @@ void MainWindow::applyLiveTTestSnapshot(LiveTTestView& v, const LiveTTestSnapsho
             int k = 0;
             for (const auto& e : v.earlier) {
                 const int alpha = 45 + 30 * k++;   // older = fainter
-                pw->addTrace(e.t, QColor(31, 119, 180, alpha),
+                pw->addTrace(e.t, [&]{ QColor c = themeTraceColor(0); c.setAlpha(alpha); return c; }(),
                              QString("after %1").arg(l.toString(static_cast<qlonglong>(e.done))));
             }
         }
-        pw->addTrace(cur, QColor("#1f77b4"),
+        pw->addTrace(cur, themeTraceColor(0),
                      QString("after %1 traces").arg(l.toString(static_cast<qlonglong>(s.done))));
         if (!v.curve_started) pw->resetView();
         else                  pw->restoreViewState(vs);
@@ -5459,7 +5459,7 @@ void MainWindow::applyLiveTTestSnapshot(LiveTTestView& v, const LiveTTestSnapsho
         v.hist->resize(static_cast<size_t>(s.done), value);
         if (PlotWidget* hp = v.history) {
             if (!v.history_started) {
-                hp->addTrace(v.hist, QColor("#d0582a"), "max |t|");
+                hp->addTrace(v.hist, themeTraceColor(3), "max |t|");
                 hp->resetView();
                 v.history_started = true;
             } else {
@@ -5831,7 +5831,7 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     QString tab_title = QString("Welch t-test — %1 traces (G0:%2  G1:%3)%4")
                             .arg(eff_count).arg(n0).arg(n1)
                             .arg(abs_value ? QString(" |t|") : QString());
-    addResultTab(*current_ptr, tab_title, QColor("#1f77b4"), value_label);
+    addResultTab(*current_ptr, tab_title, themeTraceColor(0), value_label);
     PlotWidget* pw = plotWidget();
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", value_label);
@@ -5988,7 +5988,7 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
                 [pw](double v) { pw->setTraceWidth(static_cast<float>(v)); });
 
         auto* btn_color = new QPushButton("Pick color…");
-        btn_color->setStyleSheet(QString("background:%1").arg(QColor("#4fc3f7").name()));
+        btn_color->setStyleSheet(QString("background:%1").arg(themeTraceColor(0).name()));
         connect(btn_color, &QPushButton::clicked, sd, [=]() {
             QColor c = QColorDialog::getColor(pw->palette().color(QPalette::Window), sd);
             if (!c.isValid()) return;
@@ -7612,8 +7612,9 @@ void MainWindow::showSpectralLineDialog(QWidget* parent, PlotWidget* pw,
         std::vector<float> baseline;
         std::string err;
         if (!detectSpectralLines(*spec, prm, *lines, &baseline, err)) {
-            status->setText(QString("<span style='color:#c0392b'>%1</span>")
-                                .arg(QString::fromStdString(err)));
+            status->setText(QString("<span style='color:%1'>%2</span>")
+                                .arg(currentTheme().danger.name(),
+                                     QString::fromStdString(err).toHtmlEscaped()));
             return;
         }
 
@@ -7653,7 +7654,7 @@ void MainWindow::showSpectralLineDialog(QWidget* parent, PlotWidget* pw,
             pw->removeTracesFrom(baseline_trace_marker_);
             auto base_ptr = std::make_shared<std::vector<float>>(std::move(baseline));
             baseline_trace_marker_ = pw->traceCount();
-            pw->addTrace(base_ptr, QColor("#8e44ad"), "Noise floor");
+            pw->addTrace(base_ptr, currentTheme().muted, "Noise floor");
         }
 
         if (lines->empty()) {
@@ -7813,7 +7814,7 @@ static RateEntry addSampleRateRow(QFormLayout* fl, const TrsHeader& h) {
             : QString("This file carries no sample rate. Set one here to enter "
                        "frequencies in Hz; otherwise use × Nyquist."));
     hint->setWordWrap(true);
-    hint->setStyleSheet("color: gray; font-size: 9pt;");
+    hint->setStyleSheet(themeHintStyle());
     fl->addRow("", hint);
     return re;
 }
@@ -7847,7 +7848,7 @@ static void wireFreqEcho(FreqEntry& fe, const RateEntry& re) {
         const double nrm = fe.normalized(fs);
         if (nrm < 0.0) {
             fe.echo->setText("needs a sample rate to convert");
-            fe.echo->setStyleSheet("color: #c0392b; font-size: 9pt;");
+            fe.echo->setStyleSheet(themeErrorStyle());
             return;
         }
         QString txt = QString("= %1 × Nyquist").arg(nrm, 0, 'f', 6);
@@ -7862,8 +7863,7 @@ static void wireFreqEcho(FreqEntry& fe, const RateEntry& re) {
         }
         if (nrm >= 1.0) txt += "  — at or past Nyquist, will be ignored";
         fe.echo->setText(txt);
-        fe.echo->setStyleSheet(nrm >= 1.0 ? "color: #c0392b; font-size: 9pt;"
-                                          : "color: gray; font-size: 9pt;");
+        fe.echo->setStyleSheet(nrm >= 1.0 ? themeErrorStyle() : themeHintStyle());
     };
     QObject::connect(fe.spin, &QDoubleSpinBox::valueChanged, fe.echo, update);
     QObject::connect(fe.unit, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -7920,8 +7920,7 @@ std::shared_ptr<ITransform> MainWindow::createHarmonicNotchTransform() {
         "harmonics, so a comb can remove signal as easily as interference. "
         "Run SNR or a t-test both ways rather than assuming this helped.");
     warn->setWordWrap(true);
-    warn->setStyleSheet("background:#fdf3e3; color:#7a4a00; padding:6px; "
-                        "border:1px solid #e0c48a; border-radius:3px;");
+    warn->setStyleSheet(themeNoteStyle());
     fl->addRow(warn);
 
     RateEntry re = addSampleRateRow(fl, h);
@@ -8435,8 +8434,7 @@ void MainWindow::onRunSpectralLeakage() {
         "the time axis: |t| falling off symmetrically either side of the "
         "anchor is an alignment artefact, not a property of the device.");
     jitter_note->setWordWrap(true);
-    jitter_note->setStyleSheet("background:#fdf3e3; color:#7a4a00; padding:6px; "
-                                "border:1px solid #e0c48a; border-radius:3px;");
+    jitter_note->setStyleSheet(themeNoteStyle());
     fl->addRow(jitter_note);
 
     DialogMemory mem("leakage_freq");
@@ -8547,7 +8545,7 @@ void MainWindow::onRunSpectralLeakage() {
                     .arg(out->shift_stddev > 0.0
                              ? QString(", shift σ=%1").arg(out->shift_stddev, 0, 'f', 1)
                              : QString()),
-                QColor("#e05c8a"), "max |t|");
+                themeTraceColor(0), "max |t|");
 
             PlotWidget* pw = plotWidget();
             pw->setTraceFilled(0, true);
@@ -11361,7 +11359,7 @@ void MainWindow::onRunSNR() {
                                     .arg(out->total)
                                     .arg(mode_str)
                                     .arg(n_classes);
-            addResultTab(*snr_ptr, tab_title, QColor("#f4a63a"), "SNR");
+            addResultTab(*snr_ptr, tab_title, themeTraceColor(1), "SNR");
             PlotWidget* pw = plotWidget();
             pw->setTraceFilled(0, true);
             pw->setAxisLabels("Sample Index", "SNR");
@@ -11553,7 +11551,7 @@ void MainWindow::onRunStaticSNR() {
             auto snr_ptr = std::make_shared<std::vector<float>>(std::move(out->snr));
 
             QString tab_title = QString("Static SNR |μ/σ| — %1 traces").arg(out->total);
-            addResultTab(*snr_ptr, tab_title, QColor("#4fc3f7"), "|μ/σ|");
+            addResultTab(*snr_ptr, tab_title, themeTraceColor(0), "|μ/σ|");
             PlotWidget* pw = plotWidget();
             pw->setTraceFilled(0, true);
             pw->setAxisLabels("Sample Index", "|μ/σ|");
@@ -11744,7 +11742,7 @@ void MainWindow::onRunFFT() {
     fl->addRow("Sample rate override:", rate_row);
     auto* lbl_rate_hint = new QLabel(file_rate_hint);
     lbl_rate_hint->setWordWrap(true);
-    lbl_rate_hint->setStyleSheet("color: gray; font-size: 9pt;");
+    lbl_rate_hint->setStyleSheet(themeHintStyle());
     fl->addRow("", lbl_rate_hint);
 
     auto* chk_pad = new QCheckBox("Zero-pad to next power of 2");
@@ -11973,11 +11971,11 @@ void MainWindow::onRunFFT() {
         if (show_env && n_ok > 1) {
             auto min_ptr = std::make_shared<std::vector<float>>(acc_min);
             auto max_ptr = std::make_shared<std::vector<float>>(acc_max);
-            pw->addTrace(min_ptr, QColor("#5c9bd6"), "Min");
-            pw->addTrace(max_ptr, QColor("#5c9bd6"), "Max");
-            pw->addTrace(avg_ptr, QColor("#f4a63a"), "Average");
+            pw->addTrace(min_ptr, themeTraceColor(0), "Min");
+            pw->addTrace(max_ptr, themeTraceColor(0), "Max");
+            pw->addTrace(avg_ptr, themeTraceColor(1), "Average");
         } else {
-            pw->addTrace(avg_ptr, QColor("#f4a63a"), "Average");
+            pw->addTrace(avg_ptr, themeTraceColor(1), "Average");
             pw->setTraceFilled(0, true);
         }
 

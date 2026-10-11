@@ -187,7 +187,6 @@ LeakageModelDialog::LeakageModelDialog(TrsFile* file, int32_t first_trace,
     console_ = new QTextEdit;
     console_->setReadOnly(true);
     console_->setFont(QFont("Monospace", 9));
-    console_->setStyleSheet("background: #1e1e2e; color: #cdd6f4;");
     console_->setPlaceholderText("Test output will appear here...");
     right_vl->addWidget(console_);
 
@@ -203,7 +202,7 @@ LeakageModelDialog::LeakageModelDialog(TrsFile* file, int32_t first_trace,
     auto* btn_save = new QPushButton("Save .py…");
     btn_run_ = new QPushButton("Run CPA");
     btn_run_->setEnabled(false);
-    btn_run_->setStyleSheet("QPushButton:enabled { font-weight: bold; background: #4CAF50; color: white; }");
+    btn_run_->setDefault(true);   // the theme's accent marks the primary action
     auto* btn_cancel = new QPushButton("Cancel");
 
     auto* bottom = new QHBoxLayout;
