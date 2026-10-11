@@ -208,9 +208,9 @@ QImage HeatmapWidget::renderRegion(int W, int H,
 HeatmapWidget::HeatmapWidget(QWidget* parent) : QWidget(parent) {
     setMouseTracking(true);
     setMinimumSize(300, 300);
-    QPalette pal = palette();
-    pal.setColor(QPalette::Window, QColor(22, 22, 28));
-    setPalette(pal);
+    // Chrome colours come from the app palette (see theme.cpp), so the
+    // heatmap follows the light/dark theme like everything around it.
+    setBackgroundRole(QPalette::AlternateBase);
     setAutoFillBackground(true);
 }
 
@@ -678,7 +678,7 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
     QRect pr = plotRect();
 
     if (rows_ <= 0 || cols_ <= 0 || display_matrix_.empty()) {
-        p.setPen(QColor(180, 180, 200));
+        p.setPen(palette().color(QPalette::PlaceholderText));
         p.drawText(rect(), Qt::AlignCenter, "No data.\nRun Analyze › Cross-Correlation or CPA.");
         return;
     }
@@ -707,12 +707,15 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
     // Annotations sit above the heatmap but below the axes and colour bar.
     drawAnnotations(p, QRectF(pr), view_x0_, view_y0_, view_x1_, view_y1_, 1.0);
 
+    const QColor chrome_border = palette().color(QPalette::Mid);
+    const QColor chrome_text   = palette().color(QPalette::PlaceholderText);
+
     // Border
-    p.setPen(QColor(80, 80, 100));
+    p.setPen(chrome_border);
     p.drawRect(pr);
 
     // Axis labels
-    p.setPen(QColor(180, 180, 200));
+    p.setPen(chrome_text);
     QFont f = font(); f.setPointSize(8); p.setFont(f);
 
     auto fmt = [](double v) -> QString {
@@ -747,9 +750,9 @@ void HeatmapWidget::paintEvent(QPaintEvent*) {
             p.setPen(QColor(c));
             p.drawLine(bar_x, pr.top() + yi, bar_x + bar_w - 1, pr.top() + yi);
         }
-        p.setPen(QColor(80, 80, 100));
+        p.setPen(chrome_border);
         p.drawRect(bar_x, pr.top(), bar_w, bar_h);
-        p.setPen(QColor(180, 180, 200));
+        p.setPen(chrome_text);
         p.setFont(f);
         p.drawText(bar_x + bar_w + 2, pr.top() + 10,
                    QString::number(static_cast<double>(vmax_), 'g', 3));

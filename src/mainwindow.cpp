@@ -4241,6 +4241,14 @@ void MainWindow::onLoadNpyHeatmap() {
     });
 
     auto* chk_abs    = new QCheckBox("Abs value");
+
+    // A magnitude map wants a sequential colormap, a signed one a diverging
+    // one: follow Abs value between RdBu (0) and Viridis (3) unless the user
+    // picked something else.
+    connect(chk_abs, &QCheckBox::toggled, combo_scheme, [combo_scheme](bool on) {
+        if (on && combo_scheme->currentIndex() == 0)       combo_scheme->setCurrentIndex(3);
+        else if (!on && combo_scheme->currentIndex() == 3) combo_scheme->setCurrentIndex(0);
+    });
     connect(chk_abs, &QCheckBox::toggled, [=](bool on) {
         heatmap->setAbsValue(on);
         // Abs collapses all values to [0, vmax] — snap vmin to 0 so the
@@ -7056,6 +7064,14 @@ void MainWindow::onRunXCorr() {
     });
 
     auto* chk_abs2   = new QCheckBox("Abs value");
+
+    // A magnitude map wants a sequential colormap, a signed one a diverging
+    // one: follow Abs value between RdBu (0) and Viridis (3) unless the user
+    // picked something else.
+    connect(chk_abs2, &QCheckBox::toggled, combo_scheme2, [combo_scheme2](bool on) {
+        if (on && combo_scheme2->currentIndex() == 0)       combo_scheme2->setCurrentIndex(3);
+        else if (!on && combo_scheme2->currentIndex() == 3) combo_scheme2->setCurrentIndex(0);
+    });
     connect(chk_abs2, &QCheckBox::toggled, [=](bool on) {
         heatmap->setAbsValue(on);
         if (on) {
@@ -8571,6 +8587,7 @@ void MainWindow::onRunSpectralLeakage() {
                 auto* hm = new HeatmapWidget(dlg);
                 hm->setMatrix(*plane, nw, nb);
                 hm->setAbsValue(true);        // sign is not informative here
+                hm->setColorScheme(ColorScheme::Viridis);   // magnitudes: sequential map
                 auto* v = new QVBoxLayout(dlg);
                 auto* lbl = new QLabel(QString(
                     "Rows: STFT time windows (0 = start of the region). "
@@ -11014,6 +11031,14 @@ void MainWindow::onRunCpa() {
 
     // Abs value checkbox
     auto* chk_abs = new QCheckBox("Abs value");
+
+    // A magnitude map wants a sequential colormap, a signed one a diverging
+    // one: follow Abs value between RdBu (0) and Viridis (3) unless the user
+    // picked something else.
+    connect(chk_abs, &QCheckBox::toggled, combo_scheme, [combo_scheme](bool on) {
+        if (on && combo_scheme->currentIndex() == 0)       combo_scheme->setCurrentIndex(3);
+        else if (!on && combo_scheme->currentIndex() == 3) combo_scheme->setCurrentIndex(0);
+    });
     connect(chk_abs, &QCheckBox::toggled, [hm, sp_vmin, sp_vmax](bool on) {
         hm->setAbsValue(on);
         if (on) { sp_vmin->setValue(0); }
