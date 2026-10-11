@@ -4,6 +4,7 @@
 #include "heatmap_widget.h"
 #include "ttest.h"
 #include "ttest_run.h"
+#include "theme.h"
 #include "align.h"
 #include "xcorr.h"
 #include "cpa.h"
@@ -18,6 +19,7 @@
 #include <set>
 
 #include <QActionGroup>
+#include <QStyleHints>
 #include <QAbstractButton>
 #include <QPointer>
 #include <QListWidgetItem>
@@ -308,16 +310,6 @@ private:
 };
 }  // namespace
 
-const QColor MainWindow::TRACE_COLORS[] = {
-    QColor("#4fc3f7"),  // light blue
-    QColor("#ef5350"),  // red
-    QColor("#66bb6a"),  // green
-    QColor("#ffa726"),  // orange
-    QColor("#ab47bc"),  // purple
-    QColor("#26c6da"),  // cyan
-    QColor("#d4e157"),  // lime
-    QColor("#ff7043"),  // deep orange
-};
 
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
@@ -349,7 +341,12 @@ MainWindow::MainWindow(QWidget* parent)
     jobs_dock_->hide();   // shown only while something is actually running
     connect(jobs_, &JobManager::jobsChanged, this, &MainWindow::refreshJobsDock);
 
-    theme_idx_ = QSettings("trs-viewer", "trs-viewer").value("ui/theme", 0).toInt() == 1 ? 1 : 0;
+    theme_idx_ = std::clamp(QSettings("trs-viewer", "trs-viewer").value("ui/theme", 2).toInt(), 0, 2);
+    applyAppTheme(themeChoiceIsDark(static_cast<ThemeChoice>(theme_idx_)));
+    // "System" follows the desktop's light/dark switch live.
+    connect(QGuiApplication::styleHints(), &QStyleHints::colorSchemeChanged, this, [this]() {
+        if (theme_idx_ == static_cast<int>(ThemeChoice::System)) onThemeChanged(theme_idx_);
+    });
     setupMenuBar();
 
     // ----------------------------------------------------------------
@@ -694,7 +691,6 @@ MainWindow::MainWindow(QWidget* parent)
     view_layout_->setSpacing(4);
 
     placeholder_widget_ = new PlotWidget(view_container_);
-    if (theme_idx_ == 1) placeholder_widget_->setTheme(PlotTheme::light());
     placeholder_widget_->setVisible(false);
     start_page_ = buildStartPage();
     view_layout_->addWidget(start_page_, 1);
@@ -841,7 +837,6 @@ void MainWindow::closeDatasetAt(int idx) {
 
 PlotWidget* MainWindow::createPlotWidgetForTab() {
     auto* pw = new PlotWidget(view_container_);
-    if (theme_idx_ == 1) pw->setTheme(PlotTheme::light());
 
     // Interaction signals from any tab's widget can fire while that tab is
     // not the active one (tiled mode shows every widget at once) — route
@@ -1278,9 +1273,14 @@ void MainWindow::setupMenuBar() {
     viewAct("&Tile Tabs", [this]() { btn_tile_->toggle(); });
     QMenu* theme_menu = view_menu->addMenu("T&heme");
     auto* theme_group = new QActionGroup(this);
-    const QStringList theme_names = {"&Dark", "&Light"};
-    for (int i = 0; i < theme_names.size(); i++) {
-        QAction* a = theme_menu->addAction(theme_names[i]);
+    const std::pair<const char*, ThemeChoice> theme_items[] = {
+        {"Follow &System", ThemeChoice::System},
+        {"&Dark",          ThemeChoice::Dark},
+        {"&Light",         ThemeChoice::Light},
+    };
+    for (const auto& [label, choice] : theme_items) {
+        const int i = static_cast<int>(choice);
+        QAction* a = theme_menu->addAction(label);
         a->setCheckable(true);
         a->setChecked(i == theme_idx_);
         theme_group->addAction(a);
@@ -1459,7 +1459,7 @@ void MainWindow::updateUndoButton() {
 void MainWindow::updateStateIndicators() {
     // Tab labels: mark derived results and baked views so the tab bar alone
     // tells file tabs from result tabs.
-    const QColor result_col = palette().color(QPalette::Link);
+    const QColor result_col = currentTheme().result;
     for (int i = 0; i < tab_bar_->count() && i < static_cast<int>(datasets_.size()); i++) {
         const Dataset& d = datasets_[static_cast<size_t>(i)];
         QString text = d.display_name;
@@ -1546,8 +1546,15 @@ void MainWindow::updateStateIndicators() {
     parts << (ds.pipeline.empty() ? QString("No pipeline")
                                   : QString("Pipeline: %1 step%2").arg(ds.pipeline.size())
                                         .arg(ds.pipeline.size() == 1 ? "" : "s"));
-    parts << (aligned ? "Aligned" : "Not aligned");
-    if (baked) parts << "<b>Baked</b> (Back to Live View to undo)";
+    // State chips: coloured pills for the two states that change what the
+    // analyses read, so they stand out from the plain counts.
+    const ThemeTokens& tk = currentTheme();
+    auto chip = [](const QString& text, const QColor& fg, const QColor& bg) {
+        return QString("<span style='background:%2; color:%1; font-weight:600;'>"
+                       "&nbsp;%3&nbsp;</span>").arg(fg.name(), bg.name(), text);
+    };
+    parts << (aligned ? chip("Aligned", tk.success, tk.success_bg) : QString("Not aligned"));
+    if (baked) parts << chip("Baked", tk.warn, tk.warn_bg) + " (Back to Live View to undo)";
     if (lbl_state_) lbl_state_->setText(parts.join("  ·  "));
 
     QString title = ds.display_name;
@@ -1789,7 +1796,7 @@ void MainWindow::onApplyTraces() {
     int max   = activeDs().file->header().num_traces;
 
     for (int i = 0; i < count && (first + i) < max; i++) {
-        QColor  col   = TRACE_COLORS[(first + i) % NUM_COLORS];
+        QColor  col   = themeTraceColor(first + i);
         QString label = QString("Trace %1").arg(first + i);
         plotWidget()->addTrace(activeDs().file.get(), first + i, col, label);
     }
@@ -1929,7 +1936,7 @@ void MainWindow::rebakeAlignedView() {
         for (const auto& t : ds.pipeline) n_out = t->apply(data->data(), n_out, 0);
         data->resize(static_cast<size_t>(std::max<int64_t>(0, n_out)));
 
-        plotWidget()->addTrace(std::move(data), TRACE_COLORS[shown % NUM_COLORS],
+        plotWidget()->addTrace(std::move(data), themeTraceColor(shown),
             QString("T%1 (%2%3)").arg(first_tr + i).arg(shift >= 0 ? "+" : "").arg(shift));
         shown++;
     }
@@ -2066,14 +2073,25 @@ void MainWindow::onMeasurementUpdated(int64_t s1, double v1,
 }
 
 void MainWindow::onThemeChanged(int index) {
-    theme_idx_ = (index == 1) ? 1 : 0;
+    theme_idx_ = std::clamp(index, 0, 2);
     QSettings("trs-viewer", "trs-viewer").setValue("ui/theme", theme_idx_);
-    // Result tabs pick their own (usually light) theme for readability;
-    // only file tabs and the empty placeholder follow the global setting.
-    const PlotTheme th = theme_idx_ == 0 ? PlotTheme::dark() : PlotTheme::light();
-    placeholder_widget_->setTheme(th);
-    for (auto& ds : datasets_)
-        if (!ds.is_result && ds.plot_widget) ds.plot_widget->setTheme(th);
+    applyAppTheme(themeChoiceIsDark(static_cast<ThemeChoice>(theme_idx_)));
+
+    // Every plot follows — main tabs, result tabs and plots in open dialogs.
+    const PlotTheme th = PlotTheme::current();
+    for (QWidget* w : QApplication::allWidgets())
+        if (auto* pw = qobject_cast<PlotWidget*>(w)) pw->setTheme(th);
+
+    // Trace colours are tuned per theme; recolour the file tabs' traces the
+    // same way they were assigned (by absolute trace index when live, by
+    // position in a baked preview).
+    for (auto& ds : datasets_) {
+        if (ds.is_result || !ds.plot_widget) continue;
+        const int base = ds.plot_file_backed ? ds.plot_first_trace : 0;
+        for (int i = 0; i < ds.plot_widget->traceCount(); i++)
+            ds.plot_widget->setTraceColor(i, themeTraceColor(base + i));
+    }
+    updateStateIndicators();
 }
 
 void MainWindow::rebuildTransformList() {
@@ -3437,7 +3455,6 @@ void MainWindow::onLoadNpyTTest() {
     dlg->resize(1100, 520);
 
     auto* pw = new PlotWidget(dlg);
-    pw->setTheme(PlotTheme::light());
     pw->addTrace(current_ptr, QColor("#1f77b4"), "t-value");
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", "t-value");
@@ -4530,7 +4547,7 @@ void MainWindow::onLoadSpectrumNpz() {
             }
             if (db)
                 for (float& v : *data) v = (v > 0.0f) ? 10.0f * std::log10(v) : -400.0f;
-            pw->addTrace(data, TRACE_COLORS[i % NUM_COLORS], y_curves[i].name);
+            pw->addTrace(data, themeTraceColor(i), y_curves[i].name);
         }
         pw->setAxisLabels(x_label, db ? "Magnitude (dB)" : (norm ? "Value (normalized)" : "Value"));
         if (had_view) pw->restoreViewState(saved_view);
@@ -5278,7 +5295,6 @@ std::shared_ptr<LiveTTestView> MainWindow::createLiveTTestTab(const QString& tit
     const QString value_label = abs_value ? "|t|-value" : "t-value";
     addResultTab(std::vector<float>{0.0f}, title, QColor("#1f77b4"), value_label);
     PlotWidget* pw = plotWidget();
-    pw->setTheme(PlotTheme::light());
     pw->setAxisLabels("Sample Index", value_label);
     pw->setThresholds(true, v->threshold, -v->threshold);
     if (abs_value) pw->setThresholdOneSided(true);
@@ -5317,7 +5333,6 @@ std::shared_ptr<LiveTTestView> MainWindow::createLiveTTestTab(const QString& tit
     status->setWordWrap(true);
 
     auto* hist = new PlotWidget(holder);
-    hist->setTheme(PlotTheme::light());
     hist->setFixedHeight(180);
     hist->setAxisLabels("Traces processed", "max |t|");
     hist->setTitle("max |t| vs traces processed");
@@ -5810,7 +5825,6 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
                             .arg(abs_value ? QString(" |t|") : QString());
     addResultTab(*current_ptr, tab_title, QColor("#1f77b4"), value_label);
     PlotWidget* pw = plotWidget();
-    pw->setTheme(PlotTheme::light());
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", value_label);
     pw->setThresholds(true, 4.5, -4.5);
@@ -7180,7 +7194,7 @@ void MainWindow::onRunXCorr() {
                 mat + static_cast<ptrdiff_t>(i) * cols,
                 mat + static_cast<ptrdiff_t>(i) * cols + cols);
             pw->addTrace(std::move(trace),
-                         TRACE_COLORS[(i - sel_first) % NUM_COLORS],
+                         themeTraceColor(i - sel_first),
                          is_tm ? QString("Trace %1").arg(first_trace + i)
                                : QString("C[%1,:]").arg(i));
         }
@@ -9141,7 +9155,7 @@ bool MainWindow::buildAlignedTraces(PlotWidget* pw, const std::vector<int32_t>& 
         data->resize(static_cast<size_t>(std::max<int64_t>(0, n_out)));
 
         pw->addTrace(std::move(data),
-                     TRACE_COLORS[shown % NUM_COLORS],
+                     themeTraceColor(shown),
                      QString("T%1 (%2%3)")
                          .arg(first_tr + i)
                          .arg(shift >= 0 ? "+" : "")
@@ -11015,7 +11029,7 @@ void MainWindow::onRunCpa() {
         const float* mat = result_ptr->corr.data();
         for (int k = 0; k < result_ptr->n_hypotheses; k++) {
             auto trace = std::make_shared<std::vector<float>>(mat + k * NS, mat + k * NS + NS);
-            QColor c = TRACE_COLORS[k % NUM_COLORS];
+            QColor c = themeTraceColor(k);
             c.setAlpha(180);
             pw->addTrace(std::move(trace), c, QString("h%1").arg(k));
         }

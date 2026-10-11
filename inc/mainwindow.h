@@ -469,9 +469,8 @@ private:
     QWidget*      start_page_       = nullptr;   // shown while no tab is open
     QListWidget*  list_recent_      = nullptr;   // on the start page
     QMenu*        recent_menu_      = nullptr;   // File › Open Recent
-    int           theme_idx_        = 0;         // 0 = dark, 1 = light; persisted
+    int           theme_idx_        = 2;         // ThemeChoice: 0 dark, 1 light, 2 system; persisted
     QButtonGroup* mode_group_       = nullptr;
 
-    static const QColor TRACE_COLORS[];
     static constexpr int NUM_COLORS = 8;
 };

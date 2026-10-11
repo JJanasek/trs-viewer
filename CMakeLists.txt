@@ -87,6 +87,8 @@ set(SOURCES
     src/trs_file.cpp
     src/processing.cpp
     src/plot_widget.cpp
+    src/theme.cpp
+    inc/theme.h
     src/ttest.cpp
     src/ttest_run.cpp
     inc/ttest_run.h

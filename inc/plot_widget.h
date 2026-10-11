@@ -39,6 +39,8 @@ struct PlotTheme {
 
     static PlotTheme dark();
     static PlotTheme light();
+    // Matches the app theme currently applied (see theme.h).
+    static PlotTheme current();
 };
 
 // ---------------------------------------------------------------------------

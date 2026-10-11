@@ -1,4 +1,5 @@
 #include "plot_widget.h"
+#include "theme.h"
 
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -17,25 +18,32 @@ static constexpr int64_t RENDER_CHUNK = 1 << 20;  // 1 M samples = 4 MB
 // PlotTheme built-ins
 // ---------------------------------------------------------------------------
 PlotTheme PlotTheme::dark() {
+    // "Graphite" dark — see theme.cpp.
     return {
-        QColor(22,  22,  28),   // bg_outer
-        QColor(10,  10,  15),   // bg_plot
-        QColor(45,  45,  55),   // grid
-        QColor(80,  80, 100),   // border
-        QColor(180, 180, 200),  // axis_text
-        QColor(200, 200, 220),  // legend_text
+        QColor("#1b1f24"),  // bg_outer
+        QColor("#0f1215"),  // bg_plot
+        QColor("#232931"),  // grid
+        QColor("#3a424c"),  // border
+        QColor("#9aa4af"),  // axis_text
+        QColor("#cfd5db"),  // legend_text
     };
 }
 
 PlotTheme PlotTheme::light() {
+    // "Graphite" light. The plot area stays pure white so PNG/PDF exports
+    // drop cleanly onto a page.
     return {
-        QColor(255, 255, 255),  // bg_outer  – pure white (blends into paper)
-        QColor(255, 255, 255),  // bg_plot   – pure white
-        QColor(204, 204, 204),  // grid      – matplotlib light gray
-        QColor( 30,  30,  30),  // border    – near-black spines
-        QColor(  0,   0,   0),  // axis_text – black
-        QColor(  0,   0,   0),  // legend_text – black
+        QColor("#f6f7f9"),  // bg_outer
+        QColor("#ffffff"),  // bg_plot
+        QColor("#e6e9ec"),  // grid
+        QColor("#a9b1ba"),  // border
+        QColor("#4d5660"),  // axis_text
+        QColor("#1b1f24"),  // legend_text
     };
+}
+
+PlotTheme PlotTheme::current() {
+    return currentThemeIsDark() ? dark() : light();
 }
 
 // ---------------------------------------------------------------------------
@@ -47,7 +55,7 @@ PlotWidget::PlotWidget(QWidget* parent)
     setMouseTracking(true);
     setMinimumSize(400, 200);
     setFocusPolicy(Qt::StrongFocus);
-    setTheme(PlotTheme::dark());
+    setTheme(PlotTheme::current());
 
     wheel_debounce_ = new QTimer(this);
     wheel_debounce_->setSingleShot(true);
@@ -1185,7 +1193,7 @@ void PlotWidget::paintEvent(QPaintEvent*) {
                 p.setPen(QPen(te.color, 1));
                 p.drawRect(lx - 18, ly - 5, 18, 10);
             } else {
-                p.setPen(te.color);
+                p.setPen(QPen(te.color, 2));   // 2 px so the colour reads at a glance
                 p.drawLine(lx - 18, ly, lx, ly);
             }
             p.setPen(theme_.legend_text);
