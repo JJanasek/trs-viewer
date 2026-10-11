@@ -232,12 +232,11 @@ int stageHelpIndexForName(const QString& n) {
     return -1;
 }
 
+// Kept to one line under the drop-down; the full help is in the tooltip.
 QString stageHelpRichText(int i) {
     const StageHelp& h = kStageHelp[i];
-    return QString("<b>%1</b><br><b>Use for:</b> %2<br><b>Watch out:</b> %3"
-                   "<br><a href=\"%4#%5\">Read more…</a>")
-        .arg(QString(h.summary).toHtmlEscaped(), QString(h.use).toHtmlEscaped(),
-             QString(h.careful).toHtmlEscaped(), kPipelineDocsUrl, h.anchor);
+    return QString("%1 <a href=\"%2#%3\">More…</a>")
+        .arg(QString(h.summary).toHtmlEscaped(), kPipelineDocsUrl, h.anchor);
 }
 
 QString stageHelpTooltip(int i) {
@@ -451,7 +450,9 @@ MainWindow::MainWindow(QWidget* parent)
         lbl_tx_help_->setFont(f);
     }
     auto showStageHelp = [this](int i) {
-        lbl_tx_help_->setText(i >= 0 && i < kNumStageHelp ? stageHelpRichText(i) : QString());
+        const bool ok = i >= 0 && i < kNumStageHelp;
+        lbl_tx_help_->setText(ok ? stageHelpRichText(i) : QString());
+        lbl_tx_help_->setToolTip(ok ? stageHelpTooltip(i) : QString());
     };
     connect(combo_transform_, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, showStageHelp);

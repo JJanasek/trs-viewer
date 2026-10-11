@@ -9,8 +9,9 @@ file, so you can add, reorder and remove stages freely.
 ## Using it
 
 1. In the side panel, pick a stage from the **Processing Pipeline** drop-down.
-   Hover an entry, or read the text under the drop-down, to see what it does,
-   when to use it and what to watch out for.
+   A one-line summary appears under the drop-down. Hover it, or an entry in
+   the drop-down, to see when to use the stage and what to watch out for;
+   **More…** jumps to its section below.
 2. Click **Add**. Stages that need settings open a dialog; hover any field there
    for an explanation.
 3. Reorder with **↑ / ↓**, remove with **Remove**. Hover a stage in the list to
