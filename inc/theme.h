@@ -4,6 +4,7 @@
 // mirrored into PlotTheme so plots match the widgets around them.
 
 #include <QColor>
+#include <QIcon>
 #include <QString>
 #include <array>
 
@@ -42,3 +43,13 @@ QColor themeTraceColor(int i);
 QString themeNoteStyle();    // amber "measure before and after" call-out box
 QString themeHintStyle();    // small muted hint text
 QString themeErrorStyle();   // small danger-coloured text
+
+class QAbstractButton;
+
+// Line icon from :/resources/icons/<name>.svg, drawn in the current theme's
+// text colour (muted when disabled).
+QIcon themeIcon(const QString& name);
+
+// Like button->setIcon(themeIcon(name)), but the icon is redrawn whenever
+// the theme changes.
+void setThemedIcon(QAbstractButton* button, const QString& name);

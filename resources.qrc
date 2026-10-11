@@ -1,5 +1,18 @@
 <RCC>
     <qresource prefix="/">
         <file>docs/logo.svg</file>
+        <file>resources/icons/pan.svg</file>
+        <file>resources/icons/measure.svg</file>
+        <file>resources/icons/box-zoom.svg</file>
+        <file>resources/icons/drag-shift.svg</file>
+        <file>resources/icons/stack.svg</file>
+        <file>resources/icons/zoom-in.svg</file>
+        <file>resources/icons/zoom-out.svg</file>
+        <file>resources/icons/reset.svg</file>
+        <file>resources/icons/amp-up.svg</file>
+        <file>resources/icons/amp-down.svg</file>
+        <file>resources/icons/undo.svg</file>
+        <file>resources/icons/tile.svg</file>
+        <file>resources/icons/close.svg</file>
     </qresource>
 </RCC>

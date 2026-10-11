@@ -1,6 +1,16 @@
 #include "theme.h"
 
+#include <QAbstractButton>
 #include <QApplication>
+#include <QDir>
+#include <QFile>
+#include <QPainter>
+#include <QPixmap>
+#include <QPointer>
+#include <QStandardPaths>
+#include <QSvgRenderer>
+#include <algorithm>
+#include <vector>
 #include <QGuiApplication>
 #include <QPalette>
 #include <QStyleFactory>
@@ -38,6 +48,42 @@ const ThemeTokens kLight = {
 };
 
 bool g_dark = true;
+
+std::vector<std::pair<QPointer<QAbstractButton>, QString>>& themedButtons() {
+    static std::vector<std::pair<QPointer<QAbstractButton>, QString>> v;
+    return v;
+}
+
+QByteArray iconSvg(const QString& name, const QColor& c) {
+    QFile f(":/resources/icons/" + name + ".svg");
+    if (!f.open(QIODevice::ReadOnly)) return {};
+    QByteArray svg = f.readAll();
+    svg.replace("currentColor", c.name().toLatin1());
+    return svg;
+}
+
+QPixmap renderSvg(const QByteArray& svg, int px) {
+    QPixmap pm(px, px);
+    pm.fill(Qt::transparent);
+    QSvgRenderer r(svg);
+    QPainter p(&pm);
+    r.render(&p);
+    return pm;
+}
+
+// The tab close button is styled from QSS, which can only point at a file,
+// so the recoloured icon is written once per colour to the cache dir.
+QString closeIconPath(const QColor& c) {
+    const QString dir = QStandardPaths::writableLocation(QStandardPaths::CacheLocation)
+                      + "/icons";
+    QDir().mkpath(dir);
+    const QString path = dir + "/close-" + c.name().mid(1) + ".svg";
+    if (!QFile::exists(path)) {
+        QFile f(path);
+        if (f.open(QIODevice::WriteOnly)) f.write(iconSvg("close", c));
+    }
+    return path;
+}
 
 // Kept deliberately small: the palette does most of the work under Fusion,
 // and styling inputs (spin boxes, combos) via QSS would replace their native
@@ -105,6 +151,8 @@ QMenu { border: 1px solid @border_strong; }
 QMenu::separator { height: 1px; background: @border; margin: 4px 8px; }
 QScrollArea { background: transparent; }
 QDockWidget::title { background: @panel; padding: 4px; }
+QTabBar::close-button { image: url(@close_icon); subcontrol-position: right; margin: 2px; }
+QTabBar::close-button:hover { background: @border; border-radius: 3px; }
 )QSS";
 
 QString buildQss(const ThemeTokens& t) {
@@ -117,6 +165,7 @@ QString buildQss(const ThemeTokens& t) {
         {"@muted", t.muted}, {"@accent", t.accent},
     };
     for (const auto& [k, c] : subs) s.replace(QLatin1String(k), c.name());
+    s.replace(QLatin1String("@close_icon"), closeIconPath(t.muted));
     return s;
 }
 
@@ -168,6 +217,31 @@ void applyAppTheme(bool dark) {
         QApplication::setStyle(fusion);
     QApplication::setPalette(buildPalette(t));
     qApp->setStyleSheet(buildQss(t));
+
+    auto& buttons = themedButtons();
+    buttons.erase(std::remove_if(buttons.begin(), buttons.end(),
+                                 [](const auto& b) { return b.first.isNull(); }),
+                  buttons.end());
+    for (const auto& [b, name] : buttons) b->setIcon(themeIcon(name));
+}
+
+QIcon themeIcon(const QString& name) {
+    const ThemeTokens& t = currentTheme();
+    const QByteArray normal   = iconSvg(name, t.text);
+    const QByteArray disabled = iconSvg(name, t.muted);
+    if (normal.isEmpty()) return {};
+    QIcon icon;
+    for (int px : {16, 24, 32, 48}) {
+        icon.addPixmap(renderSvg(normal, px),   QIcon::Normal);
+        icon.addPixmap(renderSvg(disabled, px), QIcon::Disabled);
+    }
+    return icon;
+}
+
+void setThemedIcon(QAbstractButton* button, const QString& name) {
+    if (!button) return;
+    button->setIcon(themeIcon(name));
+    themedButtons().push_back({QPointer<QAbstractButton>(button), name});
 }
 
 QColor themeTraceColor(int i) {

@@ -23,6 +23,15 @@ your recent files and a short outline of the usual workflow.
 3. **Ctrl+scroll** or **Shift+scroll** — Y-axis amplitude zoom.
 
 
+## Theme
+
+**View › Theme** offers *Follow System* (the default: it switches with your
+desktop's light/dark setting), *Dark* and *Light*. The theme covers the whole
+window, including the plots, result tabs and heatmaps. Trace colours come from
+the colour-vision-safe Okabe–Ito set, adjusted for each theme. In light mode the
+plot area stays pure white, so exported PNG/PDF figures sit cleanly on a page.
+
+
 ## Remembered settings
 
 The analysis dialogs remember their *method* settings from the last run: t-test

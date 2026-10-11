@@ -577,8 +577,8 @@ MainWindow::MainWindow(QWidget* parent)
     // Mode buttons (checkable, exclusive)
     btn_mode_pan_      = new QPushButton("Pan");
     btn_mode_measure_  = new QPushButton("Measure");
-    btn_mode_box_zoom_ = new QPushButton("⬚ Box Zoom");
-    btn_mode_align_    = new QPushButton("↔ Drag-shift");
+    btn_mode_box_zoom_ = new QPushButton("Box Zoom");
+    btn_mode_align_    = new QPushButton("Drag-shift");
     btn_mode_pan_->setCheckable(true);
     btn_mode_measure_->setCheckable(true);
     btn_mode_box_zoom_->setCheckable(true);
@@ -609,7 +609,7 @@ MainWindow::MainWindow(QWidget* parent)
 
     // Stacked view: draw each trace in its own non-overlapping lane instead
     // of overlaying them all. Independent of the interaction mode above.
-    btn_stack_ = new QPushButton("☰ Stack");
+    btn_stack_ = new QPushButton("Stack");
     btn_stack_->setCheckable(true);
     btn_stack_->setToolTip("Draw each trace in its own lane instead of overlapping it with the others");
     connect(btn_stack_, &QPushButton::toggled, this, [this](bool on) {
@@ -622,16 +622,18 @@ MainWindow::MainWindow(QWidget* parent)
     auto* sep3 = new QFrame; sep3->setFrameShape(QFrame::VLine);
 
     // Zoom buttons
-    btn_zoom_in_  = new QPushButton("＋ Zoom In");
-    btn_zoom_out_ = new QPushButton("－ Zoom Out");
-    btn_reset_    = new QPushButton("⟳ Reset  [R]");
-    btn_zoom_in_->setToolTip("Zoom in X (also: scroll wheel up)");
-    btn_zoom_out_->setToolTip("Zoom out X (also: scroll wheel down)");
+    // Zoom and amplitude are icon-only (with tooltips) so the toolbar fits
+    // one row at common widths; the modes keep their labels.
+    btn_zoom_in_  = new QPushButton;
+    btn_zoom_out_ = new QPushButton;
+    btn_reset_    = new QPushButton("Reset");
+    btn_zoom_in_->setToolTip("Zoom in X  (+, or scroll wheel up)");
+    btn_zoom_out_->setToolTip("Zoom out X  (−, or scroll wheel down)");
     btn_reset_->setToolTip("Back to the full range in Pan mode.\n"
                            "Traces, pipeline, alignment and crop ranges are left alone.");
 
-    auto* btn_yzoom_in  = new QPushButton("↑ Amp");
-    auto* btn_yzoom_out = new QPushButton("↓ Amp");
+    auto* btn_yzoom_in  = new QPushButton;
+    auto* btn_yzoom_out = new QPushButton;
     btn_yzoom_in ->setToolTip("Zoom in Y / taller traces (also: Ctrl/Shift+scroll up)");
     btn_yzoom_out->setToolTip("Zoom out Y / shorter traces (also: Ctrl/Shift+scroll down)");
 
@@ -643,11 +645,24 @@ MainWindow::MainWindow(QWidget* parent)
     connect(btn_yzoom_in,  &QPushButton::clicked, this, [this](){ plotWidget()->zoomInY(); });
     connect(btn_yzoom_out, &QPushButton::clicked, this, [this](){ plotWidget()->zoomOutY(); });
 
-    btn_undo_ = new QPushButton("↩ Undo");
+    btn_undo_ = new QPushButton("Undo");
     btn_undo_->setToolTip("Undo last action [Ctrl+Z]");
     btn_undo_->setEnabled(false);
     connect(btn_undo_, &QPushButton::clicked, this, &MainWindow::onUndoAction);
 
+
+    setThemedIcon(btn_mode_pan_,      "pan");
+    setThemedIcon(btn_mode_measure_,  "measure");
+    setThemedIcon(btn_mode_box_zoom_, "box-zoom");
+    setThemedIcon(btn_mode_align_,    "drag-shift");
+    setThemedIcon(btn_stack_,         "stack");
+    setThemedIcon(btn_zoom_in_,       "zoom-in");
+    setThemedIcon(btn_zoom_out_,      "zoom-out");
+    setThemedIcon(btn_reset_,         "reset");
+    setThemedIcon(btn_yzoom_in,       "amp-up");
+    setThemedIcon(btn_yzoom_out,      "amp-down");
+    setThemedIcon(btn_undo_,          "undo");
+    btn_reset_->setToolTip(btn_reset_->toolTip() + "\n(R)");
 
     toolbar_l->addWidget(btn_mode_pan_);
     toolbar_l->addWidget(btn_mode_measure_);
@@ -666,7 +681,8 @@ MainWindow::MainWindow(QWidget* parent)
 
     // "Tile Vertically" — show every open tab's plot stacked at once instead
     // of one at a time. Independent of everything else on the toolbar.
-    btn_tile_ = new QPushButton("⬒ Tile Tabs");
+    btn_tile_ = new QPushButton("Tile Tabs");
+    setThemedIcon(btn_tile_, "tile");
     btn_tile_->setCheckable(true);
     btn_tile_->setToolTip("Show every open tab stacked vertically, each with its own "
                          "axes, instead of one at a time");
