@@ -88,6 +88,8 @@ set(SOURCES
     src/processing.cpp
     src/plot_widget.cpp
     src/ttest.cpp
+    src/ttest_run.cpp
+    inc/ttest_run.h
     src/xcorr.cpp
     src/align.cpp
     src/chain.cpp
