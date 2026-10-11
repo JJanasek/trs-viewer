@@ -17,6 +17,11 @@
 #include <set>
 
 #include <QActionGroup>
+#include <QListWidgetItem>
+#include <QDir>
+#include <QMimeData>
+#include <QDropEvent>
+#include <QDragEnterEvent>
 #include <QApplication>
 #include <QDesktopServices>
 #include <QUrl>
@@ -479,7 +484,10 @@ MainWindow::MainWindow(QWidget* parent)
 
     placeholder_widget_ = new PlotWidget(view_container_);
     if (theme_idx_ == 1) placeholder_widget_->setTheme(PlotTheme::light());
-    view_layout_->addWidget(placeholder_widget_, 1);
+    placeholder_widget_->setVisible(false);
+    start_page_ = buildStartPage();
+    view_layout_->addWidget(start_page_, 1);
+    setAcceptDrops(true);
 
     right_l->addWidget(tab_bar_);
     right_l->addWidget(toolbar);
@@ -667,11 +675,16 @@ void MainWindow::updateViewLayout() {
     }
 
     if (datasets_.empty()) {
-        placeholder_widget_->setVisible(true);
-        view_layout_->addWidget(placeholder_widget_, 1);
+        // placeholder_widget_ stays hidden: it only exists so plotWidget()
+        // always has a target for toolbar actions while nothing is open.
+        placeholder_widget_->setVisible(false);
+        refreshRecentLists();
+        start_page_->setVisible(true);
+        view_layout_->addWidget(start_page_, 1);
         return;
     }
     placeholder_widget_->setVisible(false);
+    start_page_->setVisible(false);
 
     auto addDatasetWidgets = [this](Dataset& ds) {
         if (ds.extra_toolbar) {
@@ -758,6 +771,182 @@ void MainWindow::onTabMoved(int from, int to) {
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Recent files, start page, drag & drop
+// ---------------------------------------------------------------------------
+
+static constexpr int kMaxRecentFiles = 10;
+
+QStringList MainWindow::recentFiles() {
+    return QSettings("trs-viewer", "trs-viewer").value("recentFiles").toStringList();
+}
+
+void MainWindow::addRecentFile(const QString& path) {
+    const QString abs = QFileInfo(path).absoluteFilePath();
+    QStringList list = recentFiles();
+    list.removeAll(abs);
+    list.prepend(abs);
+    while (list.size() > kMaxRecentFiles) list.removeLast();
+    QSettings("trs-viewer", "trs-viewer").setValue("recentFiles", list);
+}
+
+void MainWindow::openAnyFile(const QString& path) {
+    if (!QFileInfo::exists(path)) {
+        QMessageBox::warning(this, "Open", "File not found:\n" + path);
+        return;
+    }
+    const QString lower = path.toLower();
+    if (lower.endsWith(".npy") || lower.endsWith(".npz")) {
+        updateRecentDir("npy", path);
+        openNpyTraces(path);
+    } else {
+        updateRecentDir("trs", path);
+        openFile(path);
+    }
+}
+
+void MainWindow::refreshRecentLists() {
+    const QStringList files = recentFiles();
+
+    if (recent_menu_) {
+        recent_menu_->clear();
+        for (const QString& f : files) {
+            QAction* a = recent_menu_->addAction(QFileInfo(f).fileName());
+            a->setToolTip(f);
+            a->setEnabled(QFileInfo::exists(f));
+            connect(a, &QAction::triggered, this, [this, f]() { openAnyFile(f); });
+        }
+        if (files.isEmpty()) recent_menu_->addAction("(none)")->setEnabled(false);
+        else {
+            recent_menu_->addSeparator();
+            connect(recent_menu_->addAction("Clear List"), &QAction::triggered, this, [this]() {
+                QSettings("trs-viewer", "trs-viewer").remove("recentFiles");
+                refreshRecentLists();
+            });
+        }
+    }
+
+    if (list_recent_) {
+        list_recent_->clear();
+        for (const QString& f : files) {
+            const QFileInfo fi(f);
+            auto* item = new QListWidgetItem(
+                fi.fileName() + "    " + QDir::toNativeSeparators(fi.absolutePath()));
+            item->setData(Qt::UserRole, f);
+            item->setToolTip(f);
+            if (!fi.exists()) {
+                item->setFlags(item->flags() & ~Qt::ItemIsEnabled);
+                item->setText(item->text() + "    (missing)");
+            }
+            list_recent_->addItem(item);
+        }
+        if (files.isEmpty()) {
+            auto* item = new QListWidgetItem("No recent files yet");
+            item->setFlags(Qt::NoItemFlags);
+            list_recent_->addItem(item);
+        }
+    }
+}
+
+QWidget* MainWindow::buildStartPage() {
+    auto* page  = new QWidget(view_container_);
+    auto* outer = new QVBoxLayout(page);
+    outer->setContentsMargins(32, 32, 32, 32);
+
+    auto* col   = new QWidget;
+    col->setMaximumWidth(720);
+    auto* cl    = new QVBoxLayout(col);
+    cl->setSpacing(14);
+
+    auto* title = new QLabel("Open a trace set");
+    QFont tf = title->font();
+    tf.setPointSizeF(tf.pointSizeF() * 1.8);
+    tf.setBold(true);
+    title->setFont(tf);
+    auto* sub = new QLabel("Riscure .trs, or NumPy .npy / .npz. Large files open instantly "
+                           "without loading into RAM. You can also drop files onto this window.");
+    sub->setWordWrap(true);
+
+    auto* btns = new QHBoxLayout;
+    auto* b_open   = new QPushButton("Open TRS File…  (Ctrl+O)");
+    auto* b_npy    = new QPushButton("Open NPY/NPZ…");
+    auto* b_subset = new QPushButton("Import Subset…");
+    b_open->setDefault(true);
+    connect(b_open,   &QPushButton::clicked, this, &MainWindow::onOpenFile);
+    connect(b_npy,    &QPushButton::clicked, this, &MainWindow::onOpenNpyTraces);
+    connect(b_subset, &QPushButton::clicked, this, &MainWindow::onImportTraceSubset);
+    btns->addWidget(b_open);
+    btns->addWidget(b_npy);
+    btns->addWidget(b_subset);
+    btns->addStretch();
+
+    auto* recent_lbl = new QLabel("<b>Recent</b>");
+    list_recent_ = new QListWidget;
+    list_recent_->setFrameShape(QFrame::NoFrame);
+    list_recent_->setMaximumHeight(240);
+    list_recent_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    list_recent_->setTextElideMode(Qt::ElideMiddle);   // long folder paths
+    list_recent_->setCursor(Qt::PointingHandCursor);
+    auto open_item = [this](QListWidgetItem* it) {
+        const QString f = it->data(Qt::UserRole).toString();
+        if (!f.isEmpty()) openAnyFile(f);
+    };
+    connect(list_recent_, &QListWidget::itemClicked,   this, open_item);
+    connect(list_recent_, &QListWidget::itemActivated, this, open_item);
+
+    auto* steps = new QLabel(
+        "<b>How a session usually goes</b><ol style='margin-left:-20px'>"
+        "<li><b>Load traces</b> — pick the range in the side panel, then Reload Traces.</li>"
+        "<li><b>Clean up</b> — add filters/resampling to the Processing Pipeline, then "
+        "Process › Align Traces.</li>"
+        "<li><b>Analyze</b> — Analyze › Welch t-test, SNR, CPA… Each result opens in its "
+        "own tab.</li></ol>"
+        "Help › Keyboard Shortcuts lists the plot keys; F1 opens the documentation.");
+    steps->setWordWrap(true);
+    steps->setTextFormat(Qt::RichText);
+
+    cl->addWidget(title);
+    cl->addWidget(sub);
+    cl->addLayout(btns);
+    cl->addSpacing(10);
+    cl->addWidget(recent_lbl);
+    cl->addWidget(list_recent_);
+    cl->addSpacing(10);
+    cl->addWidget(steps);
+
+    outer->addStretch(1);
+    auto* row = new QHBoxLayout;
+    row->addStretch(1);
+    row->addWidget(col, 4);
+    row->addStretch(1);
+    outer->addLayout(row);
+    outer->addStretch(2);
+
+    refreshRecentLists();
+    return page;
+}
+
+static bool isOpenableTraceFile(const QString& path) {
+    const QString l = path.toLower();
+    return l.endsWith(".trs") || l.endsWith(".npy") || l.endsWith(".npz");
+}
+
+void MainWindow::dragEnterEvent(QDragEnterEvent* e) {
+    if (!e->mimeData()->hasUrls()) return;
+    for (const QUrl& u : e->mimeData()->urls())
+        if (u.isLocalFile() && isOpenableTraceFile(u.toLocalFile())) {
+            e->acceptProposedAction();
+            return;
+        }
+}
+
+void MainWindow::dropEvent(QDropEvent* e) {
+    for (const QUrl& u : e->mimeData()->urls())
+        if (u.isLocalFile() && isOpenableTraceFile(u.toLocalFile()))
+            openAnyFile(u.toLocalFile());
+    e->acceptProposedAction();
+}
+
 void MainWindow::setupMenuBar() {
     // Menus are grouped by task — File (in/out), View, Process (change the
     // traces), Analyze (compute a result), Help. Every menu shows its
@@ -785,6 +974,9 @@ void MainWindow::setupMenuBar() {
         "whole file just to look at a slice of it.");
     connect(act_import_subset, &QAction::triggered, this, &MainWindow::onImportTraceSubset);
     file_menu->addAction(act_import_subset);
+
+    recent_menu_ = file_menu->addMenu("Open &Recent");
+    connect(recent_menu_, &QMenu::aboutToShow, this, &MainWindow::refreshRecentLists);
 
     QMenu* load_menu = file_menu->addMenu("&Load Result");
     load_menu->setToolTipsVisible(true);
@@ -1065,6 +1257,8 @@ void MainWindow::updateStateIndicators() {
     if (!hasActiveDs()) {
         setWindowTitle("TRS Viewer");
         if (lbl_state_) lbl_state_->setText("No file open — File › Open TRS File… (Ctrl+O)");
+        if (lbl_view_)    lbl_view_->clear();
+        if (lbl_measure_) lbl_measure_->setText("–");
         if (grp_trace_)    grp_trace_->setEnabled(false);
         if (grp_pipeline_) grp_pipeline_->setEnabled(false);
         if (grp_align_)    grp_align_->setEnabled(false);
@@ -1242,6 +1436,7 @@ void MainWindow::openFile(const QString& path) {
 
     tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
     tab_bar_->setCurrentIndex(active_idx_);
+    addRecentFile(path);
 
     rebuildTransformList();
     plotWidget()->setTransforms(activeDs().pipeline);
@@ -4167,7 +4362,10 @@ void MainWindow::onOpenNpyTraces() {
         recentDir("npy"), "NumPy files (*.npy *.npz);;All files (*)");
     if (path.isEmpty()) return;
     updateRecentDir("npy", path);
+    openNpyTraces(path);
+}
 
+void MainWindow::openNpyTraces(const QString& path) {
     std::vector<float> traces_flat;
     std::vector<float> data_flat;
     int64_t n_traces = 0, n_samples = 0;
@@ -4269,6 +4467,7 @@ void MainWindow::onOpenNpyTraces() {
 
         tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
         tab_bar_->setCurrentIndex(active_idx_);
+        addRecentFile(path);
 
         rebuildTransformList();
         plotWidget()->setTransforms(activeDs().pipeline);
@@ -4358,6 +4557,7 @@ void MainWindow::onOpenNpyTraces() {
 
     tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
     tab_bar_->setCurrentIndex(active_idx_);
+    addRecentFile(path);
 
     rebuildTransformList();
     plotWidget()->setTransforms(activeDs().pipeline);

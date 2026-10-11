@@ -8,6 +8,11 @@
 | TRS file | **File → Open TRS File…** (Ctrl+O) or command-line argument |
 | NPY (2-D trace matrix) | **File → Open NPY/NPZ as Traces…** |
 | NPZ archive | same — looks for `traces` array + optional `data` array |
+| Any of the above | Drag the file onto the window |
+| A file you opened before | **File → Open Recent**, or click it on the start page |
+
+With no file open, the window shows a start page with the open buttons,
+your recent files and a short outline of the usual workflow.
 
 
 ## Navigating traces

@@ -7,6 +7,7 @@
 #include "align.h"
 
 #include <QButtonGroup>
+#include <QMenu>
 #include <QComboBox>
 #include <QLabel>
 #include <QListWidget>
@@ -150,6 +151,13 @@ public:
     ~MainWindow() override;
 
     void openFile(const QString& path);
+    // Opens by extension: .npy/.npz as a trace matrix, anything else as TRS.
+    void openAnyFile(const QString& path);
+
+protected:
+    // Drop .trs/.npy/.npz files anywhere on the window to open them.
+    void dragEnterEvent(QDragEnterEvent* e) override;
+    void dropEvent(QDropEvent* e) override;
 
 private slots:
     void onOpenFile();
@@ -237,6 +245,12 @@ private:
     // derived from the active dataset's state. Called from updateUndoButton().
     void updateStateIndicators();
     void onDiscardAlignment();
+    void openNpyTraces(const QString& path);
+    // Most-recently-opened files (QSettings "recentFiles"), newest first.
+    static QStringList recentFiles();
+    void addRecentFile(const QString& path);
+    QWidget* buildStartPage();
+    void refreshRecentLists();
 
     // Switches the active plot's interaction mode back to Pan and re-checks
     // the "Pan" toolbar button (unchecking "↔ Align"/Measure/Box Zoom via
@@ -442,6 +456,9 @@ private:
     QPushButton*  btn_align_discard_ = nullptr;
     QLabel*       lbl_view_state_   = nullptr;
     QPushButton*  btn_go_live_      = nullptr;
+    QWidget*      start_page_       = nullptr;   // shown while no tab is open
+    QListWidget*  list_recent_      = nullptr;   // on the start page
+    QMenu*        recent_menu_      = nullptr;   // File › Open Recent
     int           theme_idx_        = 0;         // 0 = dark, 1 = light; persisted
     QButtonGroup* mode_group_       = nullptr;
 
