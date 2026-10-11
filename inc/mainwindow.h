@@ -451,6 +451,7 @@ private:
     QLabel*       lbl_state_        = nullptr;   // status-bar state summary
     QWidget*      grp_trace_        = nullptr;   // disabled on result tabs
     QWidget*      grp_pipeline_     = nullptr;   // disabled on result tabs
+    QLabel*       lbl_tx_help_      = nullptr;   // help for the selected pipeline stage
     QWidget*      grp_align_        = nullptr;   // alignment + live/baked state
     QLabel*       lbl_align_state_  = nullptr;
     QPushButton*  btn_align_discard_ = nullptr;

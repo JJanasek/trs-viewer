@@ -117,6 +117,131 @@ static double invTCdf(double p, double df) {
     return z + g + h;
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline stage help — shown as dropdown tooltips, in the help text under
+// the dropdown, and on hover over stages already in the pipeline. Index order
+// matches combo_transform_ / createTransform(). Anchors point at headings in
+// docs/features/pipeline.md.
+// ---------------------------------------------------------------------------
+namespace {
+struct StageHelp {
+    const char* summary;   // one line: tooltip
+    const char* use;       // "Use for"
+    const char* careful;   // "Watch out"
+    const char* anchor;    // pipeline.md heading anchor
+};
+const StageHelp kStageHelp[] = {
+    { "|x| for every sample.",
+      "Rectifying before smoothing or resampling, so positive and negative swings "
+      "don't cancel. Absolute Value → Moving Average gives an energy-like envelope "
+      "that makes operations easy to spot and to align on.",
+      "The sign is gone, so don't keep it for analyses where the sign of the "
+      "leakage matters.",
+      "absolute-value" },
+    { "−x for every sample.",
+      "Flipping probe polarity so the peaks you align on point upwards.",
+      "Doesn't change t-test or SNR magnitudes; it only flips signs.",
+      "negate" },
+    { "Mean of the last w samples (causal smoothing).",
+      "Removing high-frequency noise; combined with Absolute Value it gives an envelope.",
+      "Delays features by about w/2 samples, and the first w−1 output samples are a "
+      "start-up transient. A large w blurs short leakage peaks.",
+      "moving-average" },
+    { "Average blocks of w samples — shrinks traces, keeps the energy.",
+      "Making long, oversampled captures smaller so every analysis runs faster and "
+      "needs less memory.",
+      "Lowers time resolution; averaging also acts as a low-pass filter.",
+      "window-resample" },
+    { "Keep every N-th sample, drop the rest.",
+      "Quick decimation of data that is already band-limited.",
+      "No averaging, so high-frequency noise aliases (folds down) into the result. "
+      "Prefer Window Resample, or a lowpass Filter first.",
+      "stride-resample" },
+    { "Add a constant to every sample.",
+      "Removing a DC level or lining up baselines for display.",
+      "Has no effect on t-test, SNR or correlation results.",
+      "offset" },
+    { "Multiply every sample by a constant.",
+      "Converting ADC codes to volts, or normalising for display.",
+      "Has no effect on t-test or correlation results (a negative factor only flips the sign).",
+      "scale" },
+    { "Replace each trace by its amplitude spectrum.",
+      "Frequency-domain analysis of misaligned traces: magnitude ignores time "
+      "shifts, so a t-test or CPA then shows which frequencies leak.",
+      "All timing is lost. To see when and at which frequency, use STFT Magnitude.",
+      "fft-magnitude" },
+    { "Spectra of sliding windows, concatenated (short-time FFT).",
+      "Frequency-domain t-test/CPA that keeps coarse timing and tolerates jitter "
+      "smaller than one window.",
+      "Size the window for the jitter, not the frequency resolution. The output is "
+      "windows × bins long, window after window.",
+      "stft-magnitude" },
+    { "Add random noise scaled to each trace's standard deviation.",
+      "Robustness checks: how much extra noise before the leakage disappears.",
+      "Never leave it in for a real assessment — it is random on every run.",
+      "gaussian-noise" },
+    { "2nd-order lowpass / highpass / bandpass / notch filter.",
+      "Lowpass to remove HF noise, highpass to remove drift, bandpass to isolate a "
+      "clock band, notch for one interfering tone.",
+      "A causal filter shifts features in time. Tick Zero-phase to avoid that "
+      "(the filter then needs the whole trace at once).",
+      "filter" },
+    { "Notches at f0, 2·f0, 3·f0, … — removes a known interferer and its harmonics.",
+      "A clock or DC-DC converter at a known frequency.",
+      "Leakage can live at those harmonics too — measure SNR or a t-test before and after.",
+      "harmonic-notch" },
+    { "Flatten listed narrowband lines to the surrounding noise floor.",
+      "The best general way to remove spectral lines found with Analyze › FFT "
+      "Spectrum › Detect spectral lines. No phase distortion.",
+      "Needs the whole trace. Widen the band for a carrier that sits between FFT bins.",
+      "spectral-line-excision" },
+    { "Learn the interferer's repeating waveform and subtract it.",
+      "Periodic but non-sinusoidal interference such as a switching converter; "
+      "removes every harmonic without punching notches.",
+      "If the interferer is locked to the device's clock or trigger, this removes signal.",
+      "periodic-subtract" },
+    { "Shift a band down to baseband and take its envelope (AM demodulation).",
+      "When the leakage rides on a carrier — RF coupling, clock sidebands — instead "
+      "of the carrier being noise.",
+      "Notching that carrier would delete the signal; make the bandwidth wide enough "
+      "for the modulation.",
+      "demodulate" },
+};
+constexpr int kNumStageHelp = static_cast<int>(sizeof(kStageHelp) / sizeof(kStageHelp[0]));
+
+const char* kPipelineDocsUrl =
+    "https://github.com/JJanasek/trs-viewer/blob/main/docs/features/pipeline.md";
+
+// Which help entry describes a stage already in the pipeline, from its name().
+int stageHelpIndexForName(const QString& n) {
+    static const char* prefixes[] = {
+        "Absolute Value", "Negate", "Moving Average", "Window Resample",
+        "Stride Resample", "Offset", "Scale", "FFT Magnitude", "STFT Magnitude",
+        "Gaussian Noise", nullptr /* filter: "<Type> Filter (" */, "Harmonic Notch",
+        "Spectral Excise", "Periodic Subtract", "Demodulate" };
+    for (int i = 0; i < kNumStageHelp; i++) {
+        if (prefixes[i] ? n.startsWith(prefixes[i]) : n.contains(" Filter ("))
+            return i;
+    }
+    return -1;
+}
+
+QString stageHelpRichText(int i) {
+    const StageHelp& h = kStageHelp[i];
+    return QString("<b>%1</b><br><b>Use for:</b> %2<br><b>Watch out:</b> %3"
+                   "<br><a href=\"%4#%5\">Read more…</a>")
+        .arg(QString(h.summary).toHtmlEscaped(), QString(h.use).toHtmlEscaped(),
+             QString(h.careful).toHtmlEscaped(), kPipelineDocsUrl, h.anchor);
+}
+
+QString stageHelpTooltip(int i) {
+    const StageHelp& h = kStageHelp[i];
+    return QString("<p style='white-space:pre-wrap'><b>%1</b><br>Use for: %2<br>Watch out: %3</p>")
+        .arg(QString(h.summary).toHtmlEscaped(), QString(h.use).toHtmlEscaped(),
+             QString(h.careful).toHtmlEscaped());
+}
+}  // namespace
+
 const QColor MainWindow::TRACE_COLORS[] = {
     QColor("#4fc3f7"),  // light blue
     QColor("#ef5350"),  // red
@@ -250,6 +375,25 @@ MainWindow::MainWindow(QWidget* parent)
         "Demodulate (band → baseband envelope)",
     });
 
+    // Help for the chosen stage, so "which one, and why?" is answered before Add.
+    for (int i = 0; i < combo_transform_->count() && i < kNumStageHelp; i++)
+        combo_transform_->setItemData(i, stageHelpTooltip(i), Qt::ToolTipRole);
+    lbl_tx_help_ = new QLabel;
+    lbl_tx_help_->setWordWrap(true);
+    lbl_tx_help_->setTextFormat(Qt::RichText);
+    lbl_tx_help_->setOpenExternalLinks(true);
+    {
+        QFont f = lbl_tx_help_->font();
+        f.setPointSizeF(f.pointSizeF() * 0.92);
+        lbl_tx_help_->setFont(f);
+    }
+    auto showStageHelp = [this](int i) {
+        lbl_tx_help_->setText(i >= 0 && i < kNumStageHelp ? stageHelpRichText(i) : QString());
+    };
+    connect(combo_transform_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, showStageHelp);
+    showStageHelp(combo_transform_->currentIndex());
+
     list_transforms_ = new QListWidget;
     list_transforms_->setSelectionMode(QAbstractItemView::SingleSelection);
     list_transforms_->setMaximumHeight(140);   // leave room for Alignment & View below
@@ -270,6 +414,7 @@ MainWindow::MainWindow(QWidget* parent)
     connect(btn_dn_tx_,  &QPushButton::clicked, this, &MainWindow::onMoveTransformDown);
 
     txl->addWidget(combo_transform_);
+    txl->addWidget(lbl_tx_help_);
     txl->addWidget(list_transforms_);
     txl->addLayout(tx_btns);
 
@@ -1128,6 +1273,11 @@ void MainWindow::setupMenuBar() {
     connect(act_docs, &QAction::triggered, this, []() {
         QDesktopServices::openUrl(QUrl("https://github.com/JJanasek/trs-viewer/tree/main/docs"));
     });
+    QAction* act_pipe_docs = help_menu->addAction("Signal &Processing Guide");
+    act_pipe_docs->setToolTip("What each pipeline stage does, when to use it, and in which order");
+    connect(act_pipe_docs, &QAction::triggered, this, []() {
+        QDesktopServices::openUrl(QUrl(kPipelineDocsUrl));
+    });
     QAction* act_keys = help_menu->addAction("&Keyboard Shortcuts");
     connect(act_keys, &QAction::triggered, this, [this]() {
         QMessageBox::information(this, "Keyboard Shortcuts",
@@ -1863,9 +2013,10 @@ void MainWindow::rebuildTransformList() {
     list_transforms_->clear();
     if (!hasActiveDs()) return;
     for (int i = 0; i < static_cast<int>(activeDs().pipeline.size()); i++) {
-        list_transforms_->addItem(
-            QString("%1. %2").arg(i + 1)
-                             .arg(QString::fromStdString(activeDs().pipeline[i]->name())));
+        const QString nm = QString::fromStdString(activeDs().pipeline[i]->name());
+        list_transforms_->addItem(QString("%1. %2").arg(i + 1).arg(nm));
+        const int hi = stageHelpIndexForName(nm);
+        list_transforms_->item(i)->setToolTip(hi >= 0 ? stageHelpTooltip(hi) : nm);
     }
     updateStateIndicators();
 }
