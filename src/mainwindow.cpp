@@ -17,6 +17,8 @@
 #include <set>
 
 #include <QActionGroup>
+#include <QAbstractButton>
+#include <QPointer>
 #include <QListWidgetItem>
 #include <QDir>
 #include <QMimeData>
@@ -240,6 +242,68 @@ QString stageHelpTooltip(int i) {
         .arg(QString(h.summary).toHtmlEscaped(), QString(h.use).toHtmlEscaped(),
              QString(h.careful).toHtmlEscaped());
 }
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// DialogMemory — remembers an analysis dialog's *method* settings between
+// runs, in QSettings under "dialogs/<dialog>/<field>". Bind only method
+// parameters (grouping byte, window sizes, output modes, …) — never trace or
+// sample ranges or "apply alignment": those depend on the file that happens
+// to be open, and silently reusing a range from a different file would
+// analyse the wrong part of it.
+//
+// bind() registers fields as they are built; restore() applies the stored
+// values once the dialog's signal connections exist, so dependent labels
+// and enable-states update; save() is called on Run.
+// ---------------------------------------------------------------------------
+namespace {
+class DialogMemory {
+public:
+    explicit DialogMemory(const QString& dialog) : prefix_("dialogs/" + dialog + "/") {}
+
+    template <class W> W* bind(W* w, const QString& key) {
+        if (w) fields_.push_back({QPointer<QWidget>(w), key});
+        return w;
+    }
+
+    void restore() const {
+        QSettings st("trs-viewer", "trs-viewer");
+        for (const auto& f : fields_) {
+            if (!f.w || !st.contains(prefix_ + f.key)) continue;
+            const QVariant v = st.value(prefix_ + f.key);
+            if (auto* sp = qobject_cast<QSpinBox*>(f.w))            sp->setValue(v.toInt());
+            else if (auto* dsp = qobject_cast<QDoubleSpinBox*>(f.w)) dsp->setValue(v.toDouble());
+            else if (auto* cb = qobject_cast<QComboBox*>(f.w)) {
+                const int i = v.toInt();
+                if (i >= 0 && i < cb->count()) cb->setCurrentIndex(i);
+            }
+            else if (auto* rb = qobject_cast<QRadioButton*>(f.w)) {
+                // Only ever *select* one: unchecking an auto-exclusive radio
+                // could leave the group with nothing chosen.
+                if (v.toBool()) rb->setChecked(true);
+            }
+            else if (auto* ab = qobject_cast<QAbstractButton*>(f.w)) ab->setChecked(v.toBool());
+        }
+    }
+
+    void save() const {
+        QSettings st("trs-viewer", "trs-viewer");
+        for (const auto& f : fields_) {
+            if (!f.w) continue;
+            QVariant v;
+            if (auto* sp = qobject_cast<QSpinBox*>(f.w))            v = sp->value();
+            else if (auto* dsp = qobject_cast<QDoubleSpinBox*>(f.w)) v = dsp->value();
+            else if (auto* cb = qobject_cast<QComboBox*>(f.w))       v = cb->currentIndex();
+            else if (auto* ab = qobject_cast<QAbstractButton*>(f.w)) v = ab->isChecked();
+            if (v.isValid()) st.setValue(prefix_ + f.key, v);
+        }
+    }
+
+private:
+    struct Field { QPointer<QWidget> w; QString key; };
+    QString prefix_;
+    std::vector<Field> fields_;
+};
 }  // namespace
 
 const QColor MainWindow::TRACE_COLORS[] = {
@@ -564,8 +628,8 @@ MainWindow::MainWindow(QWidget* parent)
     btn_reset_    = new QPushButton("⟳ Reset  [R]");
     btn_zoom_in_->setToolTip("Zoom in X (also: scroll wheel up)");
     btn_zoom_out_->setToolTip("Zoom out X (also: scroll wheel down)");
-    btn_reset_->setToolTip("Back to the full range in Pan mode, and clear crop ranges.\n"
-                           "Traces, pipeline and alignment are left alone.");
+    btn_reset_->setToolTip("Back to the full range in Pan mode.\n"
+                           "Traces, pipeline, alignment and crop ranges are left alone.");
 
     auto* btn_yzoom_in  = new QPushButton("↑ Amp");
     auto* btn_yzoom_out = new QPushButton("↓ Amp");
@@ -1943,8 +2007,10 @@ void MainWindow::onMoveTransformDown() {
 }
 
 void MainWindow::onResetView() {
-    // View-only reset: pan/zoom back to the full range and clear crop
-    // ranges. Alignment (align_shifts and any per-trace drag shifts) is
+    // View-only reset: pan/zoom back to the full range. Crop ranges are kept
+    // — they are analysis input built in the Range Editor (which has its own
+    // Clear), not view state, and losing them to a stray "R" was a trap.
+    // Alignment (align_shifts and any per-trace drag shifts) is
     // deliberately left untouched — Reset is for the view, not for
     // discarding an alignment you just computed. Nothing else clears
     // alignment either: onApplyTraces() ("Load / Refresh" / "Un-apply
@@ -1954,7 +2020,6 @@ void MainWindow::onResetView() {
     // file changes, i.e. a fresh Dataset from openFile()/onOpenNpyTraces().
     if (hasActiveDs()) saveSnapshot();
     plotWidget()->resetView();
-    plotWidget()->clearCropRanges();
     resetInteractionModeToPan();
 }
 
@@ -5430,7 +5495,9 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         fl->addRow("Group byte index:", sp_byte);
     }
 
-    auto* chk_abs = new QCheckBox("Absolute value |t|");
+    DialogMemory mem("ttest");
+    mem.bind(sp_byte, "group_byte");   // null when the file carries a ttest param
+    auto* chk_abs = mem.bind(new QCheckBox("Absolute value |t|"), "abs");
     chk_abs->setToolTip("Report |t| instead of the signed t-statistic — only magnitude "
                         "matters against the significance threshold, so this makes peaks "
                         "symmetric and comparable regardless of leakage direction.");
@@ -5450,7 +5517,9 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    mem.restore();
     if (cfg.exec() != QDialog::Accepted) return;
+    mem.save();
 
     int32_t first    = static_cast<int32_t>(sp_first->value());
     int32_t count    = static_cast<int32_t>(sp_count->value());
@@ -6580,6 +6649,17 @@ void MainWindow::onRunXCorr() {
     connect(rb_template,  &QRadioButton::toggled, cfg, [=](bool) { updateEstimate(); });
     updateEstimate();
 
+    // Method only — stride is left out on purpose: it sets the output matrix
+    // size, which depends on this file's sample count.
+    auto mem = std::make_shared<DialogMemory>("xcorr");
+    mem->bind(rb_baseline, "method_baseline");
+    mem->bind(rb_dual, "method_dual");
+    mem->bind(rb_mp, "method_mp");
+    mem->bind(rb_twowin, "method_twowin");
+    mem->bind(rb_template, "method_template");
+    mem->bind(sp_mp_scale, "mp_scale");
+    mem->restore();
+
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     cfg_bb->button(QDialogButtonBox::Ok)->setText("Run cross-correlation");
     connect(cfg_bb, &QDialogButtonBox::accepted, cfg, &QDialog::accept);
@@ -6599,6 +6679,7 @@ void MainWindow::onRunXCorr() {
     // OK, via QDialog::accepted() (emitted from within accept(), so this fires
     // right after cfg_bb's "accepted" -> cfg->accept() connection above runs).
     connect(cfg, &QDialog::accepted, cfg, [=]() {
+    mem->save();
 
     int32_t first_trace  = static_cast<int32_t>(sp_first->value());
     int32_t num_traces   = static_cast<int32_t>(sp_count->value());
@@ -8150,12 +8231,20 @@ void MainWindow::onRunSpectralLeakage() {
                                 "border:1px solid #e0c48a; border-radius:3px;");
     fl->addRow(jitter_note);
 
+    DialogMemory mem("leakage_freq");
+    mem.bind(sp_byte, "group_byte");
+    mem.bind(sp_win, "stft_window");
+    mem.bind(sp_ov, "overlap");
+    mem.bind(cmb_fn, "window_fn");
+
     auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     bb->button(QDialogButtonBox::Ok)->setText("Run");
     fl->addRow(bb);
     connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    mem.restore();
     if (cfg.exec() != QDialog::Accepted) return;
+    mem.save();
 
     const bool use_alignment = chk_align->isChecked();
     std::vector<int32_t> use_shifts;
@@ -10459,6 +10548,8 @@ void MainWindow::onRunCpa() {
     sp_m->setValue(256);
     sp_m->setToolTip("Number of model evaluations (0 to M-1). 256 for a full AES key byte.");
     fl_hyp->addRow("M:", sp_m);
+    DialogMemory mem("cpa");
+    mem.bind(sp_m, "hypotheses");
 
     // Alignment shifts option — populated by the last "Apply to Main View"
     // run. Tiled alignment isn't supported here yet (align_shifts.size()
@@ -10527,7 +10618,9 @@ void MainWindow::onRunCpa() {
     vl_cfg->addWidget(grp_align);
     vl_cfg->addWidget(lbl_blocking);
     vl_cfg->addWidget(cfg_bb);
+    mem.restore();
     if (cfg.exec() != QDialog::Accepted) return;
+    mem.save();
 
     const int32_t first_trace     = static_cast<int32_t>(sp_first->value());
     const int32_t num_traces      = static_cast<int32_t>(sp_count->value());
@@ -10957,12 +11050,19 @@ void MainWindow::onRunSNR() {
         sp_key->setEnabled(idx == 2 || idx == 3);
     });
 
+    DialogMemory mem("snr");
+    mem.bind(sp_byte, "data_byte");
+    mem.bind(cmb_mode, "class_mode");
+    mem.bind(sp_key, "key_byte");
+
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     cfg_bb->button(QDialogButtonBox::Ok)->setText("Run SNR");
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    mem.restore();
     if (cfg.exec() != QDialog::Accepted) return;
+    mem.save();
 
     const int32_t first    = sp_first->value();
     const int32_t count    = sp_count->value();
@@ -11445,11 +11545,19 @@ void MainWindow::onRunFFT() {
     chk_envelope->setChecked(false);
     fl->addRow("", chk_envelope);
 
+    auto mem = std::make_shared<DialogMemory>("fft");
+    mem->bind(cmb_window, "window_fn");
+    mem->bind(cmb_output, "output");
+    mem->bind(chk_pad, "zero_pad");
+    mem->bind(chk_envelope, "envelope");
+    mem->restore();
+
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     cfg_bb->button(QDialogButtonBox::Ok)->setText("Run FFT");
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::rejected, cfg, &QDialog::reject);
     connect(cfg_bb, &QDialogButtonBox::accepted, cfg, [=]() {
+        mem->save();
         const int32_t first        = sp_first->value();
         const int32_t count        = sp_count->value();
         const int64_t eff_first_sample = sp_s_first->value();

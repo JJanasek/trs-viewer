@@ -19,8 +19,18 @@ your recent files and a short outline of the usual workflow.
 
 
 1. Set **First trace** and **Count** in the side panel, click **Reload Traces**.
-2. Scroll to zoom, drag to pan, **R** / **Reset** for full view.
+2. Scroll to zoom, drag to pan, **R** / **Reset** for full view (crop ranges from the Range Editor are kept; clear them there).
 3. **Ctrl+scroll** or **Shift+scroll** — Y-axis amplitude zoom.
+
+
+## Remembered settings
+
+The analysis dialogs remember their *method* settings from the last run: t-test
+grouping byte and |t|, SNR class mode and bytes, CPA hypothesis count, FFT
+window/output options, Leakage vs Frequency STFT settings, and the
+cross-correlation method. Trace and sample ranges and "Apply last alignment
+shifts" are never remembered; they always start from the file that is open, so
+a range from one file is never silently applied to another.
 
 
 ## Status bar
