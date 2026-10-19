@@ -95,28 +95,42 @@ bool computeTTestCore(TrsFile* file,
     std::vector<int32_t> thread_skipped(static_cast<size_t>(n_threads), 0);
     std::vector<int32_t> thread_discarded(static_cast<size_t>(n_threads), 0);
 
-    // Live snapshots: the per-thread accumulators are merged into a scratch
-    // one between batches (the parallel region is idle then, so no locking),
-    // which leaves the running state untouched. Only allocated when needed.
+    // Live snapshots: the t-curve over everything so far is computed straight
+    // from the per-thread accumulators between batches (the parallel region
+    // is idle then, so no locking), leaving the running state untouched.
+    //
+    // A snapshot reads 4 × threads × samples doubles, so on long traces it
+    // is far from free (≈0.3 s single-threaded at 10M samples × 8 threads).
+    // It is split over the worker threads, and its measured cost throttles
+    // how often it runs: the next one waits until at least
+    // kSnapshotCostRatio × that cost has passed since it finished, which
+    // keeps snapshots at ≲10% of the run whatever snapshot_every says.
+    // Snapshots cheaper than kSnapshotCostFloorMs are left to min_interval_ms
+    // alone (the default 400 ms already bounds them below that share).
     const bool snapshots = live && live->snapshot_every > 0 && live->on_snapshot;
-    std::unique_ptr<TTestAccumulator> scratch;
-    if (snapshots)
-        scratch = std::make_unique<TTestAccumulator>(static_cast<int32_t>(effective_samples));
+    constexpr double kSnapshotCostRatio   = 9.0;
+    constexpr double kSnapshotCostFloorMs = 20.0;
     const auto run_t0 = std::chrono::steady_clock::now();
-    auto last_snap_t  = run_t0;
+    auto last_snap_t    = run_t0;   // when the last snapshot finished
+    double last_snap_ms = 0.0;      // and what it cost
     int64_t last_snap_done = 0;
 
-    auto publishSnapshot = [&](int64_t done, bool final) {
+    // final_tstat: the run's own final curve (abs already applied), reused
+    // for the last snapshot instead of computing the same thing twice.
+    auto publishSnapshot = [&](int64_t done, bool final, const std::vector<float>* final_tstat) {
         auto snap = std::make_shared<LiveTTestSnapshot>();
         snap->done  = done;
         snap->total = eff_count;
         snap->final = final;
-        scratch->reset();
-        for (const auto& a : thread_accs) scratch->mergeFrom(a);
-        snap->n0 = scratch->countGroup(0);
-        snap->n1 = scratch->countGroup(1);
+        for (const auto& a : thread_accs) {
+            snap->n0 += a.countGroup(0);
+            snap->n1 += a.countGroup(1);
+        }
         std::string cerr;
-        if (scratch->compute(snap->tstat, cerr)) {
+        if (final_tstat) {
+            snap->tstat = *final_tstat;
+            summarizeTStat(snap->tstat, live->threshold, snap->max_abs, snap->n_exceed);
+        } else if (TTestAccumulator::computeMerged(thread_accs, snap->tstat, cerr, n_threads)) {
             if (abs_value)
                 for (float& v : snap->tstat) v = std::fabs(v);
             summarizeTStat(snap->tstat, live->threshold, snap->max_abs, snap->n_exceed);
@@ -230,10 +244,14 @@ bool computeTTestCore(TrsFile* file,
         if (snapshots && batch_end < eff_count
             && batch_end - last_snap_done >= live->snapshot_every) {
             const auto now = std::chrono::steady_clock::now();
-            if (std::chrono::duration<double, std::milli>(now - last_snap_t).count()
-                    >= live->min_interval_ms) {
-                publishSnapshot(batch_end, false);
-                last_snap_t    = now;
+            const double since_ms =
+                std::chrono::duration<double, std::milli>(now - last_snap_t).count();
+            const double cost_gap_ms =
+                last_snap_ms >= kSnapshotCostFloorMs ? kSnapshotCostRatio * last_snap_ms : 0.0;
+            if (since_ms >= std::max(live->min_interval_ms, cost_gap_ms)) {
+                publishSnapshot(batch_end, false, nullptr);
+                last_snap_t    = std::chrono::steady_clock::now();
+                last_snap_ms   = std::chrono::duration<double, std::milli>(last_snap_t - now).count();
                 last_snap_done = batch_end;
             }
         }
@@ -277,7 +295,7 @@ bool computeTTestCore(TrsFile* file,
     if (abs_value)
         for (float& v : tstat) v = std::fabs(v);
 
-    if (snapshots) publishSnapshot(processed, true);
+    if (snapshots) publishSnapshot(processed, true, &tstat);
 
     acc_out   = acc_ptr;
     tstat_out = std::move(tstat);

@@ -35,7 +35,9 @@ struct TTestLive {
     std::vector<int32_t> order;
 
     // Publish a snapshot roughly every `snapshot_every` traces, but no more
-    // often than every `min_interval_ms`. 0 = no snapshots.
+    // often than every `min_interval_ms`. 0 = no snapshots. Snapshots that
+    // turn out expensive (long traces) are further spaced out so they stay
+    // around 10% of the run time.
     int32_t snapshot_every  = 0;
     double  min_interval_ms = 400.0;
     float   threshold       = 4.5f;   // for LiveTTestSnapshot::n_exceed
