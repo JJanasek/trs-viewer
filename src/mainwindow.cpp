@@ -9761,10 +9761,28 @@ void MainWindow::onPatternEditor() {
 
     auto* grp = new QGroupBox("Alignment");
     auto* fl  = new QFormLayout(grp);
+    // Start from the traces loaded in the view (like Align Traces): first =
+    // the view's first trace, count = the rest of the file, template = that
+    // same first trace. The template is an absolute trace index, as in Align
+    // Traces.
+    const int32_t loaded_first = std::clamp(activeDs().plot_first_trace, 0, std::max(0, n_total - 1));
     auto* sp_first = new QSpinBox; sp_first->setRange(0, std::max(0, n_total - 1));
-    auto* sp_count = new QSpinBox; sp_count->setRange(2, std::max(2, n_total)); sp_count->setValue(n_total);
+    sp_first->setValue(loaded_first);
+    auto* sp_count = new QSpinBox; sp_count->setRange(2, std::max(2, n_total));
+    sp_count->setValue(std::max(2, n_total - loaded_first));
     auto* sp_ref   = new QSpinBox; sp_ref->setRange(0, std::max(0, n_total - 1));
-    sp_ref->setToolTip("Template trace, counted from First trace");
+    sp_ref->setValue(loaded_first);
+    sp_ref->setToolTip("Absolute index of the template trace; must lie within the traces above");
+    // Keep the template inside [first, first + count).
+    auto clampRef = [=]() {
+        const int lo = sp_first->value();
+        const int hi = std::min(n_total - 1, lo + sp_count->value() - 1);
+        if (sp_ref->value() < lo) sp_ref->setValue(lo);
+        if (sp_ref->value() > hi) sp_ref->setValue(hi);
+    };
+    connect(sp_first, QOverload<int>::of(&QSpinBox::valueChanged), dlg, clampRef);
+    connect(sp_count, QOverload<int>::of(&QSpinBox::valueChanged), dlg, clampRef);
+    connect(sp_ref,   &QSpinBox::editingFinished, dlg, clampRef);
     auto* sp_refn  = new QSpinBox; sp_refn->setRange(1, 1000); sp_refn->setValue(1);
     sp_refn->setToolTip("Average this many traces into the template (only helps if they are "
                         "already roughly aligned)");
@@ -10195,7 +10213,9 @@ void MainWindow::onPatternEditor() {
             const auto& p = ds.patterns[static_cast<size_t>(row)];
             PatternDef d = p.def;
             d.refine_raw = chk_refine->isChecked();
-            d.ref_offset = std::min(sp_ref->value(), sp_count->value() - 1);
+            // Absolute template index -> offset within the aligned traces.
+            d.ref_offset = std::clamp(sp_ref->value() - sp_first->value(), 0,
+                                      std::max(0, std::min(sp_count->value(), n_total - sp_first->value()) - 1));
             d.ref_count  = sp_refn->value();
             defs.push_back(d);
         }
@@ -11627,8 +11647,12 @@ void MainWindow::onChainEditor() {
             // Captures the definitions (not the shifts): replaying re-aligns.
             ChainStep s;
             s.kind        = ChainStep::Kind::AlignPatterns;
+            // Same traces the patterns were aligned on (templates are stored
+            // relative to that first trace); count 0 = to the end of the file.
             s.first_trace = 0;
-            s.trace_count = 0;   // every trace
+            for (const auto& p : activeDs().patterns)
+                if (p.res.aligned) { s.first_trace = p.res.first_trace; break; }
+            s.trace_count = 0;
             for (const auto& p : activeDs().patterns) s.pattern_defs.push_back(p.def);
             s.pattern_strip = QMessageBox::question(dlg, "Align Patterns",
                 "Remove the pipeline stages after aligning, so the following steps "

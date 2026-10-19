@@ -41,7 +41,9 @@ each one **on its own**, and keep only the shifts. The t-test then reads the
       one resampling step of the coarse result. The pipeline is used with its
       resamplers removed, so filters still shape the signal.
 
-    The resulting shifts are exact to the raw sample. The Result column
+    The traces default to the ones loaded in the view (first trace onward),
+    with that first trace as the template (an absolute trace number, as in
+    Align Traces). The resulting shifts are exact to the raw sample. The Result column
     shows, per pattern, how many traces were kept (e.g. *kept 60 / 300 (20%)*,
     amber below 50%, red below 25%) and the median correlation over all
     traces.
