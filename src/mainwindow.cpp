@@ -9711,6 +9711,22 @@ void MainWindow::onPatternEditor() {
     hint->setWordWrap(true);
     vl->addWidget(hint);
 
+    // Positions can be shown in the units of the (resampled) signal on the
+    // plot — easier to relate to what you see — or in raw samples; edits are
+    // converted back to exact raw positions either way.
+    auto* cmb_units = new QComboBox;
+    cmb_units->addItems({"Pipeline samples (as on the plot)", "Raw samples"});
+    cmb_units->setToolTip("Units for Start, End, Length and Search. Pipeline samples are the "
+                          "positions of the resampled signal you align on; patterns are always "
+                          "stored and applied in raw samples.");
+    {
+        auto* row = new QHBoxLayout;
+        row->addWidget(new QLabel("Positions in:"));
+        row->addWidget(cmb_units);
+        row->addStretch();
+        vl->addLayout(row);
+    }
+
     enum Col { CName, CStart, CEnd, CLen, CSearch, CMethod, CMinCorr, CResult, NCols };
     auto* tbl = new QTableWidget(0, NCols);
     tbl->setHorizontalHeaderLabels({"Name", "Start", "End", "Length", "Search ±", "Method",
@@ -9798,6 +9814,20 @@ void MainWindow::onPatternEditor() {
     auto alignmentPipeline = [this](const Dataset& ds) -> const std::vector<std::shared_ptr<ITransform>>& {
         return ds.pipeline.empty() ? ds.pattern_pipeline : ds.pipeline;
     };
+    // Raw <-> displayed units (see cmb_units).
+    struct Units { bool pipe = false; std::vector<std::shared_ptr<ITransform>> pl; int64_t step = 1; };
+    auto currentUnits = [=]() {
+        Units u;
+        const int i = dsIndex();
+        if (i < 0) return u;
+        u.pl = alignmentPipeline(datasets_[static_cast<size_t>(i)]);
+        u.step = std::max<int64_t>(1, rawStartForProcessedIndex(u.pl, 1, h.num_samples));
+        u.pipe = cmb_units->currentIndex() == 0 && u.step > 1;
+        return u;
+    };
+    auto toDisplay = [=](const Units& u, int64_t raw) {
+        return u.pipe ? processedCountForRaw(u.pl, raw) : raw;
+    };
     auto describePipeline = [](const std::vector<std::shared_ptr<ITransform>>& pl) {
         QStringList names;
         for (const auto& t : pl) names << QString::fromStdString(t->name());
@@ -9822,10 +9852,38 @@ void MainWindow::onPatternEditor() {
                 auto* it_name = new QTableWidgetItem(QString::fromStdString(p.def.name));
                 it_name->setForeground(themeTraceColor(r));
                 tbl->setItem(r, CName,   it_name);
-                tbl->setItem(r, CStart,  new QTableWidgetItem(QString::number(p.def.raw_start)));
-                tbl->setItem(r, CEnd,    new QTableWidgetItem(QString::number(p.def.raw_end)));
-                tbl->setItem(r, CLen,    new QTableWidgetItem(QString::number(p.def.raw_end - p.def.raw_start)));
-                tbl->setItem(r, CSearch, new QTableWidgetItem(QString::number(p.def.search_half)));
+                const Units un = currentUnits();
+                const int64_t ds_ = toDisplay(un, p.def.raw_start), de_ = toDisplay(un, p.def.raw_end);
+                tbl->setItem(r, CStart,  new QTableWidgetItem(QString::number(ds_)));
+                tbl->setItem(r, CEnd,    new QTableWidgetItem(QString::number(de_)));
+                tbl->setItem(r, CLen,    new QTableWidgetItem(QString::number(de_ - ds_)));
+                for (int c : {CStart, CEnd, CLen})
+                    tbl->item(r, c)->setToolTip(QString("raw samples: %1 – %2 (length %3)")
+                        .arg(p.def.raw_start).arg(p.def.raw_end).arg(p.def.raw_end - p.def.raw_start));
+                auto* it_search = new QTableWidgetItem(QString::number(
+                    un.pipe ? static_cast<int64_t>(std::llround(static_cast<double>(p.def.search_half) / un.step))
+                            : static_cast<int64_t>(p.def.search_half)));
+                {
+                    // In units of the signal alignment runs on: a window of a
+                    // couple of resampled samples can't catch real jitter.
+                    const auto& pl = alignmentPipeline(datasets_[static_cast<size_t>(idx)]);
+                    const int64_t L = std::max<int64_t>(1, p.def.raw_end - p.def.raw_start);
+                    const int64_t pl_len = processedCountForRaw(pl, L);
+                    const double step = pl_len > 0 ? static_cast<double>(L) / pl_len : 1.0;
+                    const double in_steps = p.def.search_half / step;
+                    if (step > 1.5) {
+                        it_search->setToolTip(QString("±%1 raw samples = ±%2 samples of the resampled "
+                                                      "signal it is aligned on").arg(p.def.search_half)
+                                                  .arg(in_steps, 0, 'f', 1));
+                        if (in_steps < 3.0) {
+                            it_search->setForeground(currentTheme().warn);
+                            it_search->setToolTip(it_search->toolTip() + QString(" — too narrow to "
+                                                  "catch real misalignment; widen it, e.g. to 50 pipeline "
+                                                  "samples (%1 raw).").arg(static_cast<int64_t>(step * 50)));
+                        }
+                    }
+                }
+                tbl->setItem(r, CSearch, it_search);
                 auto* sp_mc = new QDoubleSpinBox;
                 sp_mc->setRange(0.0, 1.0);
                 sp_mc->setSingleStep(0.05);
@@ -9914,6 +9972,18 @@ void MainWindow::onPatternEditor() {
         updateStateIndicators();
     };
     *rebuild_holder = rebuild;
+    {
+        const int i = dsIndex();
+        bool view_decimates = false, align_decimates = false;
+        if (i >= 0) {
+            const Dataset& d0 = datasets_[static_cast<size_t>(i)];
+            view_decimates  = rawStartForProcessedIndex(d0.pipeline, 1, h.num_samples) > 1;
+            align_decimates = rawStartForProcessedIndex(alignmentPipeline(d0), 1, h.num_samples) > 1;
+        }
+        cmb_units->setCurrentIndex(view_decimates ? 0 : 1);
+        cmb_units->setEnabled(align_decimates);
+        connect(cmb_units, QOverload<int>::of(&QComboBox::currentIndexChanged), dlg, [=](int) { rebuild(); });
+    }
     // Keep the holder alive exactly as long as the dialog (the cell widgets
     // only hold a weak reference to it).
     connect(dlg, &QObject::destroyed, dlg, [rebuild_holder]() {});
@@ -9926,13 +9996,22 @@ void MainWindow::onPatternEditor() {
         if (r < 0 || r >= static_cast<int>(pats.size())) return;
         auto& d = pats[static_cast<size_t>(r)].def;
         bool ok = true;
+        // Typed values are in the displayed units; store raw positions.
+        const Units un = currentUnits();
+        auto rawStart = [&](qlonglong v) { return un.pipe ? rawStartForProcessedIndex(un.pl, v, h.num_samples) : static_cast<int64_t>(v); };
+        auto rawEnd   = [&](qlonglong v) { return un.pipe ? rawCountForProcessedCount(un.pl, v, h.num_samples) : static_cast<int64_t>(v); };
         switch (it->column()) {
         case CName:   d.name = it->text().toStdString(); break;
-        case CStart:  { const qlonglong v = it->text().toLongLong(&ok); if (ok) d.raw_start = std::clamp<qlonglong>(v, 0, h.num_samples); } break;
-        case CEnd:    { const qlonglong v = it->text().toLongLong(&ok); if (ok) d.raw_end = std::clamp<qlonglong>(v, 0, h.num_samples); } break;
+        case CStart:  { const qlonglong v = it->text().toLongLong(&ok); if (ok) d.raw_start = std::clamp<int64_t>(rawStart(v), 0, h.num_samples); } break;
+        case CEnd:    { const qlonglong v = it->text().toLongLong(&ok); if (ok) d.raw_end = std::clamp<int64_t>(rawEnd(v), 0, h.num_samples); } break;
         case CLen:    { const qlonglong v = it->text().toLongLong(&ok);
-                        if (ok && v >= 4) d.raw_end = std::clamp<qlonglong>(d.raw_start + v, 0, h.num_samples); } break;
-        case CSearch: { const int v = it->text().toInt(&ok); if (ok) d.search_half = std::max(1, v); } break;
+                        if (ok && v >= 1) {
+                            const int64_t end = un.pipe ? rawEnd(toDisplay(un, d.raw_start) + v) : d.raw_start + v;
+                            if (end - d.raw_start >= 4) d.raw_end = std::clamp<int64_t>(end, 0, h.num_samples);
+                        } } break;
+        case CSearch: { const qlonglong v = it->text().toLongLong(&ok);
+                        if (ok) d.search_half = static_cast<int32_t>(std::clamp<int64_t>(
+                            un.pipe ? v * un.step : v, 1, h.num_samples)); } break;
         default: return;
         }
         if (d.raw_end < d.raw_start) std::swap(d.raw_start, d.raw_end);
@@ -9948,7 +10027,11 @@ void MainWindow::onPatternEditor() {
         p.def.name = "P" + std::to_string(pats.size() + 1);
         p.def.raw_start = std::min(a, b);
         p.def.raw_end   = std::max(a, b);
-        p.def.search_half = static_cast<int32_t>(std::clamp<int64_t>((p.def.raw_end - p.def.raw_start) / 4, 8, 5000));
+        // ±¼ of the pattern: wide enough for the jitter a resampled view
+        // shows (no fixed cap — at a 2000× resample even 100k raw samples
+        // are only 50 steps of the signal being aligned).
+        p.def.search_half = static_cast<int32_t>(std::clamp<int64_t>((p.def.raw_end - p.def.raw_start) / 4,
+                                                                     8, std::max<int64_t>(8, h.num_samples / 2)));
         p.def.min_corr    = 0.7f;   // keep only traces that clearly match the template
         pats.push_back(std::move(p));
         rebuild();

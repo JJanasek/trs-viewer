@@ -189,5 +189,5 @@ TEST(PatternAlign, ScoresComeFromTheAlignedSignal) {
     d.refine_raw = false;
     ASSERT_TRUE(alignPattern(&ts.f, resample16(), 0, kNT, d, coarse, {}, err)) << err;
     EXPECT_EQ(refined.scores, coarse.scores);
-    EXPECT_EQ(refined.at_limit, 0);
+    EXPECT_EQ(refined.at_limit, coarse.at_limit);   // judged on the coarse search
 }

@@ -95,8 +95,12 @@ bool alignPattern(TrsFile* file,
     // A best match on the edge of the search window means the real one is
     // probably outside it: count it, and never let refinement push further.
     const int32_t limit = def.search_half;
+    // The coarse search moves in whole resampling steps, so "at the edge"
+    // means within one step of the limit.
+    const int64_t coarse_len  = processedCountForRaw(pipeline, L);
+    const int64_t coarse_step = coarse_len > 0 ? std::max<int64_t>(1, (L + coarse_len - 1) / coarse_len) : 1;
     for (int32_t v : coarse.shifts)
-        if (v != kAlignDiscardShift && std::abs(v) >= limit - 1) out.at_limit++;
+        if (v != kAlignDiscardShift && std::abs(v) > limit - coarse_step) out.at_limit++;
 
     // ---- stage 2: refine at raw resolution ----
     const int64_t proc_len = processedCountForRaw(pipeline, L);

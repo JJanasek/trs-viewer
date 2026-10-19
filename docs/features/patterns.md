@@ -22,7 +22,13 @@ each one **on its own**, and keep only the shifts. The t-test then reads the
       rounds, loop iterations).
 
     In the table, edit the name, start, end, **length** (editing it moves the
-    end), search width (± raw samples) and method (cross-correlation or peak).
+    end), search width (±) and method (cross-correlation or peak).
+    **Positions in** switches these between *pipeline samples* — the
+    positions of the resampled signal on the plot, the same units as the
+    Align Traces dialog — and *raw samples*; patterns are always stored in
+    raw samples. The search width defaults to ±¼ of the pattern; a width of
+    less than three steps of the resampled signal is shown in amber, since it
+    can't catch real misalignment.
     For cross-correlation, **Min corr.** excludes traces whose best
     correlation with the template is lower than this. It defaults to 0.7 for
     new patterns; *off* keeps every trace. Patterns are drawn on the plot as coloured, labelled bands, dashed
