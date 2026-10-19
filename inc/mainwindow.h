@@ -409,7 +409,8 @@ private:
     std::shared_ptr<LiveTTestView> createLiveTTestTab(const QString& title, int32_t total,
                                                        bool abs_value,
                                                        const std::shared_ptr<TTestLive>& live);
-    void applyLiveTTestSnapshot(LiveTTestView& v, const LiveTTestSnapshot& s);
+    void applyLiveTTestSnapshot(LiveTTestView& v,
+                                const std::shared_ptr<const LiveTTestSnapshot>& snap);
 
     // Chain "Run T-test" step: resolves the step's trace range (the last
     // alignment's range if use_last_alignment and one exists, else the
