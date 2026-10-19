@@ -20,7 +20,8 @@ analyses over the result — each in its own tab, several files at a time.
 | **[Viewing](features/viewing.md)** | Lazily memory-mapped trace browser, pan/zoom/measure, stacked lanes |
 | **[Pipeline](features/pipeline.md)** | Filters, resampling, FFT/STFT and more, applied live to every analysis |
 | **[Alignment](features/alignment.md)** | Peak and cross-correlation alignment, including per-tile alignment |
-| **[Welch t-test](features/ttest.md)** | TVLA leakage assessment with thresholds and export |
+| **[Pattern alignment](features/patterns.md)** | Mark several regions, align each on its own (exact to the raw sample), test them side by side |
+| **[Welch t-test](features/ttest.md)** | TVLA leakage assessment, 1st and 2nd order, live progress, sanity check |
 | **[CPA](features/cpa.md)** | Correlation power analysis with a Python leakage model |
 | **[SNR](features/snr.md)** · **[Static SNR](features/static-snr.md)** | Per-sample signal-to-noise |
 | **[Cross-correlation](features/xcorr.md)** · **[Heatmap](features/heatmap.md)** | Trace similarity matrices, with red-box peak annotations that export with the figure |

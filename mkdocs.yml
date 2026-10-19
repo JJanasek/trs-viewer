@@ -35,6 +35,7 @@ nav:
       - Trace viewing: features/viewing.md
       - Processing pipeline: features/pipeline.md
       - Trace alignment: features/alignment.md
+      - Pattern alignment: features/patterns.md
       - Welch t-test: features/ttest.md
       - Cross-correlation: features/xcorr.md
       - CPA: features/cpa.md

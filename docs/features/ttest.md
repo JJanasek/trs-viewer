@@ -4,6 +4,44 @@
 
 Computes the per-sample Welch t-statistic between two trace groups. No special header fields are required — group assignment is configured in the dialog by choosing which data byte to use as the group label (0 = group 0, non-zero = group 1). If the file's parameter map contains a `ttest` entry, its `offset` field is used automatically and the byte selector is hidden.
 
+## Order, jitter window and sanity check
+
+The **Test** group in the dialog:
+
+| Setting | Effect |
+|---|---|
+| **Order: 1st** | Compares the groups' means at each sample (classic TVLA). |
+| **Order: 2nd** | Compares their **variances**, for masked implementations whose first-order leakage is hidden. |
+| **Jitter window** | 2nd order: adds up the centred squares over this many samples, so leftover misalignment smaller than the window still counts. Use about 2–4× the remaining jitter. |
+| **Show the 1st-order curve alongside** | Drawn faded behind a 2nd-order result. For a masked design, expect a flat 1st order and a peaked 2nd order. |
+| **Random-split sanity check** | Uses only group-0 traces, split into two random halves. Nothing should leak; if it does, the alignment or preprocessing created it. |
+
+### Second order
+
+The second-order test is the univariate test of Schneider & Moradi
+(*Leakage Assessment Methodology*, CHES 2015). It runs in two passes:
+
+1. A first-order pass gives each group's per-sample mean (and the 1st-order
+   curve shown alongside).
+2. Each trace is transformed into `y = (x − mean of its group)²`, optionally
+   summed over the jitter window, and the Welch t-test runs on `y`.
+
+Second order is much more sensitive to misalignment than first order. Align
+first. When different parts of the trace need different shifts, use
+[pattern alignment](patterns.md). Live progress shows the second pass.
+
+The test is *univariate*: it finds leakage where the shares are processed at
+the same moment (typical of hardware masking). Software masking that handles
+the shares at different times needs a bivariate test, which is not available
+yet.
+
+## Using patterns
+
+When the file has aligned [patterns](patterns.md), the dialog shows **Use
+patterns** with a checklist. Each selected pattern is tested on the raw traces
+with its own shifts, and the results are joined side by side in one tab with
+labelled bands. Calc TH uses all samples of all patterns.
+
 ## Live progress
 
 With **Show intermediate results while it runs** ticked (the default), a

@@ -18,8 +18,9 @@ result — each in its own tab, several files at a time.
 
 - **Viewing** — lazily memory-mapped browser, pan/zoom/measure, stacked lanes
 - **Pipeline** — filters, resampling, FFT/STFT, applied live to every analysis
-- **Alignment** — peak and cross-correlation, including per-tile alignment
-- **Analyses** — Welch t-test (TVLA), CPA, SNR, cross-correlation, FFT,
+- **Alignment** — peak and cross-correlation, per-tile, and per-pattern
+  alignment exact to the raw sample
+- **Analyses** — Welch t-test (TVLA, 1st and 2nd order, live), CPA, SNR, cross-correlation, FFT,
   leakage-vs-frequency
 - **Interference** — find narrowband carriers, switcher combs and clock
   harmonics, then excise, notch, subtract or demodulate them
