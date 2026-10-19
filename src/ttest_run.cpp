@@ -50,7 +50,8 @@ bool computeTTestCore(TrsFile* file,
                       std::shared_ptr<TTestAccumulator>& acc_out,
                       std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
                       QString& warn_out, QString& err,
-                      TTestLive* live)
+                      TTestLive* live,
+                      const TTestHooks* hooks)
 {
     const TrsHeader& h = file->header();
     const std::vector<int32_t>& use_shifts = shifts;
@@ -175,6 +176,10 @@ bool computeTTestCore(TrsFile* file,
             auto data_bytes = file->readData(src_idx);
             if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
             int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
+            if (hooks && hooks->group_map) {
+                group = hooks->group_map(group, src_idx);
+                if (group < 0) continue;   // deliberately left out (e.g. sanity split)
+            }
 
             // Read window with per-trace shift, zero-pad out of bounds.
             // Looked up by src_idx's position in the *alignment's own*
@@ -207,6 +212,7 @@ bool computeTTestCore(TrsFile* file,
             int64_t n_out = raw_ns;
             for (const auto& t : pipeline_local)
                 n_out = t->apply(trace_buf.data(), n_out, 0);
+            if (hooks && hooks->post) hooks->post(group, trace_buf.data(), n_out);
             acc_local.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
         }
 
@@ -277,5 +283,103 @@ bool computeTTestCore(TrsFile* file,
     tstat_out = std::move(tstat);
     n0_out    = acc.countGroup(0);
     n1_out    = acc.countGroup(1);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// computeTTest: order / jitter window / sanity split on top of the core.
+// ---------------------------------------------------------------------------
+
+namespace {
+// SplitMix64 — a well-mixed, platform-independent hash for the sanity split.
+uint64_t splitmix(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+}  // namespace
+
+bool computeTTest(TrsFile* file,
+                  const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                  int32_t eff_first, int32_t eff_count,
+                  int64_t eff_first_sample, int64_t eff_n_samples,
+                  int32_t byte_idx, const std::vector<int32_t>& shifts,
+                  int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
+                  bool abs_value, const TTestOptions& opt,
+                  const std::function<bool(int64_t, int64_t)>& progress,
+                  std::shared_ptr<TTestAccumulator>& acc_out,
+                  std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
+                  QString& warn_out, QString& err,
+                  TTestLive* live, std::vector<float>* first_order_out)
+{
+    TTestHooks hooks;
+    if (opt.sanity_split) {
+        hooks.group_map = [](int group, int32_t trace) {
+            if (group != 0) return -1;
+            return static_cast<int>(splitmix(static_cast<uint64_t>(trace) ^ 0x5A17ULL) & 1);
+        };
+    }
+
+    if (opt.order <= 1) {
+        return computeTTestCore(file, pipeline, eff_first, eff_count, eff_first_sample,
+                                eff_n_samples, byte_idx, shifts, shifts_first_trace,
+                                read_lo, read_hi, abs_value, progress, acc_out, tstat_out,
+                                n0_out, n1_out, warn_out, err, live, &hooks);
+    }
+
+    // ---- order 2, pass 1: first-order test, which gives the group means ----
+    auto half = [&](int64_t base) {
+        return [&progress, base](int64_t done, int64_t total) {
+            return !progress || progress(base * total + done, 2 * total);
+        };
+    };
+    std::shared_ptr<TTestAccumulator> acc1;
+    std::vector<float> t1;
+    int64_t a0 = 0, a1 = 0;
+    QString w1;
+    if (!computeTTestCore(file, pipeline, eff_first, eff_count, eff_first_sample,
+                          eff_n_samples, byte_idx, shifts, shifts_first_trace,
+                          read_lo, read_hi, /*abs=*/false, half(0), acc1, t1, a0, a1, w1, err,
+                          nullptr, &hooks))
+        return false;
+    auto mean0 = std::make_shared<std::vector<double>>();
+    auto mean1 = std::make_shared<std::vector<double>>();
+    acc1->groupMeans(0, *mean0);
+    acc1->groupMeans(1, *mean1);
+    if (first_order_out) {
+        if (abs_value) for (float& v : t1) v = std::fabs(v);
+        *first_order_out = std::move(t1);
+    }
+
+    // ---- pass 2: t-test on the centred squares (optionally windowed) ----
+    const int32_t half_w = std::max<int32_t>(0, opt.integrate / 2);
+    hooks.post = [mean0, mean1, half_w](int group, float* buf, int64_t n) {
+        const std::vector<double>& mu = (group == 1) ? *mean1 : *mean0;
+        const int64_t m = std::min<int64_t>(n, static_cast<int64_t>(mu.size()));
+        if (half_w == 0) {
+            for (int64_t i = 0; i < m; i++) {
+                const double d = buf[i] - mu[static_cast<size_t>(i)];
+                buf[i] = static_cast<float>(d * d);
+            }
+            return;
+        }
+        thread_local std::vector<double> prefix;
+        prefix.assign(static_cast<size_t>(m + 1), 0.0);
+        for (int64_t i = 0; i < m; i++) {
+            const double d = buf[i] - mu[static_cast<size_t>(i)];
+            prefix[static_cast<size_t>(i + 1)] = prefix[static_cast<size_t>(i)] + d * d;
+        }
+        for (int64_t i = 0; i < m; i++) {
+            const int64_t lo = std::max<int64_t>(0, i - half_w);
+            const int64_t hi = std::min<int64_t>(m, i + half_w + 1);
+            buf[i] = static_cast<float>(prefix[static_cast<size_t>(hi)] - prefix[static_cast<size_t>(lo)]);
+        }
+    };
+    if (!computeTTestCore(file, pipeline, eff_first, eff_count, eff_first_sample,
+                          eff_n_samples, byte_idx, shifts, shifts_first_trace,
+                          read_lo, read_hi, abs_value, half(1), acc_out, tstat_out,
+                          n0_out, n1_out, warn_out, err, live, &hooks))
+        return false;
     return true;
 }

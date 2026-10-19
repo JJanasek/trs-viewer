@@ -63,6 +63,16 @@ std::vector<int32_t> makeInterleavedOrder(int32_t n, uint64_t seed);
 void summarizeTStat(const std::vector<float>& t, float threshold,
                     float& max_abs, int64_t& n_exceed);
 
+// Per-trace hooks into computeTTestCore (called on worker threads; must be
+// thread-safe and must not touch widgets).
+struct TTestHooks {
+    // Map a trace's group (0/1 from its data byte) to the group it is
+    // accumulated into; return -1 to leave the trace out.
+    std::function<int(int group, int32_t trace)> group_map;
+    // Transform the processed samples of one trace before accumulation.
+    std::function<void(int group, float* buf, int64_t n)> post;
+};
+
 // shifts empty => no alignment; shift == kAlignDiscardShift excludes that
 // trace. Returns false on failure: err == "Cancelled." for a user cancel,
 // otherwise a real failure message from TTestAccumulator::compute().
@@ -77,4 +87,40 @@ bool computeTTestCore(TrsFile* file,
                       std::shared_ptr<TTestAccumulator>& acc_out,
                       std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
                       QString& warn_out, QString& err,
-                      TTestLive* live = nullptr);
+                      TTestLive* live = nullptr,
+                      const TTestHooks* hooks = nullptr);
+
+// ---------------------------------------------------------------------------
+// Higher-level runs: order, jitter tolerance and the sanity check.
+// ---------------------------------------------------------------------------
+struct TTestOptions {
+    // 1: Welch t-test on the samples (TVLA first order).
+    // 2: univariate second order — t-test on y = (x − μ_group)², i.e. on the
+    //    groups' variances (Schneider & Moradi, CHES 2015). Runs two passes:
+    //    pass 1 is the first-order test and supplies the group means.
+    int     order = 1;
+    // Order 2 only: sum y over a centred window of this many samples, so
+    // residual misalignment smaller than the window still adds up. 1 = off.
+    int32_t integrate = 1;
+    // Random-split sanity check: use only group-0 traces, split into two
+    // halves by a seeded hash of the trace index. A real setup shows no
+    // leakage here; if it does, the preprocessing created it.
+    bool    sanity_split = false;
+};
+
+// Runs computeTTestCore according to `opt`. For order 2, `first_order_out`
+// (optional) receives the pass-1 first-order curve. `live` applies to the
+// final pass.
+bool computeTTest(TrsFile* file,
+                  const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                  int32_t eff_first, int32_t eff_count,
+                  int64_t eff_first_sample, int64_t eff_n_samples,
+                  int32_t byte_idx, const std::vector<int32_t>& shifts,
+                  int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
+                  bool abs_value, const TTestOptions& opt,
+                  const std::function<bool(int64_t, int64_t)>& progress,
+                  std::shared_ptr<TTestAccumulator>& acc_out,
+                  std::vector<float>& tstat_out, int64_t& n0_out, int64_t& n1_out,
+                  QString& warn_out, QString& err,
+                  TTestLive* live = nullptr,
+                  std::vector<float>* first_order_out = nullptr);

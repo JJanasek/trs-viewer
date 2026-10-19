@@ -23,6 +23,8 @@ public:
     // Requires N_[0] >= 2 and N_[1] >= 2.
     void computeWelchDf(std::vector<double>& df_out) const;
     int64_t countGroup(int g) const;
+    // Per-sample mean of group g (resized to num_samples; zeros if empty).
+    void groupMeans(int g, std::vector<double>& out) const;
     int32_t numSamples() const { return num_samples_; }
     int64_t estimatedBytes() const {
         return static_cast<int64_t>(num_samples_) * 4LL * static_cast<int64_t>(sizeof(double));

@@ -62,6 +62,13 @@ void TTestAccumulator::computeWelchDf(std::vector<double>& df_out) const {
     }
 }
 
+void TTestAccumulator::groupMeans(int g, std::vector<double>& out) const {
+    out.assign(static_cast<size_t>(num_samples_), 0.0);
+    if ((g != 0 && g != 1) || N_[g] == 0) return;
+    const double n = static_cast<double>(N_[g]);
+    for (int32_t s = 0; s < num_samples_; s++) out[static_cast<size_t>(s)] = sum_[g][s] / n;
+}
+
 int64_t TTestAccumulator::countGroup(int g) const {
     return (g == 0 || g == 1) ? N_[g] : 0;
 }
