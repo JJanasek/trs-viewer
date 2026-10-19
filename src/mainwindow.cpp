@@ -5488,7 +5488,7 @@ void MainWindow::applyLiveTTestSnapshot(LiveTTestView& v,
             snap, const_cast<std::vector<float>*>(&snap->tstat));
         // Overlays cost a full copy of the curve each; past a couple of
         // million samples that is hundreds of MB for a cosmetic feature.
-        if (s.tstat.size() > 2'000'000 && v.chk_overlay && v.chk_overlay->isEnabled()) {
+        if (s.tstat.size() > 500'000 && v.chk_overlay && v.chk_overlay->isEnabled()) {
             QSignalBlocker block(v.chk_overlay.data());   // don't re-enter via toggled()
             v.chk_overlay->setChecked(false);
             v.chk_overlay->setEnabled(false);

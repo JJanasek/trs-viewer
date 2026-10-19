@@ -51,7 +51,7 @@ it shows:
 - **The t-curve so far,** recomputed every *N* traces (**Update every**, and at
   most a few times per second). The previous three snapshots are drawn faded
   behind the current one, so you can watch real leakage peaks grow while noise
-  stays put. Overlays switch off automatically for traces longer than 2 million
+  stays put. Overlays switch off automatically for traces longer than 500,000
   samples, to save memory.
 - **max |t| vs traces processed,** a small plot under the controls. It is the
   classic "traces to disclosure" view, and the status line notes when |t| first
