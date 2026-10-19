@@ -21,11 +21,14 @@ each one **on its own**, and keep only the shifts. The t-test then reads the
     - **Repeat…**: copy the selected pattern N times at a fixed period (cipher
       rounds, loop iterations).
 
-    Edit the name, region, search width (± raw samples), method
-    (cross-correlation or peak) and an optional minimum correlation in the
-    table. Patterns are drawn on the plot as coloured, labelled bands, dashed
+    In the table, edit the name, start, end, **length** (editing it moves the
+    end), search width (± raw samples) and method (cross-correlation or peak).
+    For cross-correlation, **Min corr.** excludes traces whose best
+    correlation with the template is lower than this (*off* keeps every
+    trace). Patterns are drawn on the plot as coloured, labelled bands, dashed
     until they are aligned.
-3. **Align All.** Each pattern is aligned in two stages:
+3. **Align All**, or select rows (Ctrl/Shift-click) and **Align Selected**.
+   Each pattern is aligned in two stages:
     - **coarse**, on the current pipeline (fast on the resampled signal, but
       only accurate to about one resampling step);
     - **refine**, by normalised cross-correlation at full raw resolution within
@@ -35,7 +38,9 @@ each one **on its own**, and keep only the shifts. The t-test then reads the
     The resulting shifts are exact to the raw sample. The table shows, per
     pattern, how many traces were kept, the median correlation, and how many
     were excluded by the minimum correlation. By default the pipeline stages are
-    then removed, so analyses run on raw traces. Ctrl+Z undoes this.
+    removed **once every pattern is aligned**, so you can align them one at a
+    time on the resampled view and the analyses still run on raw traces.
+    Ctrl+Z undoes this.
 4. **Run the t-test** (**Analyze → Welch t-test**). With aligned patterns the
    dialog shows **Use patterns** with a checklist. The selected patterns are
    tested on the raw traces with their own shifts, and shown side by side in
