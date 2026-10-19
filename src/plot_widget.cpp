@@ -127,6 +127,11 @@ void PlotWidget::setMatchMarkers(const std::vector<std::pair<int64_t,int64_t>>& 
     update();
 }
 
+void PlotWidget::setPatternBands(const std::vector<PatternBand>& bands) {
+    pattern_bands_ = bands;
+    update();
+}
+
 void PlotWidget::clearMatchMarkers() {
     if (match_markers_.empty()) return;
     match_markers_.clear();
@@ -1069,6 +1074,33 @@ void PlotWidget::paintEvent(QPaintEvent*) {
             p.setPen(lc);
             p.drawText(x1 + 3, pr.top() + 13,
                        is_repeat ? QString("#%1 rep").arg(i + 1) : QString("#%1").arg(i + 1));
+        }
+    }
+
+    // Pattern bands — behind the measurement, labelled along the top.
+    if (!pattern_bands_.empty()) {
+        QFont bf = font(); bf.setPointSize(8); bf.setBold(true);
+        p.setFont(bf);
+        const QFontMetrics fm(bf);
+        for (const auto& b : pattern_bands_) {
+            int x1 = sampleToPixel(b.start, pr);
+            int x2 = sampleToPixel(b.end,   pr);
+            if (x2 < pr.left() || x1 > pr.right()) continue;
+            x1 = std::clamp(x1, pr.left(), pr.right());
+            x2 = std::clamp(x2, pr.left(), pr.right());
+            if (x2 <= x1) x2 = x1 + 1;
+            QColor fill = b.color; fill.setAlpha(b.aligned ? 34 : 22);
+            QColor edge = b.color; edge.setAlpha(200);
+            p.fillRect(QRect(x1, pr.top(), x2 - x1, pr.height()), fill);
+            p.setPen(QPen(edge, 1, b.aligned ? Qt::SolidLine : Qt::DashLine));
+            p.drawLine(x1, pr.top(), x1, pr.bottom());
+            p.drawLine(x2, pr.top(), x2, pr.bottom());
+            const QString text = fm.elidedText(b.label + (b.aligned ? "  ✓" : ""),
+                                               Qt::ElideRight, std::max(0, x2 - x1 - 6));
+            if (!text.isEmpty()) {
+                p.setPen(edge);
+                p.drawText(x1 + 4, pr.top() + 13, text);
+            }
         }
     }
 

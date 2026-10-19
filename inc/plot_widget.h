@@ -199,6 +199,10 @@ public:
     // Used e.g. to project template-match hits back onto the trace.
     void    setMatchMarkers(const std::vector<std::pair<int64_t,int64_t>>& ranges);
     void    clearMatchMarkers();
+    // Pattern regions (Process › Patterns): tinted bands with a name label,
+    // in raw sample positions. Read-only overlay.
+    struct PatternBand { int64_t start = 0, end = 0; QString label; QColor color; bool aligned = false; };
+    void    setPatternBands(const std::vector<PatternBand>& bands);
 
     // Per-trace sample shifts (set by AlignDrag; also settable programmatically)
     int32_t             traceShift(int idx) const;
@@ -310,6 +314,7 @@ private:
 
     // Match-marker overlay (read-only, e.g. template-match hits)
     std::vector<std::pair<int64_t,int64_t>> match_markers_;
+    std::vector<PatternBand> pattern_bands_;
 
     // Pending cut selection (CropSelect mode: drag sets this, Enter confirms it)
     int64_t pending_cut_start_ = -1;

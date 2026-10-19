@@ -5,6 +5,7 @@
 #include "plot_widget.h"
 #include "ttest.h"
 #include "align.h"
+#include "pattern_align.h"
 
 #include <QButtonGroup>
 #include <QMenu>
@@ -12,7 +13,9 @@
 #include <QLabel>
 #include <QListWidget>
 #include <QMainWindow>
+#include <QPointer>
 #include <QPushButton>
+#include <QDialog>
 #include <QSpinBox>
 #include <QTabBar>
 
@@ -42,6 +45,7 @@ struct DatasetSnapshot {
     int64_t align_n_samples    = 0;
     int32_t align_tile_size    = 0;
     int32_t align_baked_tile   = 0;
+    std::vector<Pattern> patterns;
     PlotViewState view;
 };
 
@@ -84,6 +88,10 @@ struct Dataset {
     // View") represents; used by rebakeAlignedView() on later pipeline
     // edits. Ignored untiled.
     int32_t              align_baked_tile   = 0;
+
+    // Pattern alignment (Process › Patterns): named regions, each aligned on
+    // its own; only the per-trace shifts are kept. See pattern_align.h.
+    std::vector<Pattern> patterns;
 
     // Plot state
     int32_t              plot_first_trace   = 0;
@@ -248,6 +256,8 @@ private:
     // derived from the active dataset's state. Called from updateUndoButton().
     void updateStateIndicators();
     void onDiscardAlignment();
+    void onPatternEditor();
+    void refreshPatternBands(Dataset& ds);
     void openNpyTraces(const QString& path);
     // Most-recently-opened files (QSettings "recentFiles"), newest first.
     static QStringList recentFiles();
@@ -469,6 +479,7 @@ private:
     QWidget*      start_page_       = nullptr;   // shown while no tab is open
     QListWidget*  list_recent_      = nullptr;   // on the start page
     QMenu*        recent_menu_      = nullptr;   // File › Open Recent
+    QPointer<QDialog> pattern_dlg_;              // Process › Patterns (one at a time)
     int           theme_idx_        = 2;         // ThemeChoice: 0 dark, 1 light, 2 system; persisted
     QButtonGroup* mode_group_       = nullptr;
 

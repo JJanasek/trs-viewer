@@ -128,7 +128,8 @@ bool alignPattern(TrsFile* file,
             double norm = 0;
             for (float& v : tmpl) { v = static_cast<float>(v - mean); norm += double(v) * v; }
             norm = std::sqrt(norm);
-            if (norm <= 1e-30) { error = "The pattern's template is flat (no structure to align on)."; return false; }
+            if (norm <= 1e-30) { error = "The template trace is flat in this region (nothing to align on) — "
+                                         "choose another template trace or average several."; return false; }
             for (float& v : tmpl) v = static_cast<float>(v / norm);
         }
 

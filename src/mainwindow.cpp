@@ -500,8 +500,8 @@ MainWindow::MainWindow(QWidget* parent)
     btn_align_run->setToolTip("Open Process › Align Traces");
     connect(btn_align_run, &QPushButton::clicked, this, &MainWindow::onAlignTraces);
     btn_align_discard_ = new QPushButton("Discard");
-    btn_align_discard_->setToolTip("Forget the stored alignment, so reload, export and the "
-                                   "analyses use unshifted traces again (Ctrl+Z undoes)");
+    btn_align_discard_->setToolTip("Forget the stored alignment and patterns, so reload, export "
+                                   "and the analyses use unshifted traces again (Ctrl+Z undoes)");
     connect(btn_align_discard_, &QPushButton::clicked, this, &MainWindow::onDiscardAlignment);
     auto* align_btns = new QHBoxLayout;
     align_btns->addWidget(btn_align_run);
@@ -1313,6 +1313,10 @@ void MainWindow::setupMenuBar() {
 
     // ---- Process ----
     QMenu* proc_menu = addMenu("&Process");
+    QAction* act_patterns = proc_menu->addAction("&Patterns…");
+    act_patterns->setToolTip("Mark several regions, align each on its own and keep the shifts "
+                             "for the t-test");
+    connect(act_patterns, &QAction::triggered, this, &MainWindow::onPatternEditor);
     auto* act_align = new QAction("&Align Traces…", this);
     connect(act_align, &QAction::triggered, this, &MainWindow::onAlignTraces);
     proc_menu->addAction(act_align);
@@ -1411,6 +1415,7 @@ void MainWindow::saveSnapshot() {
     snap.align_n_samples    = ds.align_n_samples;
     snap.align_tile_size    = ds.align_tile_size;
     snap.align_baked_tile   = ds.align_baked_tile;
+    snap.patterns           = ds.patterns;
     snap.view               = plotWidget()->captureViewState();
     ds.undo_stack.push_front(std::move(snap));
     if (static_cast<int>(ds.undo_stack.size()) > Dataset::kMaxUndo)
@@ -1427,6 +1432,8 @@ void MainWindow::restoreSnapshot(DatasetSnapshot snap) {
     ds.align_n_samples    = snap.align_n_samples;
     ds.align_tile_size    = snap.align_tile_size;
     ds.align_baked_tile   = snap.align_baked_tile;
+    ds.patterns           = std::move(snap.patterns);
+    refreshPatternBands(ds);
 
     rebuildTransformList();
     plotWidget()->setTransforms(ds.pipeline);
@@ -1522,11 +1529,18 @@ void MainWindow::updateStateIndicators() {
         return;
     }
 
-    const bool aligned = !ds.align_shifts.empty();
+    int patterns_aligned = 0;
+    for (const auto& p : ds.patterns) patterns_aligned += p.res.aligned ? 1 : 0;
+    const bool aligned = !ds.align_shifts.empty() || patterns_aligned > 0;
     const bool baked   = !ds.plot_file_backed;
 
     if (lbl_align_state_) {
-        if (aligned) {
+        QString pat_line;
+        if (!ds.patterns.empty())
+            pat_line = QString("Patterns: %1 (%2 aligned)").arg(ds.patterns.size()).arg(patterns_aligned);
+        if (ds.align_shifts.empty()) {
+            lbl_align_state_->setText(pat_line.isEmpty() ? QString("No alignment") : pat_line);
+        } else {
             int32_t max_abs = 0;
             size_t  discarded = 0;
             for (int32_t v : ds.align_shifts) {
@@ -1546,9 +1560,8 @@ void MainWindow::updateStateIndicators() {
             }
             txt += QString("\nMax shift ±%1").arg(max_abs);
             if (discarded) txt += QString(" · %1 discarded").arg(discarded);
+            if (!pat_line.isEmpty()) txt += "\n" + pat_line;
             lbl_align_state_->setText(txt);
-        } else {
-            lbl_align_state_->setText("No alignment");
         }
     }
     if (btn_align_discard_) btn_align_discard_->setEnabled(aligned);
@@ -1590,9 +1603,12 @@ void MainWindow::updateStateIndicators() {
 }
 
 void MainWindow::onDiscardAlignment() {
-    if (!hasActiveDs() || activeDs().is_result || activeDs().align_shifts.empty()) return;
-    saveSnapshot();   // undoable — snapshots carry every align_* field
+    if (!hasActiveDs() || activeDs().is_result) return;
+    if (activeDs().align_shifts.empty() && activeDs().patterns.empty()) return;
+    saveSnapshot();   // undoable — snapshots carry every align_* field and the patterns
     Dataset& ds = activeDs();
+    ds.patterns.clear();
+    refreshPatternBands(ds);
     ds.align_shifts.clear();
     ds.align_first_trace  = 0;
     ds.align_first_sample = 0;
@@ -9470,6 +9486,408 @@ bool runTiledAlignment(
 // ---------------------------------------------------------------------------
 // Trace alignment dialog
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Pattern alignment (Process › Patterns…). Mark several regions on the plot —
+// usually with a Window Resample stage in the pipeline so the structure is
+// visible — align each region on its own, and keep only the shifts. The
+// t-test can then read the raw traces pattern by pattern.
+// ---------------------------------------------------------------------------
+
+void MainWindow::refreshPatternBands(Dataset& ds) {
+    if (!ds.plot_widget) return;
+    std::vector<PlotWidget::PatternBand> bands;
+    for (size_t i = 0; i < ds.patterns.size(); i++) {
+        const auto& p = ds.patterns[i];
+        bands.push_back({p.def.raw_start, p.def.raw_end, QString::fromStdString(p.def.name),
+                         themeTraceColor(static_cast<int>(i)), p.res.aligned});
+    }
+    ds.plot_widget->setPatternBands(bands);
+}
+
+void MainWindow::onPatternEditor() {
+    if (pattern_dlg_) { pattern_dlg_->raise(); pattern_dlg_->activateWindow(); return; }
+    if (!hasActiveDs() || activeDs().is_result || !activeDs().file) {
+        QMessageBox::information(this, "Patterns", "Open a trace file first.");
+        return;
+    }
+
+    // The editor stays bound to the file it was opened on, even if another
+    // tab becomes active meanwhile.
+    std::weak_ptr<TrsFile> bound = activeDs().file;
+    auto dsIndex = [this, bound]() -> int {
+        auto f = bound.lock();
+        if (!f) return -1;
+        for (size_t i = 0; i < datasets_.size(); i++)
+            if (!datasets_[i].is_result && datasets_[i].file == f) return static_cast<int>(i);
+        return -1;
+    };
+    const TrsHeader& h = activeDs().file->header();
+    const int32_t n_total = h.num_traces;
+
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle("Patterns — " + activeDs().display_name);
+    dlg->resize(760, 560);
+    pattern_dlg_ = dlg;
+    auto* vl = new QVBoxLayout(dlg);
+
+    auto* hint = new QLabel(
+        "Mark the regions you want to analyse — add a Window Resample stage first if the "
+        "structure is hard to see. Each pattern is aligned on its own and only its shifts are "
+        "kept; the t-test can then use them on the raw traces.");
+    hint->setWordWrap(true);
+    vl->addWidget(hint);
+
+    enum Col { CName, CStart, CEnd, CSearch, CMethod, CMinR, CResult, NCols };
+    auto* tbl = new QTableWidget(0, NCols);
+    tbl->setHorizontalHeaderLabels({"Name", "Start", "End", "Search ±", "Method", "Min r", "Result"});
+    tbl->horizontalHeader()->setSectionResizeMode(CName, QHeaderView::Stretch);
+    tbl->horizontalHeader()->setSectionResizeMode(CResult, QHeaderView::Stretch);
+    tbl->setColumnWidth(CMethod, 150);
+    tbl->verticalHeader()->setVisible(false);
+    tbl->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tbl->setToolTip("Start/End/Search are raw sample positions. Min r: traces whose "
+                    "correlation with the template is lower are excluded (empty = keep all).");
+    vl->addWidget(tbl, 1);
+
+    auto* btn_draw   = new QPushButton("Draw on Plot");
+    btn_draw->setCheckable(true);
+    btn_draw->setToolTip("Drag across the plot to add a pattern; stays on until you click again");
+    auto* btn_view   = new QPushButton("Add Current View");
+    auto* btn_repeat = new QPushButton("Repeat…");
+    btn_repeat->setToolTip("Copy the selected pattern N times at a fixed period (e.g. cipher rounds)");
+    auto* btn_remove = new QPushButton("Remove");
+    auto* btn_clear  = new QPushButton("Clear All");
+    vl->addWidget(widgetRow({btn_draw, btn_view, btn_repeat, btn_remove, btn_clear}));
+
+    auto* grp = new QGroupBox("Alignment");
+    auto* fl  = new QFormLayout(grp);
+    auto* sp_first = new QSpinBox; sp_first->setRange(0, std::max(0, n_total - 1));
+    auto* sp_count = new QSpinBox; sp_count->setRange(2, std::max(2, n_total)); sp_count->setValue(n_total);
+    auto* sp_ref   = new QSpinBox; sp_ref->setRange(0, std::max(0, n_total - 1));
+    sp_ref->setToolTip("Template trace, counted from First trace");
+    auto* sp_refn  = new QSpinBox; sp_refn->setRange(1, 1000); sp_refn->setValue(1);
+    sp_refn->setToolTip("Average this many traces into the template (only helps if they are "
+                        "already roughly aligned)");
+    auto* chk_refine = new QCheckBox("Refine to the exact raw sample");
+    chk_refine->setChecked(true);
+    chk_refine->setToolTip("After aligning on the resampled signal, re-match at full resolution "
+                           "within one resampling step");
+    auto* chk_strip = new QCheckBox("Remove the pipeline stages afterwards (analyse raw traces)");
+    chk_strip->setChecked(true);
+    chk_strip->setToolTip("The resampling and filters only help you see and align the patterns; "
+                          "the t-test should normally run on the raw traces.");
+    fl->addRow("Traces:", widgetRow({new QLabel("first"), sp_first, new QLabel("count"), sp_count}));
+    fl->addRow("Template:", widgetRow({new QLabel("trace"), sp_ref, new QLabel("average"), sp_refn}));
+    fl->addRow(chk_refine);
+    fl->addRow(chk_strip);
+    vl->addWidget(grp);
+
+    auto* lbl_status = new QLabel;
+    lbl_status->setWordWrap(true);
+    vl->addWidget(lbl_status);
+
+    auto* btn_load  = new QPushButton("Load Shifts…");
+    auto* btn_save  = new QPushButton("Save Shifts…");
+    auto* btn_close = new QPushButton("Close");
+    auto* btn_align = new QPushButton("Align All");
+    btn_align->setProperty("primary", true);
+    auto* bottom = new QHBoxLayout;
+    bottom->addWidget(btn_load);
+    bottom->addWidget(btn_save);
+    bottom->addStretch();
+    bottom->addWidget(btn_close);
+    bottom->addWidget(btn_align);
+    vl->addLayout(bottom);
+
+    // ---- model <-> table ----
+    auto refreshing = std::make_shared<bool>(false);
+    auto rebuild = [=]() {
+        const int idx = dsIndex();
+        *refreshing = true;
+        tbl->setRowCount(0);
+        if (idx >= 0) {
+            const auto& pats = datasets_[static_cast<size_t>(idx)].patterns;
+            tbl->setRowCount(static_cast<int>(pats.size()));
+            for (int r = 0; r < static_cast<int>(pats.size()); r++) {
+                const auto& p = pats[static_cast<size_t>(r)];
+                auto* it_name = new QTableWidgetItem(QString::fromStdString(p.def.name));
+                it_name->setForeground(themeTraceColor(r));
+                tbl->setItem(r, CName,   it_name);
+                tbl->setItem(r, CStart,  new QTableWidgetItem(QString::number(p.def.raw_start)));
+                tbl->setItem(r, CEnd,    new QTableWidgetItem(QString::number(p.def.raw_end)));
+                tbl->setItem(r, CSearch, new QTableWidgetItem(QString::number(p.def.search_half)));
+                tbl->setItem(r, CMinR,   new QTableWidgetItem(p.def.min_corr >= -1.0f
+                                                              ? QString::number(p.def.min_corr) : QString()));
+                QString res = "not aligned";
+                if (p.res.aligned) {
+                    res = QString("%1 traces").arg(p.res.shifts.size() - static_cast<size_t>(p.res.discarded));
+                    if (!std::isnan(p.res.median_score))
+                        res += QString(" · median r %1").arg(p.res.median_score, 0, 'f', 3);
+                    if (p.res.discarded) res += QString(" · %1 excluded").arg(p.res.discarded);
+                }
+                auto* it_res = new QTableWidgetItem(res);
+                it_res->setFlags(it_res->flags() & ~Qt::ItemIsEditable);
+                tbl->setItem(r, CResult, it_res);
+                auto* cmb = new QComboBox;
+                cmb->addItems({"Cross-correlation", "Peak"});
+                cmb->setCurrentIndex(static_cast<int>(p.def.method));
+                connect(cmb, QOverload<int>::of(&QComboBox::currentIndexChanged), dlg, [=](int m) {
+                    const int i = dsIndex();
+                    if (i < 0 || r >= static_cast<int>(datasets_[static_cast<size_t>(i)].patterns.size())) return;
+                    auto& pat = datasets_[static_cast<size_t>(i)].patterns[static_cast<size_t>(r)];
+                    pat.def.method = static_cast<PatternDef::Method>(m);
+                    pat.res = PatternResult{};
+                    refreshPatternBands(datasets_[static_cast<size_t>(i)]);
+                });
+                tbl->setCellWidget(r, CMethod, cmb);
+            }
+            refreshPatternBands(datasets_[static_cast<size_t>(idx)]);
+        }
+        *refreshing = false;
+        int aligned = 0, n = tbl->rowCount();
+        if (idx >= 0) for (const auto& p : datasets_[static_cast<size_t>(idx)].patterns) aligned += p.res.aligned;
+        lbl_status->setText(idx < 0 ? "The file this editor was opened on is closed."
+                                    : QString("%1 pattern%2, %3 aligned.").arg(n).arg(n == 1 ? "" : "s").arg(aligned));
+        btn_align->setEnabled(idx >= 0 && n > 0);
+        btn_save->setEnabled(idx >= 0 && aligned > 0);
+        updateStateIndicators();
+    };
+    connect(tbl, &QTableWidget::itemChanged, dlg, [=](QTableWidgetItem* it) {
+        if (*refreshing) return;
+        const int i = dsIndex();
+        if (i < 0) return;
+        auto& pats = datasets_[static_cast<size_t>(i)].patterns;
+        const int r = it->row();
+        if (r < 0 || r >= static_cast<int>(pats.size())) return;
+        auto& d = pats[static_cast<size_t>(r)].def;
+        bool ok = true;
+        switch (it->column()) {
+        case CName:   d.name = it->text().toStdString(); break;
+        case CStart:  { const qlonglong v = it->text().toLongLong(&ok); if (ok) d.raw_start = std::clamp<qlonglong>(v, 0, h.num_samples); } break;
+        case CEnd:    { const qlonglong v = it->text().toLongLong(&ok); if (ok) d.raw_end = std::clamp<qlonglong>(v, 0, h.num_samples); } break;
+        case CSearch: { const int v = it->text().toInt(&ok); if (ok) d.search_half = std::max(1, v); } break;
+        case CMinR:   {
+            const QString t = it->text().trimmed();
+            if (t.isEmpty()) d.min_corr = -2.0f;
+            else { const float v = t.toFloat(&ok); if (ok) d.min_corr = std::clamp(v, -1.0f, 1.0f); }
+        } break;
+        default: return;
+        }
+        if (d.raw_end < d.raw_start) std::swap(d.raw_start, d.raw_end);
+        if (it->column() != CName) pats[static_cast<size_t>(r)].res = PatternResult{};
+        QTimer::singleShot(0, dlg, rebuild);   // re-render (also reverts unparsable input)
+    });
+
+    auto addPattern = [=](int64_t a, int64_t b) {
+        const int i = dsIndex();
+        if (i < 0 || b - a < 4) return;
+        auto& pats = datasets_[static_cast<size_t>(i)].patterns;
+        Pattern p;
+        p.def.name = "P" + std::to_string(pats.size() + 1);
+        p.def.raw_start = std::min(a, b);
+        p.def.raw_end   = std::max(a, b);
+        p.def.search_half = static_cast<int32_t>(std::clamp<int64_t>((p.def.raw_end - p.def.raw_start) / 4, 8, 5000));
+        pats.push_back(std::move(p));
+        rebuild();
+    };
+
+    // ---- drawing on the plot ----
+    auto draw_conn = std::make_shared<QMetaObject::Connection>();
+    auto stopDrawing = [=]() {
+        QObject::disconnect(*draw_conn);
+        const int i = dsIndex();
+        if (i >= 0 && datasets_[static_cast<size_t>(i)].plot_widget) {
+            datasets_[static_cast<size_t>(i)].plot_widget->setCropAutoConfirm(false);
+            if (datasets_[static_cast<size_t>(i)].plot_widget->mode() == InteractionMode::CropSelect)
+                datasets_[static_cast<size_t>(i)].plot_widget->setMode(InteractionMode::Pan);
+        }
+        resetInteractionModeToPan();
+    };
+    connect(btn_draw, &QPushButton::toggled, dlg, [=](bool on) {
+        const int i = dsIndex();
+        if (!on || i < 0) { stopDrawing(); return; }
+        tab_bar_->setCurrentIndex(i);
+        PlotWidget* pw = datasets_[static_cast<size_t>(i)].plot_widget;
+        mode_group_->setExclusive(false);
+        for (QAbstractButton* b : mode_group_->buttons()) b->setChecked(false);
+        mode_group_->setExclusive(true);
+        pw->setCropAutoConfirm(true);
+        pw->setMode(InteractionMode::CropSelect);
+        // React only to a newly drawn range; removing it again (below) or the
+        // user's own Range Editor ranges must not turn into patterns.
+        auto known = std::make_shared<size_t>(pw->cropRanges().size());
+        *draw_conn = connect(pw, &PlotWidget::cropRangesChanged, dlg, [=]() {
+            const auto& cr = pw->cropRanges();
+            if (cr.size() <= *known) { *known = cr.size(); return; }
+            const auto [a, b] = cr.back();
+            *known = cr.size() - 1;
+            pw->removeCropRangeAt(static_cast<int>(cr.size()) - 1);
+            addPattern(a, b);
+        });
+    });
+    connect(mode_group_, &QButtonGroup::idClicked, btn_draw, [btn_draw]() { btn_draw->setChecked(false); });
+    connect(btn_view, &QPushButton::clicked, dlg, [=]() {
+        const int i = dsIndex();
+        if (i < 0) return;
+        PlotWidget* pw = datasets_[static_cast<size_t>(i)].plot_widget;
+        addPattern(pw->viewStart(), pw->viewEnd());
+    });
+    connect(btn_remove, &QPushButton::clicked, dlg, [=]() {
+        const int i = dsIndex();
+        const int r = tbl->currentRow();
+        if (i < 0 || r < 0) return;
+        auto& pats = datasets_[static_cast<size_t>(i)].patterns;
+        if (r < static_cast<int>(pats.size())) pats.erase(pats.begin() + r);
+        rebuild();
+    });
+    connect(btn_clear, &QPushButton::clicked, dlg, [=]() {
+        const int i = dsIndex();
+        if (i < 0 || datasets_[static_cast<size_t>(i)].patterns.empty()) return;
+        if (QMessageBox::question(dlg, "Patterns", "Remove all patterns and their shifts?")
+                != QMessageBox::Yes) return;
+        datasets_[static_cast<size_t>(i)].patterns.clear();
+        rebuild();
+    });
+    connect(btn_repeat, &QPushButton::clicked, dlg, [=]() {
+        const int i = dsIndex();
+        const int r = tbl->currentRow();
+        if (i < 0 || r < 0) { QMessageBox::information(dlg, "Repeat", "Select a pattern first."); return; }
+        const PatternDef base = datasets_[static_cast<size_t>(i)].patterns[static_cast<size_t>(r)].def;
+        QDialog d(dlg);
+        d.setWindowTitle("Repeat pattern");
+        auto* f = new QFormLayout(&d);
+        auto* sp_n = new QSpinBox; sp_n->setRange(1, 1000); sp_n->setValue(9);
+        auto* sp_p = new QSpinBox; sp_p->setRange(1, std::max<int>(1, static_cast<int>(h.num_samples)));
+        sp_p->setValue(static_cast<int>(std::max<int64_t>(1, base.raw_end - base.raw_start)));
+        f->addRow("Copies to add:", sp_n);
+        f->addRow("Period (raw samples):", sp_p);
+        auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+        bb->button(QDialogButtonBox::Ok)->setText("Add");
+        f->addRow(bb);
+        connect(bb, &QDialogButtonBox::accepted, &d, &QDialog::accept);
+        connect(bb, &QDialogButtonBox::rejected, &d, &QDialog::reject);
+        if (d.exec() != QDialog::Accepted) return;
+        auto& pats = datasets_[static_cast<size_t>(dsIndex())].patterns;
+        for (int k = 1; k <= sp_n->value(); k++) {
+            Pattern p;
+            p.def = base;
+            p.def.raw_start = base.raw_start + static_cast<int64_t>(k) * sp_p->value();
+            p.def.raw_end   = base.raw_end   + static_cast<int64_t>(k) * sp_p->value();
+            if (p.def.raw_end > h.num_samples) break;
+            p.def.name = base.name + " #" + std::to_string(k + 1);
+            pats.push_back(std::move(p));
+        }
+        rebuild();
+    });
+
+    // ---- shifts files ----
+    connect(btn_save, &QPushButton::clicked, dlg, [=]() {
+        const int i = dsIndex();
+        if (i < 0) return;
+        const QString path = QFileDialog::getSaveFileName(dlg, "Save pattern shifts",
+            recentDir("chain"), "Shift tables (*.csv);;All files (*)");
+        if (path.isEmpty()) return;
+        updateRecentDir("chain", path);
+        std::string err;
+        if (!savePatternShifts(path.toStdString(), datasets_[static_cast<size_t>(i)].patterns, err))
+            QMessageBox::critical(dlg, "Save failed", QString::fromStdString(err));
+    });
+    connect(btn_load, &QPushButton::clicked, dlg, [=]() {
+        const int i = dsIndex();
+        if (i < 0) return;
+        const QString path = QFileDialog::getOpenFileName(dlg, "Load pattern shifts",
+            recentDir("chain"), "Shift tables (*.csv *.txt);;All files (*)");
+        if (path.isEmpty()) return;
+        updateRecentDir("chain", path);
+        std::vector<Pattern> pats;
+        std::string err;
+        if (!loadPatternShifts(path.toStdString(), h.num_samples, pats, err)) {
+            QMessageBox::critical(dlg, "Load failed", QString::fromStdString(err));
+            return;
+        }
+        tab_bar_->setCurrentIndex(i);
+        saveSnapshot();
+        datasets_[static_cast<size_t>(i)].patterns = std::move(pats);
+        rebuild();
+    });
+
+    // ---- align all ----
+    connect(btn_align, &QPushButton::clicked, dlg, [=]() {
+        const int i = dsIndex();
+        if (i < 0) return;
+        btn_draw->setChecked(false);
+        Dataset& ds = datasets_[static_cast<size_t>(i)];
+        std::vector<PatternDef> defs;
+        for (const auto& p : ds.patterns) {
+            PatternDef d = p.def;
+            d.refine_raw = chk_refine->isChecked();
+            d.ref_offset = std::min(sp_ref->value(), sp_count->value() - 1);
+            d.ref_count  = sp_refn->value();
+            defs.push_back(d);
+        }
+        std::shared_ptr<TrsFile> file = ds.file;
+        std::vector<std::shared_ptr<ITransform>> pipeline;
+        for (const auto& t : ds.pipeline) pipeline.push_back(t->clone());
+        const int32_t first = sp_first->value();
+        const int32_t count = std::min(sp_count->value(), n_total - first);
+        const bool strip = chk_strip->isChecked();
+        auto results = std::make_shared<std::vector<PatternResult>>(defs.size());
+        auto err = std::make_shared<std::string>();
+        btn_align->setEnabled(false);
+        lbl_status->setText("Aligning…");
+
+        jobs_->submit(QString("Align %1 patterns — %2").arg(defs.size()).arg(ds.display_name),
+            [=](JobContext& ctx) {
+                const int64_t per = 1000;
+                for (size_t k = 0; k < defs.size(); k++) {
+                    auto prog = [&](int done, int total) {
+                        ctx.setProgress(static_cast<int64_t>(k) * per + (total > 0 ? per * done / total : 0),
+                                        per * static_cast<int64_t>(defs.size()));
+                        return !ctx.cancelled();
+                    };
+                    if (!alignPattern(file.get(), pipeline, first, count, defs[k],
+                                      (*results)[k], prog, *err)) {
+                        *err = "\"" + defs[k].name + "\": " + *err;
+                        return false;
+                    }
+                }
+                return true;
+            },
+            [=](bool ok) {
+                const int j = dsIndex();
+                if (j < 0) return;
+                if (!ok) {
+                    if (*err != "Cancelled." && err->find("Cancelled.") == std::string::npos)
+                        QMessageBox::critical(this, "Pattern alignment failed", QString::fromStdString(*err));
+                    if (pattern_dlg_) rebuild();
+                    return;
+                }
+                tab_bar_->setCurrentIndex(j);
+                saveSnapshot();   // undoable, including the pipeline change below
+                Dataset& d = datasets_[static_cast<size_t>(j)];
+                const size_t n = std::min(d.patterns.size(), results->size());
+                for (size_t k = 0; k < n; k++) d.patterns[k].res = (*results)[k];
+                if (strip && !d.pipeline.empty()) {
+                    d.pipeline.clear();
+                    rebuildTransformList();
+                    d.plot_widget->setTransforms(d.pipeline);
+                    onApplyTraces();
+                }
+                refreshPatternBands(d);
+                updateStateIndicators();
+                if (pattern_dlg_) rebuild();
+            });
+    });
+
+    connect(btn_close, &QPushButton::clicked, dlg, &QDialog::close);
+    // On close, not on destroyed: the dialog is also destroyed as a child
+    // while MainWindow is being torn down, when datasets_ is already gone.
+    connect(dlg, &QDialog::finished, dlg, [stopDrawing]() { stopDrawing(); });
+    rebuild();
+    dlg->show();
+}
+
 void MainWindow::onAlignTraces() {
     showAlignDialog(nullptr);
 }
