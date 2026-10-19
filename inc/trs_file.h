@@ -85,6 +85,13 @@ public:
     // between chunks; return false to stop early.
     void prefetch(const std::function<bool(int64_t, int64_t)>& progress) const;
 
+    // Hint that samples [sample_offset, sample_offset + count) of a trace
+    // (and its data bytes) will be read soon: starts reading them into the
+    // page cache in the background (madvise MADV_WILLNEED). The mapping is
+    // MADV_RANDOM, so without this a cold read faults in one 4 KB page at a
+    // time. No-op in in-memory mode or for an out-of-range request.
+    void willNeed(int32_t trace_idx, int64_t sample_offset, int64_t count) const;
+
 private:
     bool    parseHeader(const uint8_t* data, size_t size, std::string& error);
     int64_t traceByteOffset(int32_t trace_idx) const;

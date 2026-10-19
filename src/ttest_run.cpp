@@ -164,6 +164,11 @@ bool computeTTestCore(TrsFile* file,
     bool cancelled = false;
     int32_t processed = 0;
 
+    auto trace_at = [&](int32_t ti) {
+        return eff_first + (use_order ? live->order[static_cast<size_t>(ti)] : ti);
+    };
+    int32_t prefetched_to = 0;
+
     for (int32_t batch_start = 0; batch_start < eff_count && !cancelled; ) {
         if (live && live->stop_keep.load()) break;
         while (live && live->paused.load() && !live->stop_keep.load()) {
@@ -174,6 +179,17 @@ bool computeTTestCore(TrsFile* file,
 
         int32_t batch_end = std::min(batch_start + batch_size, eff_count);
         const auto batch_t0 = std::chrono::steady_clock::now();
+
+        // Start reading this batch's windows and the next batch's (assumed
+        // the same size) in the background. Each range is advised once: the
+        // first batch advises both, later ones only what is new.
+        {
+            const int32_t from = std::max(batch_start, prefetched_to);
+            const int32_t to   = std::min(eff_count, batch_end + batch_size);
+            for (int32_t ti = from; ti < to; ti++)
+                file->willNeed(trace_at(ti), eff_first_sample, raw_ns);
+            prefetched_to = std::max(prefetched_to, to);
+        }
 
         #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
         for (int32_t ti = batch_start; ti < batch_end; ti++) {
@@ -186,7 +202,7 @@ bool computeTTestCore(TrsFile* file,
             std::vector<std::shared_ptr<ITransform>>& pipeline_local = thread_pipelines[tid];
             std::vector<float>&                      trace_buf  = thread_bufs[tid];
 
-            int32_t src_idx = eff_first + (use_order ? live->order[static_cast<size_t>(ti)] : ti);
+            int32_t src_idx = trace_at(ti);
             auto data_bytes = file->readData(src_idx);
             if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
             int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
