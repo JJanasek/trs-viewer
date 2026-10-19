@@ -5794,6 +5794,46 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                         "symmetric and comparable regardless of leakage direction.");
     fl->addRow(chk_abs);
 
+    // Order / jitter window / sanity check (ttest_run.h: TTestOptions).
+    auto* grp_order = new QGroupBox("Test");
+    auto* fl_order  = new QFormLayout(grp_order);
+    auto* cmb_order = mem.bind(new QComboBox, "order");
+    cmb_order->addItems({"1st order — compare means",
+                         "2nd order — compare variances (masked implementations)"});
+    cmb_order->setToolTip("2nd order tests y = (x − group mean)² in a second pass, which "
+                          "detects leakage that first-order masking hides. Needs good "
+                          "alignment — or a jitter window.");
+    auto* sp_win = mem.bind(new QSpinBox, "integrate");
+    sp_win->setRange(1, 100001);
+    sp_win->setSingleStep(2);
+    sp_win->setValue(1);
+    sp_win->setSpecialValueText("off");
+    sp_win->setToolTip("2nd order: add up the centred squares over this many samples, so "
+                       "leftover misalignment smaller than the window still counts. Use about "
+                       "2–4× the remaining jitter; 1 = off.");
+    auto* chk_first = mem.bind(new QCheckBox("Show the 1st-order curve alongside"), "show_first");
+    chk_first->setChecked(true);
+    chk_first->setToolTip("Drawn faded behind the 2nd-order result. For a masked design the "
+                          "1st order should be flat while the 2nd order shows the leak.");
+    auto* chk_sanity = mem.bind(new QCheckBox("Random-split sanity check"), "sanity");
+    chk_sanity->setToolTip("Use only group-0 traces, split into two random halves. Nothing "
+                           "should leak; if it does, the preprocessing or alignment created it.");
+    fl_order->addRow("Order:", cmb_order);
+    fl_order->addRow("Jitter window:", sp_win);
+    fl_order->addRow(chk_first);
+    fl_order->addRow(chk_sanity);
+    auto syncOrder = [=](int idx) {
+        sp_win->setEnabled(idx == 1);
+        chk_first->setEnabled(idx == 1);
+    };
+    connect(cmb_order, QOverload<int>::of(&QComboBox::currentIndexChanged), &cfg, syncOrder);
+    syncOrder(0);
+    if (onAddToChain) {   // the Chain step stores first-order runs only for now
+        grp_order->setEnabled(false);
+        grp_order->setToolTip("Not available when adding to a chain yet.");
+    }
+    fl->addRow(grp_order);
+
     // Live progress: intermediate t-curves while the job runs (ttest_run.h).
     auto* grp_live = new QGroupBox("Live progress");
     auto* fl_live  = new QFormLayout(grp_live);
@@ -5853,6 +5893,26 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     int32_t byte_idx = have_ttest_param ? auto_byte_idx
                                         : static_cast<int32_t>(sp_byte->value());
 
+    TTestOptions topt;
+    if (!onAddToChain) {
+        topt.order        = cmb_order->currentIndex() == 1 ? 2 : 1;
+        topt.integrate    = topt.order == 2 ? sp_win->value() : 1;
+        topt.sanity_split = chk_sanity->isChecked();
+    }
+    const bool show_first = topt.order == 2 && chk_first->isChecked();
+    // "Welch t-test", plus what kind of run it was.
+    const QString run_kind = QString("Welch t-test%1%2%3")
+        .arg(topt.order == 2 ? QString(" 2nd order") : QString())
+        .arg(topt.order == 2 && topt.integrate > 1 ? QString(" (window %1)").arg(topt.integrate) : QString())
+        .arg(topt.sanity_split ? QString(" · SANITY SPLIT") : QString());
+    // After a result tab is built: the faded 1st-order curve, if wanted.
+    auto addFirstOrderOverlay = [this](const std::vector<float>& t1) {
+        if (t1.empty()) return;
+        QColor c = currentTheme().muted;
+        c.setAlpha(150);
+        plotWidget()->addTrace(std::make_shared<std::vector<float>>(t1), c, "1st order");
+    };
+
     // ---- Pattern run: each selected pattern on the raw traces, own shifts ----
     if (grp_pat && grp_pat->isChecked()) {
         std::vector<Pattern> pats;
@@ -5875,13 +5935,13 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
 
         struct PatOut {
             std::vector<std::shared_ptr<TTestAccumulator>> acc;
-            std::vector<std::vector<float>> t;
+            std::vector<std::vector<float>> t, t1;
             std::vector<int64_t> n0, n1;
             QStringList warn;
             QString err;
         };
         auto out = std::make_shared<PatOut>();
-        out->acc.resize(pats.size()); out->t.resize(pats.size());
+        out->acc.resize(pats.size()); out->t.resize(pats.size()); out->t1.resize(pats.size());
         out->n0.resize(pats.size()); out->n1.resize(pats.size());
         const int64_t ns = h.num_samples;
         const QString fname = activeDs().display_name;
@@ -5896,12 +5956,12 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                                         static_cast<int64_t>(pats.size()) * total);
                         return !ctx.cancelled();
                     };
-                    if (!computeTTestCore(job_file.get(), job_pipeline, first, count,
-                                          p.def.raw_start, p.def.raw_end - p.def.raw_start,
-                                          byte_idx, p.res.shifts, p.res.first_trace,
-                                          0, ns, abs_value, prog,
-                                          out->acc[k], out->t[k], out->n0[k], out->n1[k],
-                                          warn, err)) {
+                    if (!computeTTest(job_file.get(), job_pipeline, first, count,
+                                      p.def.raw_start, p.def.raw_end - p.def.raw_start,
+                                      byte_idx, p.res.shifts, p.res.first_trace,
+                                      0, ns, abs_value, topt, prog,
+                                      out->acc[k], out->t[k], out->n0[k], out->n1[k],
+                                      warn, err, nullptr, show_first ? &out->t1[k] : nullptr)) {
                         out->err = err == "Cancelled." ? err
                                  : QString("Pattern \"%1\": %2").arg(QString::fromStdString(p.def.name), err);
                         return false;
@@ -5919,13 +5979,14 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                 }
                 if (!out->warn.isEmpty()) QMessageBox::warning(this, "T-test", out->warn.join('\n'));
                 // Join the patterns' curves side by side, with labelled bands.
-                std::vector<float>  joined;
+                std::vector<float>  joined, joined1;
                 std::vector<double> df_joined;
                 std::vector<PlotWidget::PatternBand> bands;
                 int64_t n0 = 0, n1 = 0;
                 for (size_t k = 0; k < pats.size(); k++) {
                     const int64_t off = static_cast<int64_t>(joined.size());
                     joined.insert(joined.end(), out->t[k].begin(), out->t[k].end());
+                    joined1.insert(joined1.end(), out->t1[k].begin(), out->t1[k].end());
                     std::vector<double> df;
                     out->acc[k]->computeWelchDf(df);
                     df_joined.insert(df_joined.end(), df.begin(), df.end());
@@ -5935,13 +5996,14 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                     n0 = std::max(n0, out->n0[k]);
                     n1 = std::max(n1, out->n1[k]);
                 }
-                const QString title = QString("Welch t-test — %1 pattern%2 (G0:%3  G1:%4)%5")
-                    .arg(pats.size()).arg(pats.size() == 1 ? "" : "s").arg(n0).arg(n1)
+                const QString title = QString("%1 — %2 pattern%3 (G0:%4  G1:%5)%6")
+                    .arg(run_kind).arg(pats.size()).arg(pats.size() == 1 ? "" : "s").arg(n0).arg(n1)
                     .arg(abs_value ? QString(" |t|") : QString());
                 buildTTestResultTab(out->acc.front(), std::move(joined), n0, n1, count,
                                     abs_value, &df_joined, bands, title);
                 if (PlotWidget* pw = plotWidget())
                     pw->setAxisLabels("Patterns (joined, raw samples)", abs_value ? "|t|-value" : "t-value");
+                if (show_first && joined1.size() == df_joined.size()) addFirstOrderOverlay(joined1);
             });
         return;
     }
@@ -6000,7 +6062,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
 
     struct TTestOut {
         std::shared_ptr<TTestAccumulator> acc;
-        std::vector<float> tstat;
+        std::vector<float> tstat, tstat1;   // tstat1: 1st-order curve of a 2nd-order run
         int64_t n0 = 0, n1 = 0;
         QString warn, err;
     };
@@ -6015,7 +6077,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         live->snapshot_every = sp_every->value();
         if (chk_shuffle->isChecked())
             live->order = makeInterleavedOrder(eff_count, 0x7e57'5eedULL);
-        view = createLiveTTestTab(QString("Live t-test — %1").arg(activeDs().display_name),
+        view = createLiveTTestTab(QString("Live %1 — %2").arg(run_kind, activeDs().display_name),
                                   eff_count, abs_value, live);
         // Worker thread → GUI: keep only the newest snapshot and post at
         // most one redraw at a time, so a slow repaint drops intermediate
@@ -6046,16 +6108,17 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
 
     const int job_id = jobs_->submit(job_title,
         [=](JobContext& ctx) {
-            return computeTTestCore(job_file.get(), job_pipeline,
-                                     eff_first, eff_count, eff_first_sample, eff_n_samples,
-                                     byte_idx, use_shifts, shifts_first_trace,
-                                     read_lo, read_hi, abs_value,
-                                     [&ctx](int64_t done, int64_t total) {
-                                         ctx.setProgress(done, total);
-                                         return !ctx.cancelled();
-                                     },
-                                     out->acc, out->tstat, out->n0, out->n1,
-                                     out->warn, out->err, live.get());
+            return computeTTest(job_file.get(), job_pipeline,
+                                eff_first, eff_count, eff_first_sample, eff_n_samples,
+                                byte_idx, use_shifts, shifts_first_trace,
+                                read_lo, read_hi, abs_value, topt,
+                                [&ctx](int64_t done, int64_t total) {
+                                    ctx.setProgress(done, total);
+                                    return !ctx.cancelled();
+                                },
+                                out->acc, out->tstat, out->n0, out->n1,
+                                out->warn, out->err, live.get(),
+                                show_first ? &out->tstat1 : nullptr);
         },
         [=](bool ok) {
             if (view) finishLiveTTestView(*view, ok, ok ? QString() : out->err);
@@ -6071,8 +6134,12 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                 [](const QString& l) { return l.startsWith("Stopped early"); }), warn.end());
             if (!warn.isEmpty()) QMessageBox::warning(this, "T-test", warn.join('\n'));
             const int32_t n_used = live ? static_cast<int32_t>(live->processed) : eff_count;
+            const QString title = (topt.order == 1 && !topt.sanity_split) ? QString()
+                : QString("%1 — %2 traces (G0:%3  G1:%4)%5").arg(run_kind).arg(n_used)
+                      .arg(out->n0).arg(out->n1).arg(abs_value ? QString(" |t|") : QString());
             buildTTestResultTab(out->acc, std::move(out->tstat), out->n0, out->n1,
-                                 n_used, abs_value);
+                                 n_used, abs_value, nullptr, {}, title);
+            if (show_first) addFirstOrderOverlay(out->tstat1);
         });
     if (view) view->job_id = job_id;
 }
