@@ -176,15 +176,16 @@ bool alignPattern(TrsFile* file,
     }
 
     // ---- quality + discard ----
+    // The median is over every trace that got a score, including the ones
+    // the threshold then excludes: "how well does this region match at all".
     std::vector<float> kept;
     for (size_t i = 0; i < out.shifts.size(); i++) {
         if (out.shifts[i] == kAlignDiscardShift) { out.discarded++; continue; }
+        if (!out.scores.empty()) kept.push_back(out.scores[i]);
         if (!out.scores.empty() && def.min_corr >= -1.0f && out.scores[i] < def.min_corr) {
             out.shifts[i] = kAlignDiscardShift;
             out.discarded++;
-            continue;
         }
-        if (!out.scores.empty()) kept.push_back(out.scores[i]);
     }
     if (!kept.empty()) {
         std::nth_element(kept.begin(), kept.begin() + kept.size() / 2, kept.end());

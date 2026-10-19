@@ -40,7 +40,7 @@ struct PatternResult {
     int32_t first_trace = 0;     // shifts[i] belongs to trace first_trace + i
     std::vector<int32_t> shifts; // raw samples; kAlignDiscardShift = excluded
     std::vector<float>   scores; // NCC at the final shift (may be empty for Peak)
-    float   median_score = NAN;
+    float   median_score = NAN;   // over every scored trace, excluded ones too
     int32_t discarded    = 0;
 };
 

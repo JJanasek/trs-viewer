@@ -9806,6 +9806,9 @@ void MainWindow::onPatternEditor() {
     vl->addWidget(tbl, 1);
 
     auto* btn_draw   = new QPushButton("Draw on Plot");
+    auto* btn_redraw = new QPushButton("Redraw Selected");
+    btn_redraw->setToolTip("Your next drag on the plot replaces the selected pattern's region "
+                           "(name and settings stay); then Align Selected again");
     btn_draw->setCheckable(true);
     btn_draw->setToolTip("Drag across the plot to add a pattern; stays on until you click again");
     auto* btn_view   = new QPushButton("Add Current View");
@@ -9813,7 +9816,7 @@ void MainWindow::onPatternEditor() {
     btn_repeat->setToolTip("Copy the selected pattern N times at a fixed period (e.g. cipher rounds)");
     auto* btn_remove = new QPushButton("Remove");
     auto* btn_clear  = new QPushButton("Clear All");
-    vl->addWidget(widgetRow({btn_draw, btn_view, btn_repeat, btn_remove, btn_clear}));
+    vl->addWidget(widgetRow({btn_draw, btn_redraw, btn_view, btn_repeat, btn_remove, btn_clear}));
 
     auto* grp = new QGroupBox("Alignment");
     auto* fl  = new QFormLayout(grp);
@@ -9901,13 +9904,26 @@ void MainWindow::onPatternEditor() {
                 });
                 tbl->setCellWidget(r, CMinCorr, sp_mc);
                 QString res = "not aligned";
+                QColor res_col;
                 if (p.res.aligned) {
-                    res = QString("%1 traces").arg(p.res.shifts.size() - static_cast<size_t>(p.res.discarded));
+                    const int64_t total = static_cast<int64_t>(p.res.shifts.size());
+                    const int64_t kept  = total - p.res.discarded;
+                    const int pct = total > 0 ? static_cast<int>(std::lround(100.0 * kept / total)) : 0;
+                    res = QString("kept %1 / %2 (%3%)").arg(kept).arg(total).arg(pct);
                     if (!std::isnan(p.res.median_score))
-                        res += QString(" · median r %1").arg(p.res.median_score, 0, 'f', 3);
-                    if (p.res.discarded) res += QString(" · %1 excluded").arg(p.res.discarded);
+                        res += QString(" · median r %1").arg(p.res.median_score, 0, 'f', 2);
+                    // Few traces kept usually means the region or template is off:
+                    // redraw it and align it again.
+                    if (pct < 25)      res_col = currentTheme().danger;
+                    else if (pct < 50) res_col = currentTheme().warn;
                 }
                 auto* it_res = new QTableWidgetItem(res);
+                if (res_col.isValid()) {
+                    it_res->setForeground(res_col);
+                    it_res->setToolTip("Few traces matched the template well enough. Try Redraw "
+                                       "Selected around clearer structure, a wider search, or a "
+                                       "lower Min corr.");
+                }
                 it_res->setFlags(it_res->flags() & ~Qt::ItemIsEditable);
                 tbl->setItem(r, CResult, it_res);
                 auto* cmb = new QComboBox;
@@ -9939,6 +9955,9 @@ void MainWindow::onPatternEditor() {
         updateStateIndicators();
     };
     *rebuild_holder = rebuild;
+    // Keep the holder alive exactly as long as the dialog (the cell widgets
+    // only hold a weak reference to it).
+    connect(dlg, &QObject::destroyed, dlg, [rebuild_holder]() {});
     connect(tbl, &QTableWidget::itemChanged, dlg, [=](QTableWidgetItem* it) {
         if (*refreshing) return;
         const int i = dsIndex();
@@ -9971,12 +9990,14 @@ void MainWindow::onPatternEditor() {
         p.def.raw_start = std::min(a, b);
         p.def.raw_end   = std::max(a, b);
         p.def.search_half = static_cast<int32_t>(std::clamp<int64_t>((p.def.raw_end - p.def.raw_start) / 4, 8, 5000));
+        p.def.min_corr    = 0.7f;   // keep only traces that clearly match the template
         pats.push_back(std::move(p));
         rebuild();
     };
 
     // ---- drawing on the plot ----
     auto draw_conn = std::make_shared<QMetaObject::Connection>();
+    auto redraw_row = std::make_shared<int>(-1);   // >= 0: the next drag replaces this pattern
     auto stopDrawing = [=]() {
         QObject::disconnect(*draw_conn);
         const int i = dsIndex();
@@ -10006,10 +10027,36 @@ void MainWindow::onPatternEditor() {
             const auto [a, b] = cr.back();
             *known = cr.size() - 1;
             pw->removeCropRangeAt(static_cast<int>(cr.size()) - 1);
+            const int row = *redraw_row;
+            const int di  = dsIndex();
+            if (row >= 0 && di >= 0
+                && row < static_cast<int>(datasets_[static_cast<size_t>(di)].patterns.size())
+                && std::abs(b - a) >= 4) {
+                auto& pat = datasets_[static_cast<size_t>(di)].patterns[static_cast<size_t>(row)];
+                pat.def.raw_start = std::min(a, b);
+                pat.def.raw_end   = std::max(a, b);
+                pat.res = PatternResult{};
+                *redraw_row = -1;
+                btn_draw->setChecked(false);   // one redraw per click
+                if (auto f = rebuild_ref.lock()) (*f)();
+                tbl->selectRow(row);
+                return;
+            }
             addPattern(a, b);
         });
     });
     connect(mode_group_, &QButtonGroup::idClicked, btn_draw, [btn_draw]() { btn_draw->setChecked(false); });
+    connect(btn_draw, &QPushButton::toggled, dlg, [=](bool on) { if (!on) *redraw_row = -1; });
+    connect(btn_redraw, &QPushButton::clicked, dlg, [=]() {
+        const auto sel = tbl->selectionModel()->selectedRows();
+        if (sel.size() != 1) {
+            QMessageBox::information(dlg, "Redraw", "Select one pattern to redraw.");
+            return;
+        }
+        btn_draw->setChecked(false);
+        *redraw_row = sel.front().row();
+        btn_draw->setChecked(true);   // reuses the drawing mode; the handler sees redraw_row
+    });
     connect(btn_view, &QPushButton::clicked, dlg, [=]() {
         const int i = dsIndex();
         if (i < 0) return;

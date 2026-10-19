@@ -24,8 +24,8 @@ each one **on its own**, and keep only the shifts. The t-test then reads the
     In the table, edit the name, start, end, **length** (editing it moves the
     end), search width (± raw samples) and method (cross-correlation or peak).
     For cross-correlation, **Min corr.** excludes traces whose best
-    correlation with the template is lower than this (*off* keeps every
-    trace). Patterns are drawn on the plot as coloured, labelled bands, dashed
+    correlation with the template is lower than this. It defaults to 0.7 for
+    new patterns; *off* keeps every trace. Patterns are drawn on the plot as coloured, labelled bands, dashed
     until they are aligned.
 3. **Align All**, or select rows (Ctrl/Shift-click) and **Align Selected**.
    Each pattern is aligned in two stages:
@@ -35,9 +35,14 @@ each one **on its own**, and keep only the shifts. The t-test then reads the
       one resampling step of the coarse result. The pipeline is used with its
       resamplers removed, so filters still shape the signal.
 
-    The resulting shifts are exact to the raw sample. The table shows, per
-    pattern, how many traces were kept, the median correlation, and how many
-    were excluded by the minimum correlation. By default the pipeline stages are
+    The resulting shifts are exact to the raw sample. The Result column
+    shows, per pattern, how many traces were kept (e.g. *kept 60 / 300 (20%)*,
+    amber below 50%, red below 25%) and the median correlation over all
+    traces.
+
+    If too few traces are kept, the region or the template is off: select the
+    pattern, click **Redraw Selected**, drag the new region (the name and
+    settings stay), and **Align Selected** again. By default the pipeline stages are
     removed **once every pattern is aligned**, so you can align them one at a
     time on the resampled view and the analyses still run on raw traces.
     Ctrl+Z undoes this.
