@@ -52,7 +52,7 @@ PatternDef defAround(int64_t centre, const char* name) {
     d.name = name;
     d.raw_start = centre - 260;
     d.raw_end   = centre + 260;
-    d.search_half = 64;
+    d.search_half = 96;   // relative shifts reach ±80 (shiftA/B span ±40 around trace 0's)
     return d;
 }
 
@@ -167,4 +167,27 @@ TEST(PatternAlign, LegacyShiftFileLoadsAsOnePattern) {
     EXPECT_EQ(back[0].def.raw_end, 5000);
     EXPECT_EQ(back[0].res.shifts, (std::vector<int32_t>{4, -2, kAlignDiscardShift, 9}));
     std::remove(path.c_str());
+}
+
+TEST(PatternAlign, RefinementStaysInsideTheSearchWindow) {
+    TwoPatternSet ts;
+    PatternDef d = defAround(1700, "A");
+    d.search_half = 12;   // true shifts go up to ±40 — many hit the limit
+    PatternResult r;
+    std::string err;
+    ASSERT_TRUE(alignPattern(&ts.f, resample16(), 0, kNT, d, r, {}, err)) << err;
+    for (int t = 0; t < kNT; t++) EXPECT_LE(std::abs(r.shifts[t]), 12) << "trace " << t;
+    EXPECT_GT(r.at_limit, 0);
+}
+
+TEST(PatternAlign, ScoresComeFromTheAlignedSignal) {
+    TwoPatternSet ts;
+    PatternDef d = defAround(1700, "A");
+    PatternResult refined, coarse;
+    std::string err;
+    ASSERT_TRUE(alignPattern(&ts.f, resample16(), 0, kNT, d, refined, {}, err)) << err;
+    d.refine_raw = false;
+    ASSERT_TRUE(alignPattern(&ts.f, resample16(), 0, kNT, d, coarse, {}, err)) << err;
+    EXPECT_EQ(refined.scores, coarse.scores);
+    EXPECT_EQ(refined.at_limit, 0);
 }

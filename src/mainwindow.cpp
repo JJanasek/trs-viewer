@@ -9820,17 +9820,20 @@ void MainWindow::onPatternEditor() {
                     res = QString("kept %1 / %2 (%3%)").arg(kept).arg(total).arg(pct);
                     if (!std::isnan(p.res.median_score))
                         res += QString(" · median r %1").arg(p.res.median_score, 0, 'f', 2);
+                    if (p.res.at_limit > 0)
+                        res += QString(" · %1 at search limit").arg(p.res.at_limit);
                     // Few traces kept usually means the region or template is off:
                     // redraw it and align it again.
                     if (pct < 25)      res_col = currentTheme().danger;
-                    else if (pct < 50) res_col = currentTheme().warn;
+                    else if (pct < 50 || p.res.at_limit > total / 10) res_col = currentTheme().warn;
                 }
                 auto* it_res = new QTableWidgetItem(res);
                 if (res_col.isValid()) {
                     it_res->setForeground(res_col);
-                    it_res->setToolTip("Few traces matched the template well enough. Try Redraw "
-                                       "Selected around clearer structure, a wider search, or a "
-                                       "lower Min corr.");
+                    it_res->setToolTip("Few traces matched well, or many matched only at the edge of "
+                                       "the search window (their real position is probably outside "
+                                       "it). Try a wider Search ±, Redraw Selected around clearer "
+                                       "structure, or a lower Min corr.");
                 }
                 it_res->setFlags(it_res->flags() & ~Qt::ItemIsEditable);
                 tbl->setItem(r, CResult, it_res);

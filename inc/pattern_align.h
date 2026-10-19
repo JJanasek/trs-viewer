@@ -39,9 +39,14 @@ struct PatternResult {
     bool    aligned     = false;
     int32_t first_trace = 0;     // shifts[i] belongs to trace first_trace + i
     std::vector<int32_t> shifts; // raw samples; kAlignDiscardShift = excluded
-    std::vector<float>   scores; // NCC at the final shift (may be empty for Peak)
+    std::vector<float>   scores; // NCC per trace (may be empty for Peak), see below
+    // Scores are the normalised cross-correlation on the signal the pattern
+    // was aligned on (e.g. the resampled one), not after the raw
+    // refinement: raw samples are noisier, and a threshold meant for the
+    // aligned signal would otherwise throw most traces away.
     float   median_score = NAN;   // over every scored trace, excluded ones too
     int32_t discarded    = 0;
+    int32_t at_limit     = 0;     // best match on the edge of the search window
 };
 
 struct Pattern {

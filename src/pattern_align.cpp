@@ -91,6 +91,12 @@ bool alignPattern(TrsFile* file,
     if (!ok) return false;
     out.shifts = coarse.shifts;
     out.scores = coarse.scores;
+    const std::vector<float> coarse_scores = coarse.scores;
+    // A best match on the edge of the search window means the real one is
+    // probably outside it: count it, and never let refinement push further.
+    const int32_t limit = def.search_half;
+    for (int32_t v : coarse.shifts)
+        if (v != kAlignDiscardShift && std::abs(v) >= limit - 1) out.at_limit++;
 
     // ---- stage 2: refine at raw resolution ----
     const int64_t proc_len = processedCountForRaw(pipeline, L);
@@ -194,6 +200,7 @@ bool alignPattern(TrsFile* file,
                     double best = -2.0;
                     int64_t best_lag = 0;
                     for (int64_t lag = -r; lag <= r; lag++) {
+                        if (std::llabs(sh + lag * dec) > limit) continue;   // stay inside the search window
                         const double c = ncc(tmpl.data(), x + r + lag, Ld);
                         if (c > best) { best = c; best_lag = lag; }
                     }
@@ -210,6 +217,10 @@ bool alignPattern(TrsFile* file,
             }
         }
     }
+
+    // Quality is judged on the signal the pattern was aligned on (see the
+    // header); the refinement only sharpens the shift.
+    if (!coarse_scores.empty()) out.scores = coarse_scores;
 
     // ---- quality + discard ----
     // The median is over every trace that got a score, including the ones
