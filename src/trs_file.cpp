@@ -522,3 +522,29 @@ void TrsFile::prefetch(const std::function<bool(int64_t, int64_t)>& progress) co
             return;   // caller skipped/cancelled — remaining pages fault in lazily on first use
     }
 }
+
+void TrsFile::willNeed(int32_t trace_idx, int64_t sample_offset, int64_t count) const {
+    if (!mmap_ptr_ || trace_idx < 0 || trace_idx >= header_.num_traces || count <= 0) return;
+    sample_offset = std::max<int64_t>(0, sample_offset);
+    count = std::min<int64_t>(count, header_.num_samples - sample_offset);
+    if (count <= 0) return;
+    const int64_t data_off = traceByteOffset(trace_idx) + header_.title_space;
+    const int64_t win_off  = data_off + header_.data_length + sample_offset * header_.sample_size;
+    const int64_t win_end  = std::min<int64_t>(win_off + count * header_.sample_size,
+                                               static_cast<int64_t>(mmap_size_));
+    const int64_t page = sysconf(_SC_PAGESIZE);
+    auto advise = [&](int64_t lo, int64_t hi) {
+        lo = lo / page * page;
+        if (hi > lo)
+            madvise(static_cast<uint8_t*>(mmap_ptr_) + lo, static_cast<size_t>(hi - lo),
+                    MADV_WILLNEED);
+    };
+    // The data bytes (read first, for the group) and the window: one range
+    // when they are close, two when the window starts far into the trace.
+    if (win_off - data_off <= 64 * 1024) {
+        advise(data_off, win_end);
+    } else {
+        advise(data_off, data_off + std::max<int64_t>(1, header_.data_length));
+        advise(win_off, win_end);
+    }
+}

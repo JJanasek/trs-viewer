@@ -241,3 +241,43 @@ TEST(TTestAccumulator, MergeFromMatchesDirectAccumulation) {
     for (size_t i = 0; i < direct_out.size(); i++)
         EXPECT_FLOAT_EQ(direct_out[i], merged_out[i]);
 }
+
+// ---------------------------------------------------------------------------
+// computeMerged: the live-snapshot path computes t straight from the
+// per-thread parts. It must equal reset() + mergeFrom() each part + compute()
+// exactly, since it adds the parts in the same order per sample.
+// ---------------------------------------------------------------------------
+
+TEST(TTestAccumulator, ComputeMergedEqualsMergeThenCompute) {
+    constexpr int32_t kNs = 1000;
+    std::vector<TTestAccumulator> parts(5, TTestAccumulator(kNs));
+    std::vector<float> tr(kNs);
+    for (int t = 0; t < 47; t++) {
+        for (int32_t i = 0; i < kNs; i++)
+            tr[static_cast<size_t>(i)] = std::sin(0.37f * t + 0.11f * i) * (1.0f + (t & 1) * 0.1f);
+        parts[static_cast<size_t>(t % 5)].addTrace(t & 1, tr.data(), kNs);
+    }
+    TTestAccumulator merged(kNs);
+    for (const auto& p : parts) merged.mergeFrom(p);
+    std::vector<float> want, got1, got4;
+    std::string err;
+    ASSERT_TRUE(merged.compute(want, err)) << err;
+    ASSERT_TRUE(TTestAccumulator::computeMerged(parts, got1, err, 1)) << err;
+    ASSERT_TRUE(TTestAccumulator::computeMerged(parts, got4, err, 4)) << err;
+    EXPECT_EQ(got1, want);
+    EXPECT_EQ(got4, want);
+}
+
+TEST(TTestAccumulator, ComputeMergedNeedsTwoTracesPerGroup) {
+    std::vector<TTestAccumulator> parts(3, TTestAccumulator(4));
+    const float v[4] = {1, 2, 3, 4};
+    parts[0].addTrace(0, v, 4);
+    parts[1].addTrace(0, v, 4);
+    parts[2].addTrace(1, v, 4);   // group 1 has only one trace in total
+    std::vector<float> out;
+    std::string err;
+    EXPECT_FALSE(TTestAccumulator::computeMerged(parts, out, err, 2));
+    EXPECT_NE(err.find("Group 1: 1"), std::string::npos) << err;
+    std::vector<TTestAccumulator> none;
+    EXPECT_FALSE(TTestAccumulator::computeMerged(none, out, err, 2));
+}

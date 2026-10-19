@@ -96,6 +96,21 @@ add_trs_test(test_xcorr)
 add_trs_test(test_spectral)
 add_trs_test(test_chain)
 
+# Plain vs live t-test timing on a real TRS file — a manual benchmark, not a
+# test, so it is built but not registered with ctest. Uses -O2 core sources
+# rather than the -O1 trs-core-test objects so the numbers mean something.
+add_executable(bench_ttest_live bench_ttest_live.cpp
+    ${CMAKE_SOURCE_DIR}/src/trs_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/processing.cpp
+    ${CMAKE_SOURCE_DIR}/src/spectral.cpp
+    ${CMAKE_SOURCE_DIR}/src/ttest.cpp
+    ${CMAKE_SOURCE_DIR}/src/ttest_run.cpp
+    ${CMAKE_SOURCE_DIR}/src/align.cpp
+    ${CMAKE_SOURCE_DIR}/src/xcorr.cpp)
+target_include_directories(bench_ttest_live PRIVATE ${CMAKE_SOURCE_DIR}/inc ${CMAKE_SOURCE_DIR}/src)
+target_compile_options(bench_ttest_live PRIVATE -O2 -march=native)
+target_link_libraries(bench_ttest_live PRIVATE OpenMP::OpenMP_CXX Eigen3::Eigen ZLIB::ZLIB ${QT_LIBS_CORE})
+
 # HeatmapWidget is a QWidget, so unlike the rest of the suite this target needs
 # the Qt widget stack and a QApplication (created offscreen in the test's own
 # main). Kept separate so the headless core tests stay free of it.

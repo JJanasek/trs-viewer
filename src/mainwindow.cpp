@@ -5461,7 +5461,7 @@ std::shared_ptr<LiveTTestView> MainWindow::createLiveTTestTab(const QString& tit
         if (v && v->last) {
             // Redraw the last snapshot without pushing it into the history again.
             v->current = {};
-            applyLiveTTestSnapshot(*v, *v->last);
+            applyLiveTTestSnapshot(*v, v->last);
         }
     });
 
@@ -5470,15 +5470,22 @@ std::shared_ptr<LiveTTestView> MainWindow::createLiveTTestTab(const QString& tit
     return v;
 }
 
-void MainWindow::applyLiveTTestSnapshot(LiveTTestView& v, const LiveTTestSnapshot& s) {
+void MainWindow::applyLiveTTestSnapshot(LiveTTestView& v,
+                                         const std::shared_ptr<const LiveTTestSnapshot>& snap) {
     if (!v.holder) return;   // tab was closed; the job just runs to completion
+    const LiveTTestSnapshot& s = *snap;
     const QLocale l;
 
     if (v.bar) v.bar->setValue(static_cast<int>(std::min<int64_t>(s.done, v.total)));
 
     // --- t-curve ---
     if (!s.tstat.empty() && v.curve) {
-        auto cur = std::make_shared<std::vector<float>>(s.tstat);
+        // Share the snapshot's own curve instead of copying it (133 MB at a
+        // full 33M-sample trace). The aliasing pointer keeps the snapshot
+        // alive; the const_cast is safe because PlotWidget only ever reads
+        // in-memory trace data and nothing else holds the snapshot mutably.
+        std::shared_ptr<std::vector<float>> cur(
+            snap, const_cast<std::vector<float>*>(&snap->tstat));
         // Overlays cost a full copy of the curve each; past a couple of
         // million samples that is hundreds of MB for a cosmetic feature.
         if (s.tstat.size() > 2'000'000 && v.chk_overlay && v.chk_overlay->isEnabled()) {
@@ -6025,9 +6032,9 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         ? (h.num_samples - eff_first_sample)
         : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
     const bool want_live = chk_live->isChecked();
-    // A live run merges into one extra scratch accumulator for snapshots.
-    if (!confirmTTestMemory(this, job_pipeline, prompt_ns,
-                            jobs_->plannedThreadBudget() + (want_live ? 1 : 0)))
+    // Live snapshots are computed straight from the per-thread accumulators
+    // (TTestAccumulator::computeMerged), so a live run needs no extra one.
+    if (!confirmTTestMemory(this, job_pipeline, prompt_ns, jobs_->plannedThreadBudget()))
         return;
 
     struct TTestOut {
@@ -6071,7 +6078,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                     s = std::move(v->pending);
                     v->posted = false;
                 }
-                if (s) { v->last = s; applyLiveTTestSnapshot(*v, *s); }
+                if (s) { v->last = s; applyLiveTTestSnapshot(*v, s); }
             }, Qt::QueuedConnection);
         };
     }

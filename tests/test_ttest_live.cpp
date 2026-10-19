@@ -127,7 +127,10 @@ TEST(TTestLive, SnapshotAtNEqualsBatchOverFirstNTraces) {
 
     EXPECT_TRUE(snaps.back()->final);
     EXPECT_EQ(snaps.back()->done, 200);
-    expectNear(snaps.back()->tstat, full.t, 1e-6f);
+    // The final snapshot reuses the run's own final curve.
+    EXPECT_EQ(snaps.back()->tstat, full.t);
+    EXPECT_EQ(snaps.back()->n0, full.n0);
+    EXPECT_EQ(snaps.back()->n1, full.n1);
 
     int checked = 0;
     for (const auto& s : snaps) {

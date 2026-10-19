@@ -19,6 +19,15 @@ public:
     void mergeFrom(const TTestAccumulator& other);
     // Compute Welch t-statistics into out (resized to num_samples).
     bool compute(std::vector<float>& out, std::string& error) const;
+    // Welch t over the sum of several partial accumulators (same num_samples)
+    // without building that sum first: equivalent to reset() + mergeFrom()
+    // of each part in order + compute() — bit-identical, since the per-sample
+    // additions happen in the same order — but one pass over the parts
+    // instead of three, no extra 4 × num_samples doubles, and split over
+    // `threads` OpenMP threads. Used for live t-test snapshots.
+    static bool computeMerged(const std::vector<TTestAccumulator>& parts,
+                              std::vector<float>& out, std::string& error,
+                              int threads = 1);
     // Compute per-sample Welch-Satterthwaite degrees of freedom.
     // Requires N_[0] >= 2 and N_[1] >= 2.
     void computeWelchDf(std::vector<double>& df_out) const;

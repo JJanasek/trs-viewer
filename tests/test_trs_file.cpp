@@ -2,7 +2,9 @@
 #include "trs_file.h"
 
 #include <cmath>
+#include <cstdio>
 #include <numeric>
+#include <string>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -217,4 +219,56 @@ TEST(TrsFile, ManyTracesOffsets) {
     EXPECT_EQ(n, 100);
     for (int s = 0; s < 100; ++s)
         EXPECT_FLOAT_EQ(buf[s], 999.f * 1000.f + s);
+}
+
+// ---------------------------------------------------------------------------
+// willNeed — a read-ahead hint on the memory-mapped file. It must accept any
+// arguments (out-of-range ones are ignored) and must not change what is read.
+// ---------------------------------------------------------------------------
+
+TEST(TrsFile, WillNeedIsAHarmlessHint) {
+    const std::string path = ::testing::TempDir() + "willneed_test.trs";
+    constexpr int kTraces = 20, kSamples = 3000;   // int8, 1 data byte
+    auto value = [](int t, int s) { return static_cast<int8_t>((t * 7 + s) % 101 - 50); };
+    {
+        FILE* fp = std::fopen(path.c_str(), "wb");
+        ASSERT_NE(fp, nullptr);
+        auto le32 = [&](int32_t v) { std::fwrite(&v, 4, 1, fp); };
+        std::fputc(0x41, fp); std::fputc(4, fp); le32(kTraces);
+        std::fputc(0x42, fp); std::fputc(4, fp); le32(kSamples);
+        std::fputc(0x43, fp); std::fputc(1, fp); std::fputc(0x01, fp);
+        std::fputc(0x44, fp); std::fputc(2, fp); std::fputc(1, fp); std::fputc(0, fp);
+        std::fputc(0x5F, fp); std::fputc(0, fp);
+        for (int t = 0; t < kTraces; t++) {
+            std::fputc(t & 1, fp);
+            for (int s = 0; s < kSamples; s++) std::fputc(static_cast<uint8_t>(value(t, s)), fp);
+        }
+        std::fclose(fp);
+    }
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.open(path, err)) << err;
+
+    f.willNeed(0, 0, kSamples);
+    f.willNeed(5, 2000, 5000);          // runs past the trace end
+    f.willNeed(kTraces - 1, 0, kSamples);
+    f.willNeed(-1, 0, 10);              // ignored
+    f.willNeed(kTraces, 0, 10);         // ignored
+    f.willNeed(3, kSamples + 10, 10);   // ignored
+    f.willNeed(3, 0, 0);                // ignored
+
+    std::vector<float> buf(kSamples);
+    for (int t : {0, 5, kTraces - 1}) {
+        ASSERT_EQ(f.readSamples(t, 0, kSamples, buf.data()), kSamples);
+        for (int s = 0; s < kSamples; s += 499)
+            EXPECT_EQ(buf[static_cast<size_t>(s)], static_cast<float>(value(t, s)));
+        EXPECT_EQ(f.readData(t), std::vector<uint8_t>{static_cast<uint8_t>(t & 1)});
+    }
+
+    TrsFile mem;   // in-memory mode: a no-op
+    auto m = makeMatrix(2, 4);
+    mem.openFromArray(m.data(), 2, 4);
+    mem.willNeed(0, 0, 4);
+    f.close();
+    std::remove(path.c_str());
 }
