@@ -398,6 +398,14 @@ private:
                               const QString& title_override = {});
     // Live t-test: a result tab that shows intermediate t-curves and the
     // max|t|-vs-traces history while the job runs. See ttest_run.h.
+    void showPatternTTestResult(const std::vector<Pattern>& pats,
+                                const std::vector<std::shared_ptr<TTestAccumulator>>& accs,
+                                std::vector<std::vector<float>> ts,
+                                const std::vector<std::vector<float>>& t1s,
+                                const std::vector<int64_t>& n0s, const std::vector<int64_t>& n1s,
+                                int32_t count, bool abs_value, const QString& run_kind,
+                                bool show_first);
+    bool runAlignPatternsChainStep(const ChainStep& step, QWidget* msg_parent, QString& err);
     std::shared_ptr<LiveTTestView> createLiveTTestTab(const QString& title, int32_t total,
                                                        bool abs_value,
                                                        const std::shared_ptr<TTestLive>& live);

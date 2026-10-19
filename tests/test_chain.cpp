@@ -410,3 +410,86 @@ TEST(ChainCompat, UnknownTransformTypeReturnsNullptr) {
             << bogus << " -> " << s.summary().toStdString();
     }
 }
+
+// ---------------------------------------------------------------------------
+// Pattern alignment and second-order t-test steps
+// ---------------------------------------------------------------------------
+
+TEST(ChainPatterns, AlignPatternsRoundTripsEveryField) {
+    ChainStep in;
+    in.kind          = ChainStep::Kind::AlignPatterns;
+    in.first_trace   = 10;
+    in.trace_count   = 900;
+    in.pattern_strip = false;
+    PatternDef a;
+    a.name = "key load"; a.raw_start = 1000; a.raw_end = 5000; a.search_half = 320;
+    a.method = PatternDef::Method::Peak; a.peak_abs = false; a.min_corr = 0.6f;
+    a.ref_offset = 3; a.ref_count = 8; a.refine_raw = false;
+    PatternDef b;
+    b.name = "round 1"; b.raw_start = 9000; b.raw_end = 12000;
+    in.pattern_defs = {a, b};
+
+    const ChainStep out = roundTrip(in);
+    EXPECT_EQ(out.kind, ChainStep::Kind::AlignPatterns);
+    EXPECT_EQ(out.first_trace, 10);
+    EXPECT_EQ(out.trace_count, 900);
+    EXPECT_FALSE(out.pattern_strip);
+    ASSERT_EQ(out.pattern_defs.size(), 2u);
+    const PatternDef& o = out.pattern_defs[0];
+    EXPECT_EQ(o.name, "key load");
+    EXPECT_EQ(o.raw_start, 1000);
+    EXPECT_EQ(o.raw_end, 5000);
+    EXPECT_EQ(o.search_half, 320);
+    EXPECT_EQ(o.method, PatternDef::Method::Peak);
+    EXPECT_FALSE(o.peak_abs);
+    EXPECT_FLOAT_EQ(o.min_corr, 0.6f);
+    EXPECT_EQ(o.ref_offset, 3);
+    EXPECT_EQ(o.ref_count, 8);
+    EXPECT_FALSE(o.refine_raw);
+    EXPECT_EQ(out.pattern_defs[1].name, "round 1");
+    EXPECT_TRUE(out.summary().contains("Align Patterns"));
+}
+
+TEST(ChainPatterns, RunTTestKeepsOrderAndPatternOptions) {
+    ChainStep in;
+    in.kind               = ChainStep::Kind::RunTTest;
+    in.first_trace        = 0;
+    in.trace_count        = 5000;
+    in.ttest_order        = 2;
+    in.ttest_integrate    = 9;
+    in.ttest_sanity       = true;
+    in.ttest_show_first   = false;
+    in.ttest_use_patterns = true;
+    const ChainStep out = roundTrip(in);
+    EXPECT_EQ(out.ttest_order, 2);
+    EXPECT_EQ(out.ttest_integrate, 9);
+    EXPECT_TRUE(out.ttest_sanity);
+    EXPECT_FALSE(out.ttest_show_first);
+    EXPECT_TRUE(out.ttest_use_patterns);
+    EXPECT_TRUE(out.summary().contains("2nd order"));
+    EXPECT_TRUE(out.summary().contains("patterns"));
+}
+
+TEST(ChainPatterns, OlderRunTTestStepDefaultsToFirstOrder) {
+    ChainStep in;
+    in.kind = ChainStep::Kind::RunTTest;
+    in.trace_count = 100;
+    QJsonObject o;   // what an older file has: none of the new keys
+    o["kind"] = "run_ttest";
+    o["trace_count"] = 100;
+    QJsonArray arr; arr.append(o);
+    QJsonObject root; root["steps"] = arr;
+    QTemporaryDir dir;
+    const QString path = dir.filePath("old.json");
+    QFile f(path);
+    ASSERT_TRUE(f.open(QIODevice::WriteOnly));
+    f.write(QJsonDocument(root).toJson());
+    f.close();
+    std::vector<ChainStep> out;
+    QString err;
+    ASSERT_TRUE(loadChain(path, out, err)) << err.toStdString();
+    ASSERT_EQ(out.size(), 1u);
+    EXPECT_EQ(out[0].ttest_order, 1);
+    EXPECT_EQ(out[0].ttest_integrate, 1);
+    EXPECT_FALSE(out[0].ttest_use_patterns);
+}

@@ -17,6 +17,7 @@
 // ---------------------------------------------------------------------------
 
 #include "processing.h"
+#include "pattern_align.h"
 
 #include <QString>
 
@@ -28,6 +29,7 @@ struct ChainStep {
     enum class Kind {
         AddTransform, ClearPipeline, Align, Reload, Export,
         ExportShifts, LoadShifts, RunTTest,
+        AlignPatterns,
     };
     Kind kind = Kind::AddTransform;
 
@@ -121,6 +123,19 @@ struct ChainStep {
     bool    ttest_abs          = false; // report |t| instead of the signed t-statistic
 
     // One-line label for the Chain Editor's step list.
+    // AlignPatterns: the pattern definitions — the shifts are recomputed when
+    // the chain runs. first_trace / trace_count are reused (trace_count 0 =
+    // every trace); the template settings live in each PatternDef.
+    std::vector<PatternDef> pattern_defs;
+    bool    pattern_strip      = true;   // remove the pipeline stages afterwards
+
+    // RunTTest: test options (see TTestOptions) and the pattern source.
+    int     ttest_order        = 1;
+    int32_t ttest_integrate    = 1;
+    bool    ttest_sanity       = false;
+    bool    ttest_show_first   = true;
+    bool    ttest_use_patterns = false;  // every aligned pattern, joined
+
     QString summary() const;
 };
 

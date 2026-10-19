@@ -1,4 +1,5 @@
 #include "chain.h"
+#include <QStringList>
 
 #include <QFile>
 #include <QJsonArray>
@@ -96,14 +97,32 @@ QString ChainStep::summary() const {
         QString range = trace_count > 0
             ? QString("trace[%1,%2)").arg(first_trace).arg(first_trace + trace_count)
             : QString("last alignment's range");
-        return QString("Run T-test — %1%2%3%4%5")
+        if (ttest_use_patterns)
+            return QString("Run T-test — %1patterns, trace[%2,%3)%4%5")
+                .arg(ttest_order == 2 ? QString("2nd order%1, ").arg(ttest_integrate > 1
+                         ? QString(" (window %1)").arg(ttest_integrate) : QString()) : QString())
+                .arg(first_trace).arg(first_trace + trace_count)
+                .arg(ttest_abs ? QString(", |t|") : QString())
+                .arg(ttest_sanity ? QString(", sanity split") : QString());
+        return QString("Run T-test — %1%2%3%4%5%6")
+            .arg(ttest_order == 2 ? QString("2nd order%1, ").arg(ttest_integrate > 1
+                     ? QString(" (window %1)").arg(ttest_integrate) : QString()) : QString())
             .arg(use_last_alignment ? QString("apply alignment, ") : QString())
             .arg(range)
             .arg(ttest_n_samples > 0
                      ? QString(", sample[%1,%2)").arg(ttest_first_sample).arg(ttest_first_sample + ttest_n_samples)
                      : QString())
             .arg(ttest_abs ? QString(", |t|") : QString())
-            .arg(tile_idx >= 0 ? QString(", tile %1").arg(tile_idx) : QString());
+            .arg(tile_idx >= 0 ? QString(", tile %1").arg(tile_idx) : QString())
+            + (ttest_sanity ? QString(", sanity split") : QString());
+    }
+    case Kind::AlignPatterns: {
+        QStringList names;
+        for (const auto& d : pattern_defs) names << QString::fromStdString(d.name);
+        if (names.size() > 4) names = names.mid(0, 4) << "…";
+        return QString("Align Patterns — %1 (%2)%3")
+            .arg(pattern_defs.size()).arg(names.join(", "))
+            .arg(pattern_strip ? QString(", then clear pipeline") : QString());
     }
     }
     return QString("?");
@@ -263,6 +282,7 @@ static QString kindToStr(ChainStep::Kind k) {
     case ChainStep::Kind::ExportShifts:  return "export_shifts";
     case ChainStep::Kind::LoadShifts:    return "load_shifts";
     case ChainStep::Kind::RunTTest:      return "run_ttest";
+    case ChainStep::Kind::AlignPatterns: return "align_patterns";
     }
     return QString();
 }
@@ -276,6 +296,7 @@ static bool kindFromStr(const QString& s, ChainStep::Kind& out) {
     if (s == "export_shifts")  { out = ChainStep::Kind::ExportShifts;  return true; }
     if (s == "load_shifts")    { out = ChainStep::Kind::LoadShifts;    return true; }
     if (s == "run_ttest")      { out = ChainStep::Kind::RunTTest;      return true; }
+    if (s == "align_patterns") { out = ChainStep::Kind::AlignPatterns; return true; }
     return false;
 }
 
@@ -347,7 +368,34 @@ bool saveChain(const QString& path, const std::vector<ChainStep>& steps, QString
             o["ttest_byte_idx"]     = s.ttest_byte_idx;
             o["ttest_abs"]          = s.ttest_abs;
             o["tile_idx"]            = s.tile_idx;
+            o["ttest_order"]        = s.ttest_order;
+            o["ttest_integrate"]    = s.ttest_integrate;
+            o["ttest_sanity"]       = s.ttest_sanity;
+            o["ttest_show_first"]   = s.ttest_show_first;
+            o["ttest_use_patterns"] = s.ttest_use_patterns;
             break;
+        case ChainStep::Kind::AlignPatterns: {
+            o["first_trace"]   = s.first_trace;
+            o["trace_count"]   = s.trace_count;
+            o["pattern_strip"] = s.pattern_strip;
+            QJsonArray pa;
+            for (const auto& d : s.pattern_defs) {
+                QJsonObject po;
+                po["name"]        = QString::fromStdString(d.name);
+                po["raw_start"]   = static_cast<double>(d.raw_start);
+                po["raw_end"]     = static_cast<double>(d.raw_end);
+                po["search_half"] = d.search_half;
+                po["method"]      = static_cast<int>(d.method);
+                po["peak_abs"]    = d.peak_abs;
+                po["min_corr"]    = d.min_corr;
+                po["ref_offset"]  = d.ref_offset;
+                po["ref_count"]   = d.ref_count;
+                po["refine_raw"]  = d.refine_raw;
+                pa.append(po);
+            }
+            o["patterns"] = pa;
+            break;
+        }
         }
         arr.append(o);
     }
@@ -455,6 +503,31 @@ bool loadChain(const QString& path, std::vector<ChainStep>& steps, QString& err)
             s.ttest_byte_idx     = o.value("ttest_byte_idx").toInt();
             s.ttest_abs          = o.value("ttest_abs").toBool(false);
             s.tile_idx           = o.value("tile_idx").toInt(-1);
+            s.ttest_order        = o.value("ttest_order").toInt(1);
+            s.ttest_integrate    = o.value("ttest_integrate").toInt(1);
+            s.ttest_sanity       = o.value("ttest_sanity").toBool(false);
+            s.ttest_show_first   = o.value("ttest_show_first").toBool(true);
+            s.ttest_use_patterns = o.value("ttest_use_patterns").toBool(false);
+            break;
+        case ChainStep::Kind::AlignPatterns:
+            s.first_trace   = o.value("first_trace").toInt();
+            s.trace_count   = o.value("trace_count").toInt();
+            s.pattern_strip = o.value("pattern_strip").toBool(true);
+            for (const auto& v : o.value("patterns").toArray()) {
+                const QJsonObject po = v.toObject();
+                PatternDef d;
+                d.name        = po.value("name").toString().toStdString();
+                d.raw_start   = static_cast<int64_t>(po.value("raw_start").toDouble());
+                d.raw_end     = static_cast<int64_t>(po.value("raw_end").toDouble());
+                d.search_half = po.value("search_half").toInt(100);
+                d.method      = static_cast<PatternDef::Method>(po.value("method").toInt(0));
+                d.peak_abs    = po.value("peak_abs").toBool(true);
+                d.min_corr    = static_cast<float>(po.value("min_corr").toDouble(-2.0));
+                d.ref_offset  = po.value("ref_offset").toInt(0);
+                d.ref_count   = po.value("ref_count").toInt(1);
+                d.refine_raw  = po.value("refine_raw").toBool(true);
+                s.pattern_defs.push_back(d);
+            }
             break;
         }
         out.push_back(s);
