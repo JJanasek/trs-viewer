@@ -97,8 +97,7 @@ Result windows (t-test, SNR, FFT, loaded NPY) carry their own smaller toolbar: *
 | Trace matrix → NPY | **File → Export → Traces as NPY…** |
 | Trace matrix + data → NPZ | **File → Export → Traces as NPZ…** |
 | Trace matrix + named labels → NPZ | **File → Export → Dataset (NPZ)…** |
-| Plot → PNG | **File → Export → Plot as PNG…** (Ctrl+Shift+S) |
-| Plot → PDF | **File → Export → Plot as PDF…** or **Export PDF…** in result dialogs |
+| Plot → figure | **File → Export → Figure (PDF, SVG, PNG)…** (Ctrl+Shift+S), or right-click a plot — see [Figures](features/figures.md) |
 | Heatmap → PNG | "Export PNG…" in heatmap dialog |
 | Heatmap → NPY | "Export .npy…" in heatmap dialog |
 | T-test vector → NPY | "Export .npy…" in t-test dialog |

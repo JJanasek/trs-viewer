@@ -94,7 +94,7 @@ come from the main toolbar, as for any tab.
 - **Cut**: drag across the plot to cut a region out of the exported result
 - **Trim ▾**: exclude a number of samples at the start or end; the exported length is shown next to it while trimmed
 - **Style…**: plot title, line width, trace colour, dark/light theme
-- **Export ▾**: PNG image, PDF (A4 landscape vector), curve as `.npz`, or curve as TRS
+- **Export ▾**: figure (PDF / SVG / PNG — see [Figures](figures.md)), copy figure, curve as `.npz`, or curve as TRS
 
 **File → Load Result → t-test Curve (NPY)…** — load a pre-computed 1-D `float32` t-statistic vector.
 

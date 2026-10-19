@@ -187,8 +187,6 @@ private slots:
                                int64_t s2, double v2, bool has_p2);
     void onThemeChanged(int index);
     void onExportTrs();
-    void onExportPng();
-    void onExportPdf();
     void onRunTTest();
     void onCropEdit();
     void onRunXCorr();

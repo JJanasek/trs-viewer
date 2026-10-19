@@ -1,5 +1,8 @@
 #include "plot_widget.h"
 #include "theme.h"
+#include "figure_dialog.h"
+#include <QContextMenuEvent>
+#include <QMenu>
 
 #include <QKeyEvent>
 #include <QMouseEvent>
@@ -1522,4 +1525,107 @@ void PlotWidget::keyPressEvent(QKeyEvent* ev) {
         }
     }
     QWidget::keyPressEvent(ev);
+}
+
+// ---------------------------------------------------------------------------
+// Publication figures
+// ---------------------------------------------------------------------------
+
+void PlotWidget::contextMenuEvent(QContextMenuEvent* e) {
+    if (traces_.empty()) return;
+    QMenu menu(this);
+    QAction* exp  = menu.addAction("Export Figure…");
+    QAction* copy = menu.addAction("Copy Figure");
+    exp->setToolTip("PDF, SVG or PNG, sized for a paper, thesis or slide");
+    copy->setToolTip("Copy the figure to the clipboard (for slides and documents)");
+    QAction* chosen = menu.exec(e->globalPos());
+    if (chosen == exp)  showFigureExportDialog(this, window());
+    if (chosen == copy) copyFigureToClipboard(this);
+}
+
+FigureData PlotWidget::figureData(int columns) {
+    FigureData d;
+    d.title   = plot_title_;
+    d.x_label = axis_label_x_;
+    d.y_label = axis_label_y_;
+    if (traces_.empty() || view_end_ <= view_start_) return d;
+
+    // Axis units: the same mapping as the on-screen tick labels (pipeline
+    // output index, then the optional scale/offset, e.g. to Hz).
+    auto labelOf = [this](double raw) {
+        const int64_t r = static_cast<int64_t>(std::llround(raw));
+        int64_t idx = r;
+        for (const auto& t : transforms_) idx = t->transformedCount(idx);
+        const double frac = raw - static_cast<double>(r);   // keep sub-sample positions
+        return (static_cast<double>(idx) + frac) * x_label_scale_ + x_label_offset_;
+    };
+    d.x0 = labelOf(static_cast<double>(view_start_));
+    d.x1 = labelOf(static_cast<double>(view_end_));
+
+    // Dark-theme colours are tuned for a dark background; on paper use the
+    // light theme's equivalents.
+    const ThemeTokens& dk = themeTokens(true);
+    const ThemeTokens& lt = themeTokens(false);
+    auto paperColor = [&](QColor c) {
+        for (size_t k = 0; k < dk.traces.size(); k++)
+            if (c.rgb() == dk.traces[k].rgb()) { QColor o = lt.traces[k]; o.setAlpha(c.alpha()); return o; }
+        if (c.rgb() == dk.muted.rgb()) { QColor o = lt.muted; o.setAlpha(c.alpha()); return o; }
+        return c;
+    };
+
+    const int64_t view_len = view_end_ - view_start_;
+    float lo = std::numeric_limits<float>::max(), hi = std::numeric_limits<float>::lowest();
+    for (const auto& te : traces_) {
+        if (!te.visible) continue;
+        TraceEntry t = te;          // own cache at figure resolution
+        t.cache = TraceCache{};
+        buildTraceCache(t, columns);
+        if (!t.cache.valid) continue;
+        FigureSeries se;
+        se.label   = te.label;
+        se.color   = paperColor(te.color);
+        se.filled  = te.filled;
+        se.overlay = te.color.alpha() < 255;
+        if (!t.cache.samples.empty()) {
+            const int64_t n = static_cast<int64_t>(t.cache.samples.size());
+            const int64_t raw = std::max<int64_t>(1, t.cache.raw_read);
+            for (int64_t i = 0; i < n; i++) {
+                const float v = t.cache.samples[static_cast<size_t>(i)];
+                if (std::isnan(v)) continue;
+                se.x.push_back(labelOf(static_cast<double>(view_start_) + static_cast<double>(i) * raw / n));
+                se.y.push_back(v);
+                lo = std::min(lo, v); hi = std::max(hi, v);
+            }
+        } else {
+            for (int c = 0; c < columns; c++) {
+                const float mn = t.cache.pix_min[static_cast<size_t>(c)];
+                const float mx = t.cache.pix_max[static_cast<size_t>(c)];
+                if (mn == std::numeric_limits<float>::max()) continue;
+                se.x.push_back(labelOf(static_cast<double>(view_start_) + (c + 0.5) * view_len / columns));
+                se.ymin.push_back(mn);
+                se.ymax.push_back(mx);
+                lo = std::min(lo, mn); hi = std::max(hi, mx);
+            }
+        }
+        if (!se.x.empty()) d.series.push_back(std::move(se));
+    }
+
+    // The y range on screen, if one has been drawn; otherwise the data's own.
+    if (!stacked_ && last_ymax_ > last_ymin_) {
+        d.y0 = last_ymin_; d.y1 = last_ymax_;
+    } else if (hi > lo) {
+        const float pad = (hi - lo) * 0.05f;
+        d.y0 = lo - pad; d.y1 = hi + pad;
+    } else {
+        d.y0 = lo - 1; d.y1 = lo + 1;
+    }
+
+    d.thresholds = show_thresholds_ && !stacked_;
+    d.one_sided  = threshold_one_sided_;
+    d.thr_pos    = threshold_pos_;
+    d.thr_neg    = threshold_neg_;
+    for (const auto& b : pattern_bands_)
+        d.bands.push_back({labelOf(static_cast<double>(b.start)), labelOf(static_cast<double>(b.end)),
+                           b.label, paperColor(b.color)});
+    return d;
 }

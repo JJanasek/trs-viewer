@@ -1,0 +1,56 @@
+# Figures for papers and slides
+
+**Right-click any plot → Export Figure…** (or **File → Export → Figure**,
+Ctrl+Shift+S). **Copy Figure** puts it on the clipboard.
+
+Every plot in the app (traces, t-test and SNR results, live t-test, FFT,
+loaded curves) exports through the same renderer. It draws the **visible
+range** as a vector figure at its final printed size, so it can go straight
+into LaTeX without scaling, and its text stays at the size you chose.
+
+## Presets
+
+Widths are the text and column widths of the LaTeX classes; heights give the
+wide, short strips trace plots usually are.
+
+| Preset | Size | Font | Use |
+|---|---|---|---|
+| LNCS — full / half width | 12.2 × 4.5 / 5.9 × 3.0 cm | serif 8 / 7 pt | Springer LNCS: CARDIS, COSADE, CT-RSA |
+| TCHES — full / half width | 13.6 × 4.8 / 6.6 × 3.2 cm | serif 8 / 7 pt | IACR Transactions (`iacrtrans`, `iacrj`) |
+| IEEE — one / two columns | 8.8 × 4.0 / 18.1 × 5.0 cm | Times 8 pt | `IEEEtran` |
+| Thesis (A4) — full width | 15 × 5.5 cm | serif 9 pt | typical A4 thesis |
+| Beamer 16:9 — full / half, Beamer 4:3 | 14 × 6 / 6.8 × 5 / 10.8 × 5.5 cm | sans 9 / 8 pt | slides |
+| PowerPoint 16:9 — full / half | 30 × 12 / 15 × 10 cm | sans 16 pt | slides |
+
+In LaTeX, `\includegraphics[width=\textwidth]{figure.pdf}` (or `\columnwidth`)
+places it at exactly its exported size.
+
+## Style
+
+The defaults follow how side-channel figures look in published papers:
+
+- **Data drawn thin and black**; colour is kept for the threshold. Several
+  overlaid traces stay black, and their legend is left to the caption.
+  Untick *Data in black* for slides to keep the plot's colours.
+- **TVLA threshold** as a red dashed line, labelled on the y axis (4.5).
+- **Full frame, inward ticks, no grid** (a light grid is optional).
+- Plain tick numbers; a common power of ten moves to the end of the axis
+  (×10⁵) instead of k/M suffixes.
+- **No title**: figures get their caption in LaTeX. The X and Y labels can be
+  edited in the dialog, e.g. *Time samples* and *t-value*.
+- Dense data (millions of samples) is drawn as a min/max envelope at figure
+  resolution, so PDFs stay small.
+
+**Fonts**: *Serif — LaTeX look* uses Latin Modern when it is installed (an
+exact match for LaTeX's default font), otherwise a Times-like serif. *Times*
+suits IEEE, and *Sans* suits slides. The dialog shows which font is used.
+
+## Formats
+
+| Format | Use |
+|---|---|
+| **PDF** (vector, fonts embedded) | LaTeX papers, theses, Beamer |
+| **SVG** (vector) | PowerPoint, LibreOffice, Inkscape |
+| **PNG** (300–600 dpi, resolution stored in the file) | Word, web, anywhere else |
+
+The clipboard copy carries both SVG and a 300 dpi PNG.

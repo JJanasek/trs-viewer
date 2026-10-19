@@ -6,6 +6,7 @@
 #include <QColor>
 #include <QPoint>
 #include <QTimer>
+#include "figure.h"
 #include <QWidget>
 #include <limits>
 
@@ -204,6 +205,14 @@ public:
     struct PatternBand { int64_t start = 0, end = 0; QString label; QColor color; bool aligned = false; };
     void    setPatternBands(const std::vector<PatternBand>& bands);
 
+    // The visible range as a publication figure (see figure.h), sampled at
+    // `columns` points across — exact samples when they fit, per-column
+    // min/max envelopes when they don't. Colours are mapped to the light
+    // palette, since figures go on white paper.
+    FigureData figureData(int columns = 1600);
+
+    // Right-click on a plot: Export Figure… / Copy Figure (figure_dialog.h).
+
     // Per-trace sample shifts (set by AlignDrag; also settable programmatically)
     int32_t             traceShift(int idx) const;
     std::vector<int32_t> traceShifts() const;
@@ -241,6 +250,7 @@ protected:
     void wheelEvent(QWheelEvent*) override;
     void resizeEvent(QResizeEvent*) override;
     void keyPressEvent(QKeyEvent*) override;
+    void contextMenuEvent(QContextMenuEvent* e) override;
 
 private:
     QRect   plotRect() const;

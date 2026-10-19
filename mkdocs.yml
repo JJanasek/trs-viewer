@@ -44,6 +44,7 @@ nav:
       - FFT spectrum: features/fft.md
       - Narrowband interference: features/interference.md
       - Heatmap viewer: features/heatmap.md
+      - Figures for papers and slides: features/figures.md
       - Export (TRS/NPY/NPZ): features/export.md
       - Export dataset: features/export-dataset.md
       - Range editor: features/range-editor.md

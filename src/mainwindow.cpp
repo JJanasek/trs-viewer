@@ -6,6 +6,7 @@
 #include "ttest_run.h"
 #include "pattern_align.h"
 #include "theme.h"
+#include "figure_dialog.h"
 #include "align.h"
 #include "xcorr.h"
 #include "cpa.h"
@@ -1241,12 +1242,14 @@ void MainWindow::setupMenuBar() {
     connect(act_exp_dataset, &QAction::triggered, this, &MainWindow::onExportDataset);
     export_menu->addAction(act_exp_dataset);
     export_menu->addSeparator();
-    auto* act_exp_png = new QAction("Plot as &PNG…", this);
+    auto* act_exp_png = new QAction("&Figure (PDF, SVG, PNG)…", this);
+    act_exp_png->setToolTip("The current plot as a publication figure, sized for a paper, "
+                            "thesis or slide (also: right-click a plot)");
     act_exp_png->setShortcut(QKeySequence("Ctrl+Shift+S"));
-    connect(act_exp_png, &QAction::triggered, this, &MainWindow::onExportPng);
+    connect(act_exp_png, &QAction::triggered, this, [this]() { showFigureExportDialog(plotWidget(), this); });
     export_menu->addAction(act_exp_png);
-    auto* act_exp_pdf = new QAction("Plot as P&DF…", this);
-    connect(act_exp_pdf, &QAction::triggered, this, &MainWindow::onExportPdf);
+    auto* act_exp_pdf = new QAction("&Copy Figure", this);
+    connect(act_exp_pdf, &QAction::triggered, this, [this]() { copyFigureToClipboard(plotWidget()); });
     export_menu->addAction(act_exp_pdf);
 
     file_menu->addSeparator();
@@ -2764,57 +2767,6 @@ void MainWindow::onImportTraceSubset() {
     openFile(out_path);
 }
 
-void MainWindow::onExportPng() {
-    if (!hasActiveDs()) {
-        QMessageBox::information(this, "Export PNG", "No file loaded.");
-        return;
-    }
-
-    QString path = QFileDialog::getSaveFileName(
-        this, "Export PNG", recentDir("export"), "PNG images (*.png)");
-    if (path.isEmpty()) return;
-    updateRecentDir("export", path);
-
-    QPixmap px = plotWidget()->grab();
-    QImage img = px.toImage();
-    constexpr int kMaxPx = 2400;
-    if (img.width() > kMaxPx || img.height() > kMaxPx)
-        img = img.scaled(kMaxPx, kMaxPx, Qt::KeepAspectRatio, Qt::SmoothTransformation);
-    if (!img.save(path, "PNG"))
-        QMessageBox::critical(this, "Export failed",
-                              "Could not write PNG to:\n" + path);
-}
-
-void MainWindow::onExportPdf() {
-    if (!hasActiveDs()) {
-        QMessageBox::information(this, "Export PDF", "No file loaded.");
-        return;
-    }
-
-    QString path = QFileDialog::getSaveFileName(
-        this, "Export PDF", recentDir("export"), "PDF files (*.pdf)");
-    if (path.isEmpty()) return;
-    updateRecentDir("export", path);
-
-    // Grab the plot at current widget resolution, then paint into PDF.
-    QPixmap px = plotWidget()->grab();
-
-    QPdfWriter writer(path);
-    writer.setResolution(150);
-    // Use A4 landscape; the pixmap is scaled to fill the printable area.
-    writer.setPageSize(QPageSize(QPageSize::A4));
-    writer.setPageOrientation(QPageLayout::Landscape);
-    writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-
-    QPainter painter(&writer);
-    if (!painter.isActive()) {
-        QMessageBox::critical(this, "Export failed",
-                              "Could not initialise PDF writer for:\n" + path);
-        return;
-    }
-    painter.drawPixmap(painter.viewport(), px);
-    painter.end();
-}
 
 // ---------------------------------------------------------------------------
 // T-test
@@ -3666,35 +3618,10 @@ void MainWindow::onLoadNpyTTest() {
         sd->show();
     });
 
-    auto* btn_exp_pdf_npy = new QPushButton("Export PDF…");
-    connect(btn_exp_pdf_npy, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PDF", MainWindow::recentDir("export"), "PDF files (*.pdf)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("export", path);
-        QPdfWriter writer(path);
-        writer.setPageSize(QPageSize(QPageSize::A4));
-        writer.setPageOrientation(QPageLayout::Landscape);
-        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-        QPainter painter(&writer);
-        double sx = static_cast<double>(writer.width())  / pw->width();
-        double sy = static_cast<double>(writer.height()) / pw->height();
-        double sc = std::min(sx, sy);
-        painter.scale(sc, sc);
-        pw->render(&painter);
-        painter.end();
-        QMessageBox::information(dlg, "Exported", "Saved: " + path);
-    });
-    auto* btn_exp_png_npy = new QPushButton("Export PNG…");
-    connect(btn_exp_png_npy, &QPushButton::clicked, dlg, [=]() {
-        QString path = QFileDialog::getSaveFileName(dlg, "Export t-test as PNG", MainWindow::recentDir("export"), "PNG images (*.png)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("export", path);
-        QPixmap pix = pw->grab();
-        if (!pix.save(path, "PNG"))
-            QMessageBox::warning(dlg, "Export PNG", "Could not save:\n" + path);
-        else
-            QMessageBox::information(dlg, "Exported", "Saved: " + path);
-    });
+    auto* btn_exp_pdf_npy = new QPushButton("Export Figure…");
+    connect(btn_exp_pdf_npy, &QPushButton::clicked, dlg, [this, pw]() { showFigureExportDialog(pw, this); });
+    auto* btn_exp_png_npy = new QPushButton("Copy Figure");
+    connect(btn_exp_png_npy, &QPushButton::clicked, dlg, [pw]() { copyFigureToClipboard(pw); });
 
     auto* ctrl   = new QWidget(dlg);
     // Wraps onto extra rows instead of forcing the window wider than the
@@ -4689,22 +4616,8 @@ void MainWindow::onLoadSpectrumNpz() {
     connect(chk_db,   &QCheckBox::toggled, dlg, [=](bool) { rebuild(); });
     connect(chk_norm, &QCheckBox::toggled, dlg, [=](bool) { rebuild(); });
 
-    auto* btn_exp_pdf = new QPushButton("Export PDF…");
-    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
-        QString p = QFileDialog::getSaveFileName(dlg, "Export spectrum as PDF",
-                                                 MainWindow::recentDir("export"), "PDF files (*.pdf)");
-        if (p.isEmpty()) return;
-        MainWindow::updateRecentDir("export", p);
-        QPixmap px = pw->grab();
-        QPdfWriter writer(p);
-        writer.setResolution(150);
-        writer.setPageSize(QPageSize(QPageSize::A4));
-        writer.setPageOrientation(QPageLayout::Landscape);
-        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-        QPainter painter(&writer);
-        if (painter.isActive())
-            painter.drawPixmap(painter.viewport(), px);
-    });
+    auto* btn_exp_pdf = new QPushButton("Export Figure…");
+    connect(btn_exp_pdf, &QPushButton::clicked, dlg, [this, pw]() { showFigureExportDialog(pw, this); });
 
     auto* hl = new QHBoxLayout;
     hl->addWidget(chk_norm);
@@ -6384,35 +6297,10 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     });
 
     // PDF / PNG export buttons
-    auto* btn_exp_pdf = new QPushButton("Export PDF…");
-    connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
-        QString path = QFileDialog::getSaveFileName(this, "Export t-test as PDF", MainWindow::recentDir("export"), "PDF files (*.pdf)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("export", path);
-        QPdfWriter writer(path);
-        writer.setPageSize(QPageSize(QPageSize::A4));
-        writer.setPageOrientation(QPageLayout::Landscape);
-        writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-        QPainter painter(&writer);
-        double sx = static_cast<double>(writer.width())  / pw->width();
-        double sy = static_cast<double>(writer.height()) / pw->height();
-        double sc = std::min(sx, sy);
-        painter.scale(sc, sc);
-        pw->render(&painter);
-        painter.end();
-        QMessageBox::information(this, "Exported", "Saved: " + path);
-    });
-    auto* btn_exp_png = new QPushButton("Export PNG…");
-    connect(btn_exp_png, &QPushButton::clicked, pw, [=]() {
-        QString path = QFileDialog::getSaveFileName(this, "Export t-test as PNG", MainWindow::recentDir("export"), "PNG images (*.png)");
-        if (path.isEmpty()) return;
-        MainWindow::updateRecentDir("export", path);
-        QPixmap pix = pw->grab();
-        if (!pix.save(path, "PNG"))
-            QMessageBox::warning(this, "Export PNG", "Could not save:\n" + path);
-        else
-            QMessageBox::information(this, "Exported", "Saved: " + path);
-    });
+    auto* btn_exp_pdf = new QPushButton("Export Figure…");
+    connect(btn_exp_pdf, &QPushButton::clicked, pw, [this, pw]() { showFigureExportDialog(pw, this); });
+    auto* btn_exp_png = new QPushButton("Copy Figure");
+    connect(btn_exp_png, &QPushButton::clicked, pw, [pw]() { copyFigureToClipboard(pw); });
 
     auto* ctrl = new QWidget;
     // Wraps onto extra rows instead of forcing the window wider than the
@@ -6532,8 +6420,8 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     // Right-hand side: one Style button and one Export menu.
     ctrl_l->addWidget(btn_style);
     ctrl_l->addWidget(makeMenuButton("Export", ctrl, {
-        {"PNG image…",         btn_exp_png},
-        {"PDF (vector)…",      btn_exp_pdf},
+        {"Figure (PDF, SVG, PNG)…", btn_exp_pdf},
+        {"Copy figure",        btn_exp_png},
         {"Curve as .npz…",     btn_exp_npy},
         {"Curve as TRS…",      btn_exp_trs}}));
 
@@ -12349,22 +12237,8 @@ void MainWindow::onRunSNR() {
                     QMessageBox::information(this, "Export complete", "Saved: " + path);
             });
 
-            auto* btn_exp_pdf = new QPushButton("Export PDF…");
-            connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
-                QString path = QFileDialog::getSaveFileName(this, "Export SNR as PDF",
-                                                            MainWindow::recentDir("export"), "PDF files (*.pdf)");
-                if (path.isEmpty()) return;
-                MainWindow::updateRecentDir("export", path);
-                QPixmap px = pw->grab();
-                QPdfWriter writer(path);
-                writer.setResolution(150);
-                writer.setPageSize(QPageSize(QPageSize::A4));
-                writer.setPageOrientation(QPageLayout::Landscape);
-                writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-                QPainter painter(&writer);
-                if (painter.isActive())
-                    painter.drawPixmap(painter.viewport(), px);
-            });
+            auto* btn_exp_pdf = new QPushButton("Export Figure…");
+            connect(btn_exp_pdf, &QPushButton::clicked, pw, [this, pw]() { showFigureExportDialog(pw, this); });
 
             auto* extra = new QWidget;
             auto* hl = new QHBoxLayout(extra);
@@ -12548,22 +12422,8 @@ void MainWindow::onRunStaticSNR() {
                     QMessageBox::information(this, "Export complete", "Saved: " + path);
             });
 
-            auto* btn_exp_pdf = new QPushButton("Export PDF…");
-            connect(btn_exp_pdf, &QPushButton::clicked, pw, [=]() {
-                QString path = QFileDialog::getSaveFileName(this, "Export static SNR as PDF",
-                                                            MainWindow::recentDir("export"), "PDF files (*.pdf)");
-                if (path.isEmpty()) return;
-                MainWindow::updateRecentDir("export", path);
-                QPixmap px = pw->grab();
-                QPdfWriter writer(path);
-                writer.setResolution(150);
-                writer.setPageSize(QPageSize(QPageSize::A4));
-                writer.setPageOrientation(QPageLayout::Landscape);
-                writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-                QPainter painter(&writer);
-                if (painter.isActive())
-                    painter.drawPixmap(painter.viewport(), px);
-            });
+            auto* btn_exp_pdf = new QPushButton("Export Figure…");
+            connect(btn_exp_pdf, &QPushButton::clicked, pw, [this, pw]() { showFigureExportDialog(pw, this); });
 
             auto* extra = new QWidget;
             auto* hl = new QHBoxLayout(extra);
@@ -12966,22 +12826,8 @@ void MainWindow::onRunFFT() {
                 QMessageBox::information(dlg, "Export complete", "Saved: " + path);
         });
 
-        auto* btn_exp_pdf = new QPushButton("Export PDF…");
-        connect(btn_exp_pdf, &QPushButton::clicked, dlg, [=]() {
-            QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as PDF",
-                                                        MainWindow::recentDir("export"), "PDF files (*.pdf)");
-            if (path.isEmpty()) return;
-            MainWindow::updateRecentDir("export", path);
-            QPixmap px = pw->grab();
-            QPdfWriter writer(path);
-            writer.setResolution(150);
-            writer.setPageSize(QPageSize(QPageSize::A4));
-            writer.setPageOrientation(QPageLayout::Landscape);
-            writer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout::Millimeter);
-            QPainter painter(&writer);
-            if (painter.isActive())
-                painter.drawPixmap(painter.viewport(), px);
-        });
+        auto* btn_exp_pdf = new QPushButton("Export Figure…");
+        connect(btn_exp_pdf, &QPushButton::clicked, dlg, [this, pw]() { showFigureExportDialog(pw, this); });
 
         // Phase output has no magnitude floor to stand a line against, so
         // detection is only offered for the magnitude modes.

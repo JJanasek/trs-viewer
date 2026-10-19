@@ -88,6 +88,10 @@ set(SOURCES
     src/processing.cpp
     src/plot_widget.cpp
     src/theme.cpp
+    src/figure.cpp
+    inc/figure.h
+    src/figure_dialog.cpp
+    inc/figure_dialog.h
     inc/theme.h
     src/ttest.cpp
     src/ttest_run.cpp
