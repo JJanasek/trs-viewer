@@ -4,6 +4,7 @@
 #include "heatmap_widget.h"
 #include "ttest.h"
 #include "ttest_run.h"
+#include "pattern_align.h"
 #include "theme.h"
 #include "align.h"
 #include "xcorr.h"
@@ -6833,7 +6834,7 @@ void MainWindow::onRunXCorr() {
         const auto& pl = activeDs().pipeline;
         int64_t proc_first = static_cast<int64_t>(sp_tmpl_first->value());
         int64_t proc_end    = proc_first + static_cast<int64_t>(sp_tmpl_len->value());
-        int64_t raw_first  = rawCountForProcessedCount(pl, proc_first, h.num_samples);
+        int64_t raw_first  = rawStartForProcessedIndex(pl, proc_first, h.num_samples);
         int64_t raw_end     = rawCountForProcessedCount(pl, proc_end,   h.num_samples);
         addTemplateToList({ static_cast<int32_t>(sp_tmpl_trace->value()),
                             raw_first, std::max<int64_t>(1, raw_end - raw_first) });
@@ -7012,7 +7013,7 @@ void MainWindow::onRunXCorr() {
             const auto& pl = activeDs().pipeline;
             int64_t proc_first = static_cast<int64_t>(sp_tmpl_first->value());
             int64_t proc_end    = proc_first + static_cast<int64_t>(sp_tmpl_len->value());
-            int64_t raw_first  = rawCountForProcessedCount(pl, proc_first, h.num_samples);
+            int64_t raw_first  = rawStartForProcessedIndex(pl, proc_first, h.num_samples);
             int64_t raw_end     = rawCountForProcessedCount(pl, proc_end,   h.num_samples);
             template_specs.push_back({ static_cast<int32_t>(sp_tmpl_trace->value()),
                                        raw_first, std::max<int64_t>(1, raw_end - raw_first) });
@@ -7543,7 +7544,7 @@ void MainWindow::onRunXCorr() {
             const auto& pl = activeDs().pipeline;
             int64_t proc_ref_first = static_cast<int64_t>(sp_r_first->value());
             int64_t proc_ref_end    = proc_ref_first + static_cast<int64_t>(sp_r_count->value());
-            int64_t ref_first = rawCountForProcessedCount(pl, proc_ref_first, h.num_samples);
+            int64_t ref_first = rawStartForProcessedIndex(pl, proc_ref_first, h.num_samples);
             int64_t ref_end    = rawCountForProcessedCount(pl, proc_ref_end,   h.num_samples);
             int64_t ref_count = std::max<int64_t>(1, ref_end - ref_first);
             int64_t ns = (num_samples_req == 0) ? (h.num_samples - first_sample) : num_samples_req;
@@ -9895,11 +9896,11 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
         const auto& pipeline_now = activeDs().pipeline;
         int64_t proc_ref_first = static_cast<int64_t>(sp_ref_first->value());
         int64_t proc_ref_end   = proc_ref_first + static_cast<int64_t>(sp_ref_len->value());
-        int64_t ref_first = rawCountForProcessedCount(pipeline_now, proc_ref_first, h.num_samples);
+        int64_t ref_first = rawStartForProcessedIndex(pipeline_now, proc_ref_first, h.num_samples);
         int64_t ref_end   = rawCountForProcessedCount(pipeline_now, proc_ref_end,   h.num_samples);
         int64_t ref_len   = std::max<int64_t>(1, ref_end - ref_first);
         int32_t shalf     = static_cast<int32_t>(std::max<int64_t>(1,
-            rawCountForProcessedCount(pipeline_now, sp_search->value(), h.num_samples)));
+            rawStartForProcessedIndex(pipeline_now, sp_search->value(), h.num_samples)));
         bool    use_abs   = (combo_peak->currentIndex() == 0);
         bool    is_peak   = (combo_method->currentIndex() == 0);
 
@@ -10260,12 +10261,12 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         // top-of-function comment) — convert to raw using the *current*
         // pipeline, right before calling into align.cpp.
         const auto& pipeline_now = activeDs().pipeline;
-        int64_t ref_first = rawCountForProcessedCount(pipeline_now, step.ref_first, h.num_samples);
+        int64_t ref_first = rawStartForProcessedIndex(pipeline_now, step.ref_first, h.num_samples);
         int64_t ref_end   = rawCountForProcessedCount(pipeline_now, step.ref_first + step.ref_len,
                                                        h.num_samples);
         int64_t ref_len   = std::max<int64_t>(1, ref_end - ref_first);
         int32_t shalf     = static_cast<int32_t>(std::max<int64_t>(1,
-            rawCountForProcessedCount(pipeline_now, step.search_half, h.num_samples)));
+            rawStartForProcessedIndex(pipeline_now, step.search_half, h.num_samples)));
 
         QProgressDialog prog(step.align_method == 0 ? "Finding peaks…" : "Cross-correlating…",
                               "Cancel", 0, num_tr, msg_parent);

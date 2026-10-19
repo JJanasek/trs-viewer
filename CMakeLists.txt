@@ -94,6 +94,8 @@ set(SOURCES
     inc/ttest_run.h
     src/xcorr.cpp
     src/align.cpp
+    src/pattern_align.cpp
+    inc/pattern_align.h
     src/chain.cpp
     inc/chain.h
     src/flow_layout.cpp
