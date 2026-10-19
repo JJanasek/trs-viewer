@@ -388,9 +388,14 @@ private:
     // what was passed to computeTTest(): it pre-checks "One-sided (+)" and
     // labels the tab/axis "|t|-value", since the negative threshold half is
     // meaningless once every value has been rectified to non-negative.
+    // df_override / bands / title: used for pattern runs, whose result is
+    // several patterns' curves joined side by side (see showTTestDialog).
     void buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& acc_ptr,
                               std::vector<float> tstat, int64_t n0, int64_t n1,
-                              int32_t eff_count, bool abs_value);
+                              int32_t eff_count, bool abs_value,
+                              const std::vector<double>* df_override = nullptr,
+                              const std::vector<PlotWidget::PatternBand>& bands = {},
+                              const QString& title_override = {});
     // Live t-test: a result tab that shows intermediate t-curves and the
     // max|t|-vs-traces history while the job runs. See ttest_run.h.
     std::shared_ptr<LiveTTestView> createLiveTTestTab(const QString& title, int32_t total,

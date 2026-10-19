@@ -5728,6 +5728,48 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     if (has_alignment) applyAlignmentToSpinboxes(true);
     fl->addRow(grp_align);
 
+    // Patterns (Process › Patterns): test each aligned pattern on the raw
+    // traces with its own shifts, results side by side.
+    std::vector<int> aligned_patterns;
+    for (size_t i = 0; i < activeDs().patterns.size(); i++)
+        if (activeDs().patterns[i].res.aligned) aligned_patterns.push_back(static_cast<int>(i));
+    QGroupBox*   grp_pat  = nullptr;
+    QListWidget* lst_pat  = nullptr;
+    if (!aligned_patterns.empty()) {
+        grp_pat = new QGroupBox("Use patterns");
+        grp_pat->setCheckable(true);
+        grp_pat->setChecked(true);
+        grp_pat->setToolTip("Test each pattern on the raw traces with its own shifts; the "
+                            "results are shown side by side in one tab.");
+        auto* pl = new QVBoxLayout(grp_pat);
+        lst_pat = new QListWidget;
+        lst_pat->setMaximumHeight(120);
+        for (int i : aligned_patterns) {
+            const auto& p = activeDs().patterns[static_cast<size_t>(i)];
+            auto* it = new QListWidgetItem(QString("%1   [%2 – %3)")
+                .arg(QString::fromStdString(p.def.name)).arg(p.def.raw_start).arg(p.def.raw_end));
+            it->setFlags(it->flags() | Qt::ItemIsUserCheckable);
+            it->setCheckState(Qt::Checked);
+            it->setData(Qt::UserRole, i);
+            it->setForeground(themeTraceColor(i));
+            lst_pat->addItem(it);
+        }
+        pl->addWidget(lst_pat);
+        if (onAddToChain) {   // the Chain step can't store patterns yet
+            grp_pat->setChecked(false);
+            grp_pat->setEnabled(false);
+            grp_pat->setToolTip("Not available when adding to a chain yet.");
+        }
+        fl->addRow(grp_pat);
+        auto syncPatternMode = [=](bool on) {
+            sp_s_first->setEnabled(!on);
+            sp_s_count->setEnabled(!on);
+            grp_align->setEnabled(!on);
+        };
+        connect(grp_pat, &QGroupBox::toggled, &cfg, syncPatternMode);
+        syncPatternMode(grp_pat->isChecked());
+    }
+
     QSpinBox* sp_byte = nullptr;
     if (have_ttest_param) {
         auto* lbl = new QLabel(
@@ -5774,6 +5816,15 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                             "is the same either way.");
     fl_live->addRow(chk_live);
     fl_live->addRow("Update every (traces):", sp_every);
+    if (grp_pat) {
+        auto syncLive = [=](bool patterns_on) {
+            grp_live->setEnabled(!patterns_on);
+            grp_live->setToolTip(patterns_on ? "Live progress isn't available for pattern runs yet."
+                                             : QString());
+        };
+        connect(grp_pat, &QGroupBox::toggled, &cfg, syncLive);
+        syncLive(grp_pat->isChecked());
+    }
     fl_live->addRow(chk_shuffle);
     connect(chk_live, &QCheckBox::toggled, sp_every, &QWidget::setEnabled);
     connect(chk_live, &QCheckBox::toggled, chk_shuffle, &QWidget::setEnabled);
@@ -5801,6 +5852,99 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     int32_t count    = static_cast<int32_t>(sp_count->value());
     int32_t byte_idx = have_ttest_param ? auto_byte_idx
                                         : static_cast<int32_t>(sp_byte->value());
+
+    // ---- Pattern run: each selected pattern on the raw traces, own shifts ----
+    if (grp_pat && grp_pat->isChecked()) {
+        std::vector<Pattern> pats;
+        for (int r = 0; r < lst_pat->count(); r++)
+            if (lst_pat->item(r)->checkState() == Qt::Checked)
+                pats.push_back(activeDs().patterns[static_cast<size_t>(
+                    lst_pat->item(r)->data(Qt::UserRole).toInt())]);
+        if (pats.empty()) {
+            QMessageBox::information(this, "T-test", "Tick at least one pattern.");
+            return;
+        }
+        std::shared_ptr<TrsFile> job_file = activeDs().file;
+        std::vector<std::shared_ptr<ITransform>> job_pipeline;
+        for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
+        int64_t longest = 0;
+        for (const auto& p : pats) longest = std::max(longest, p.def.raw_end - p.def.raw_start);
+        if (!confirmTTestMemory(this, job_pipeline, longest, jobs_->plannedThreadBudget()))
+            return;
+        const bool abs_value = chk_abs->isChecked();
+
+        struct PatOut {
+            std::vector<std::shared_ptr<TTestAccumulator>> acc;
+            std::vector<std::vector<float>> t;
+            std::vector<int64_t> n0, n1;
+            QStringList warn;
+            QString err;
+        };
+        auto out = std::make_shared<PatOut>();
+        out->acc.resize(pats.size()); out->t.resize(pats.size());
+        out->n0.resize(pats.size()); out->n1.resize(pats.size());
+        const int64_t ns = h.num_samples;
+        const QString fname = activeDs().display_name;
+
+        jobs_->submit(QString("T-test — %1 patterns of %2").arg(pats.size()).arg(fname),
+            [=](JobContext& ctx) {
+                for (size_t k = 0; k < pats.size(); k++) {
+                    const auto& p = pats[k];
+                    QString warn, err;
+                    auto prog = [&](int64_t done, int64_t total) {
+                        ctx.setProgress(static_cast<int64_t>(k) * total + done,
+                                        static_cast<int64_t>(pats.size()) * total);
+                        return !ctx.cancelled();
+                    };
+                    if (!computeTTestCore(job_file.get(), job_pipeline, first, count,
+                                          p.def.raw_start, p.def.raw_end - p.def.raw_start,
+                                          byte_idx, p.res.shifts, p.res.first_trace,
+                                          0, ns, abs_value, prog,
+                                          out->acc[k], out->t[k], out->n0[k], out->n1[k],
+                                          warn, err)) {
+                        out->err = err == "Cancelled." ? err
+                                 : QString("Pattern \"%1\": %2").arg(QString::fromStdString(p.def.name), err);
+                        return false;
+                    }
+                    if (!warn.isEmpty())
+                        out->warn << QString("%1: %2").arg(QString::fromStdString(p.def.name), warn);
+                }
+                return true;
+            },
+            [=](bool ok) {
+                if (!ok) {
+                    if (!out->err.isEmpty() && out->err != "Cancelled.")
+                        QMessageBox::critical(this, "T-test failed", out->err);
+                    return;
+                }
+                if (!out->warn.isEmpty()) QMessageBox::warning(this, "T-test", out->warn.join('\n'));
+                // Join the patterns' curves side by side, with labelled bands.
+                std::vector<float>  joined;
+                std::vector<double> df_joined;
+                std::vector<PlotWidget::PatternBand> bands;
+                int64_t n0 = 0, n1 = 0;
+                for (size_t k = 0; k < pats.size(); k++) {
+                    const int64_t off = static_cast<int64_t>(joined.size());
+                    joined.insert(joined.end(), out->t[k].begin(), out->t[k].end());
+                    std::vector<double> df;
+                    out->acc[k]->computeWelchDf(df);
+                    df_joined.insert(df_joined.end(), df.begin(), df.end());
+                    bands.push_back({off, static_cast<int64_t>(joined.size()),
+                                     QString::fromStdString(pats[k].def.name),
+                                     themeTraceColor(static_cast<int>(k)), true});
+                    n0 = std::max(n0, out->n0[k]);
+                    n1 = std::max(n1, out->n1[k]);
+                }
+                const QString title = QString("Welch t-test — %1 pattern%2 (G0:%3  G1:%4)%5")
+                    .arg(pats.size()).arg(pats.size() == 1 ? "" : "s").arg(n0).arg(n1)
+                    .arg(abs_value ? QString(" |t|") : QString());
+                buildTTestResultTab(out->acc.front(), std::move(joined), n0, n1, count,
+                                    abs_value, &df_joined, bands, title);
+                if (PlotWidget* pw = plotWidget())
+                    pw->setAxisLabels("Patterns (joined, raw samples)", abs_value ? "|t|-value" : "t-value");
+            });
+        return;
+    }
 
     // Trace/sample range are always whatever's in the spinboxes now — Apply
     // last alignment shifts only controls whether shifts get looked up and
@@ -5941,20 +6085,26 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
 // ---------------------------------------------------------------------------
 void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& acc_ptr,
                                       std::vector<float> tstat, int64_t n0, int64_t n1,
-                                      int32_t eff_count, bool abs_value)
+                                      int32_t eff_count, bool abs_value,
+                                      const std::vector<double>* df_override,
+                                      const std::vector<PlotWidget::PatternBand>& bands,
+                                      const QString& title_override)
 {
     auto tstat_ptr  = std::make_shared<std::vector<float>>(std::move(tstat));
     auto current_ptr = std::make_shared<std::vector<float>>(*tstat_ptr);
     auto df_orig    = std::make_shared<std::vector<double>>();
-    acc_ptr->computeWelchDf(*df_orig);
+    if (df_override) *df_orig = *df_override;
+    else             acc_ptr->computeWelchDf(*df_orig);
     auto current_df = std::make_shared<std::vector<double>>(*df_orig);
 
     const QString value_label = abs_value ? "|t|-value" : "t-value";
-    QString tab_title = QString("Welch t-test — %1 traces (G0:%2  G1:%3)%4")
+    QString tab_title = !title_override.isEmpty() ? title_override
+                      : QString("Welch t-test — %1 traces (G0:%2  G1:%3)%4")
                             .arg(eff_count).arg(n0).arg(n1)
                             .arg(abs_value ? QString(" |t|") : QString());
     addResultTab(*current_ptr, tab_title, themeTraceColor(0), value_label);
     PlotWidget* pw = plotWidget();
+    if (!bands.empty()) pw->setPatternBands(bands);
     pw->setTraceFilled(0, true);
     pw->setAxisLabels("Sample Index", value_label);
     pw->setThresholds(true, 4.5, -4.5);
@@ -6238,6 +6388,7 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
         *current_df = std::vector<double>(df_orig->begin() + ds, df_orig->begin() + de);
         *skip_tt = true; pw->clearCropRanges(); *skip_tt = false;
         pw->replaceMemTrace(0, current_ptr);
+        pw->setPatternBands({});   // positions moved; pattern labels no longer line up
         upd_lbl_tt();
     };
     connect(pw, &PlotWidget::cropRangesChanged, pw, [=]() {
@@ -6259,6 +6410,7 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
         }
         *skip_tt = true; pw->clearCropRanges(); *skip_tt = false;
         pw->replaceMemTrace(0, current_ptr);
+        pw->setPatternBands({});   // positions moved; pattern labels no longer line up
         upd_lbl_tt();
     });
     connect(sp_excl_start, QOverload<int>::of(&QSpinBox::valueChanged), pw, [=](int){ do_trim_tt(); });
