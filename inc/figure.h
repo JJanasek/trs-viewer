@@ -41,7 +41,19 @@ struct FigureData {
     double  thr_pos = 4.5, thr_neg = -4.5;
     std::vector<FigureSeries> series;
     std::vector<FigureBand>   bands;
+
+    // Units, for the export dialog to offer Time / Voltage axes.
+    bool    x_samples = false;   // x is a raw sample position
+    double  dt        = 0.0;     // seconds per sample (0 = unknown)
+    double  y_scale   = 0.0;     // physical units per raw value (0 = not raw traces)
+    QString y_unit;              // e.g. "V"
 };
+
+// Converts a figure's axes to physical units: x from samples to time (with
+// an automatic s/ms/µs/ns prefix) when dt > 0, y from raw values to y_unit
+// (V/mV/µV) when y_scale > 0. Returns the axis labels it used.
+struct AxisUnits { bool time = false; double dt = 0; bool physical_y = false; };
+FigureData applyAxisUnits(const FigureData& d, const AxisUnits& u, QString* x_label, QString* y_label);
 
 struct FigureStyle {
     double  width_cm  = 12.2;

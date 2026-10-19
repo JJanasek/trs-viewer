@@ -315,6 +315,21 @@ private:
 }  // namespace
 
 
+// Physical axis metadata from a TRS header, for figure export: seconds per
+// sample and value scale, when the file carries them (SCALE_X / SCALE_Y,
+// usually with LABEL_X "s" / LABEL_Y "V"; absent tags read as 1.0).
+static double fileSampleInterval(const TrsHeader& h) {
+    return (!h.label_x.empty() || h.scale_x != 1.0f) && h.scale_x > 0 ? static_cast<double>(h.scale_x) : 0.0;
+}
+static double fileValueScale(const TrsHeader& h) {
+    return (!h.label_y.empty() || h.scale_y != 1.0f) && h.scale_y > 0 ? static_cast<double>(h.scale_y) : 0.0;
+}
+// True if the pipeline keeps sample positions (so result index i is raw
+// sample first + i and time can be derived).
+static bool keepsSamplePositions(const std::vector<std::shared_ptr<ITransform>>& pl) {
+    return processedCountForRaw(pl, 1'000'000) == 1'000'000;
+}
+
 MainWindow::MainWindow(QWidget* parent)
     : QMainWindow(parent)
 {
@@ -1712,6 +1727,11 @@ void MainWindow::openFile(const QString& path) {
 
     rebuildTransformList();
     plotWidget()->setTransforms(activeDs().pipeline);
+    {
+        const TrsHeader& fh = activeDs().file->header();
+        plotWidget()->setAxisMeta(fileSampleInterval(fh), 0, fileValueScale(fh),
+                                  QString::fromStdString(fh.label_y));
+    }
 
     int n = activeDs().file->header().num_traces;
     spin_first_->setMaximum(std::max(0, n - 1));
@@ -4843,6 +4863,11 @@ void MainWindow::openNpyTraces(const QString& path) {
 
     rebuildTransformList();
     plotWidget()->setTransforms(activeDs().pipeline);
+    {
+        const TrsHeader& fh = activeDs().file->header();
+        plotWidget()->setAxisMeta(fileSampleInterval(fh), 0, fileValueScale(fh),
+                                  QString::fromStdString(fh.label_y));
+    }
 
     int n = activeDs().file->header().num_traces;
     spin_first_->setMaximum(std::max(0, n - 1));
@@ -6085,6 +6110,8 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
             buildTTestResultTab(out->acc, std::move(out->tstat), out->n0, out->n1,
                                  n_used, abs_value, nullptr, {}, title);
             if (show_first) addFirstOrderOverlay(out->tstat1);
+            if (keepsSamplePositions(job_pipeline))
+                plotWidget()->setAxisMeta(fileSampleInterval(job_file->header()), eff_first_sample);
         });
     if (view) view->job_id = job_id;
 }
@@ -10998,6 +11025,8 @@ bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, Q
               .arg(step.ttest_abs ? QString(" |t|") : QString());
     buildTTestResultTab(acc_ptr, std::move(tstat), n0, n1, eff_count, step.ttest_abs,
                         nullptr, {}, title);
+    if (keepsSamplePositions(activeDs().pipeline))
+        plotWidget()->setAxisMeta(fileSampleInterval(h), step.ttest_first_sample);
     if (show_first && !tstat1.empty()) {
         QColor c = currentTheme().muted;
         c.setAlpha(150);

@@ -1543,6 +1543,14 @@ void PlotWidget::contextMenuEvent(QContextMenuEvent* e) {
     if (chosen == copy) copyFigureToClipboard(this);
 }
 
+void PlotWidget::setAxisMeta(double seconds_per_sample, int64_t raw_offset,
+                             double y_scale, const QString& y_unit) {
+    meta_dt_ = seconds_per_sample;
+    meta_raw_offset_ = raw_offset;
+    meta_y_scale_ = y_scale;
+    meta_y_unit_ = y_unit;
+}
+
 FigureData PlotWidget::figureData(int columns) {
     FigureData d;
     d.title   = plot_title_;
@@ -1550,9 +1558,14 @@ FigureData PlotWidget::figureData(int columns) {
     d.y_label = axis_label_y_;
     if (traces_.empty() || view_end_ <= view_start_) return d;
 
-    // Axis units: the same mapping as the on-screen tick labels (pipeline
-    // output index, then the optional scale/offset, e.g. to Hz).
-    auto labelOf = [this](double raw) {
+    // Axis units. A plain sample axis is exported in raw sample positions
+    // (so it can be converted to time); a scaled one (e.g. Hz) uses the same
+    // mapping as the on-screen tick labels.
+    const bool sample_axis = x_label_scale_ == 1.0 && x_label_offset_ == 0.0;
+    d.x_samples = sample_axis;
+    d.dt        = sample_axis ? meta_dt_ : 0.0;
+    auto labelOf = [this, sample_axis](double raw) {
+        if (sample_axis) return raw + static_cast<double>(meta_raw_offset_);
         const int64_t r = static_cast<int64_t>(std::llround(raw));
         int64_t idx = r;
         for (const auto& t : transforms_) idx = t->transformedCount(idx);
@@ -1618,6 +1631,13 @@ FigureData PlotWidget::figureData(int columns) {
         d.y0 = lo - pad; d.y1 = hi + pad;
     } else {
         d.y0 = lo - 1; d.y1 = lo + 1;
+    }
+
+    bool raw_traces = !traces_.empty();
+    for (const auto& te : traces_) if (!te.file) raw_traces = false;
+    if (raw_traces && meta_y_scale_ > 0 && transforms_.empty()) {
+        d.y_scale = meta_y_scale_;
+        d.y_unit  = meta_y_unit_;
     }
 
     d.thresholds = show_thresholds_ && !stacked_;

@@ -13,6 +13,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
+#include <utility>
 
 // ---------------------------------------------------------------------------
 // Presets
@@ -230,7 +232,9 @@ void renderFigure(QPainter& p, const QRectF& page, const FigureData& d, const Fi
         if (!se.label.isEmpty())
             entries.push_back({se.label, dataColor(se), Qt::SolidLine, s.line_pt, se.filled && !s.mono});
     const QColor thr_col(0xD6, 0x27, 0x28);
-    if (d.thresholds)
+    const bool thr_visible = d.thresholds &&
+        ((d.thr_pos > d.y0 && d.thr_pos < d.y1) || (!d.one_sided && d.thr_neg > d.y0 && d.thr_neg < d.y1));
+    if (thr_visible)   // only list it when the line is actually drawn
         entries.push_back({d.one_sided ? QString("threshold %1").arg(d.thr_pos)
                                        : QString("threshold ±%1").arg(d.thr_pos),
                            thr_col, Qt::DashLine, 0.8, false});
@@ -513,4 +517,50 @@ bool exportFigure(const QString& path, const FigureData& d, const FigureStyle& s
     }
     error = "Unknown format \"" + ext + "\" — use .pdf, .svg or .png.";
     return false;
+}
+
+// ---------------------------------------------------------------------------
+// Physical axis units
+// ---------------------------------------------------------------------------
+
+namespace {
+// Picks an SI prefix so the largest value lands in [1, 1000).
+std::pair<double, QString> siPrefix(double maxabs, const QString& unit) {
+    struct P { double f; const char* p; };
+    static const P ps[] = {{1, ""}, {1e3, "m"}, {1e6, "µ"}, {1e9, "n"}, {1e12, "p"}};
+    for (const P& p : ps)
+        if (maxabs * p.f >= 1.0 || p.f == 1e12) return {p.f, QString(p.p) + unit};
+    return {1.0, unit};
+}
+}  // namespace
+
+FigureData applyAxisUnits(const FigureData& d, const AxisUnits& u, QString* x_label, QString* y_label) {
+    FigureData o = d;
+    if (u.time && u.dt > 0 && d.x_samples) {
+        const double maxabs = std::max(std::fabs(d.x0), std::fabs(d.x1)) * u.dt;
+        const auto [f, unit] = siPrefix(maxabs, "s");
+        const double k = u.dt * f;
+        auto conv = [&](double& v) { v *= k; };
+        conv(o.x0); conv(o.x1);
+        for (auto& se : o.series) for (double& x : se.x) conv(x);
+        for (auto& b : o.bands) { conv(b.x0); conv(b.x1); }
+        if (x_label) *x_label = QString("Time [%1]").arg(unit);
+    } else if (x_label && d.x_samples) {
+        *x_label = "Sample index";
+    }
+    if (u.physical_y && d.y_scale > 0) {
+        const double maxabs = std::max(std::fabs(d.y0), std::fabs(d.y1)) * d.y_scale;
+        const auto [f, unit] = siPrefix(maxabs, d.y_unit.isEmpty() ? QString("V") : d.y_unit);
+        const double k = d.y_scale * f;
+        auto conv = [&](auto& v) { v = static_cast<std::remove_reference_t<decltype(v)>>(v * k); };
+        conv(o.y0); conv(o.y1);
+        for (auto& se : o.series) {
+            for (float& v : se.y) conv(v);
+            for (float& v : se.ymin) conv(v);
+            for (float& v : se.ymax) conv(v);
+        }
+        const QString what = (d.y_unit.isEmpty() || d.y_unit == "V") ? QString("Voltage") : QString("Value");
+        if (y_label) *y_label = QString("%1 [%2]").arg(what, unit);
+    }
+    return o;
 }

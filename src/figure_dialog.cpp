@@ -24,6 +24,7 @@
 #include <QPushButton>
 #include <QRegularExpression>
 #include <QSettings>
+#include <QSignalBlocker>
 #include <QSpinBox>
 #include <QSvgGenerator>
 #include <QVBoxLayout>
@@ -134,6 +135,9 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
         return;
     }
     auto cfg = std::make_shared<FigureSettings>(FigureSettings::load());
+    // The plot's own data in sample/raw units; `data` is what gets drawn,
+    // after the axis-unit choice below.
+    const auto base = std::make_shared<FigureData>(*data);
 
     QDialog dlg(parent);
     dlg.setWindowTitle("Export Figure");
@@ -162,6 +166,24 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
     sp_lw->setSingleStep(0.1); sp_lw->setSuffix(" pt");
     auto* cmb_leg = new QComboBox;
     cmb_leg->addItems({"Automatic", "Inside, top right", "Below the plot", "Off"});
+    // Axis units: sample index or time (from the file's sample interval, or a
+    // rate typed here), raw values or volts (from the file's value scale).
+    auto* cmb_x = new QComboBox;
+    cmb_x->addItems({"Sample index", "Time"});
+    auto* sp_rate = new QDoubleSpinBox;
+    sp_rate->setRange(0.0, 1e6);
+    sp_rate->setDecimals(3);
+    sp_rate->setSuffix(" MS/s");
+    sp_rate->setSpecialValueText("unknown");
+    sp_rate->setValue(base->dt > 0 ? 1e-6 / base->dt : 0.0);
+    sp_rate->setToolTip(base->dt > 0 ? QString("From the file: %1 per sample").arg(
+                                           base->dt >= 1e-6 ? QString("%1 µs").arg(base->dt * 1e6)
+                                                            : QString("%1 ns").arg(base->dt * 1e9))
+                                     : QString("The file has no sample interval — enter the "
+                                               "sampling rate to show time."));
+    auto* cmb_y = new QComboBox;
+    cmb_y->addItems({"Raw values", base->y_unit.isEmpty() || base->y_unit == "V"
+                                       ? QString("Voltage (from the file)") : QString("Physical units (from the file)")});
     auto* ed_xl = new QLineEdit(data->x_label);
     auto* ed_yl = new QLineEdit(data->y_label);
     ed_xl->setPlaceholderText("e.g. Time samples");
@@ -189,6 +211,12 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
     fl->addRow("", lbl_font);
     fl->addRow("Font size:", sp_fpt);
     fl->addRow("Line width:", sp_lw);
+    if (base->x_samples) {
+        fl->addRow("X axis:", [&]{ auto* w = new QWidget; auto* l = new QHBoxLayout(w);
+                                   l->setContentsMargins(0,0,0,0); l->addWidget(cmb_x, 1);
+                                   l->addWidget(sp_rate, 1); return w; }());
+    }
+    if (base->y_scale > 0) fl->addRow("Y axis:", cmb_y);
     fl->addRow("X label:", ed_xl);
     fl->addRow("Y label:", ed_yl);
     fl->addRow("Legend:", cmb_leg);
@@ -277,6 +305,11 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
         cfg->grid = chk_grid->isChecked(); cfg->box = chk_box->isChecked();
         cfg->title = chk_title->isChecked(); cfg->transparent = chk_trans->isChecked();
         cfg->mono = chk_mono->isChecked();
+        AxisUnits u;
+        u.time = cmb_x->currentIndex() == 1;
+        u.dt   = sp_rate->value() > 0 ? 1e-6 / sp_rate->value() : 0.0;
+        u.physical_y = cmb_y->currentIndex() == 1;
+        *data = applyAxisUnits(*base, u, nullptr, nullptr);
         data->x_label = ed_xl->text();
         data->y_label = ed_yl->text();
         cfg->format = cmb_fmt->currentIndex();
@@ -315,6 +348,23 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
         QObject::connect(c, &QCheckBox::toggled, &dlg, fromUi);
     QObject::connect(sp_dpi, QOverload<int>::of(&QSpinBox::valueChanged), &dlg, fromUi);
 
+    // Changing the axis units writes the matching label (still editable).
+    auto unitsChanged = [&]() {
+        AxisUnits u;
+        u.time = cmb_x->currentIndex() == 1;
+        u.dt   = sp_rate->value() > 0 ? 1e-6 / sp_rate->value() : 0.0;
+        u.physical_y = cmb_y->currentIndex() == 1;
+        sp_rate->setEnabled(u.time);
+        QString xl = ed_xl->text(), yl = ed_yl->text();
+        applyAxisUnits(*base, u, base->x_samples ? &xl : nullptr, base->y_scale > 0 ? &yl : nullptr);
+        if (base->y_scale > 0 && !u.physical_y) yl = base->y_label.isEmpty() ? QString("ADC value") : base->y_label;
+        { QSignalBlocker b1(ed_xl), b2(ed_yl); ed_xl->setText(xl); ed_yl->setText(yl); }
+        fromUi();
+    };
+    QObject::connect(cmb_x, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, unitsChanged);
+    QObject::connect(cmb_y, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, unitsChanged);
+    QObject::connect(sp_rate, QOverload<double>::of(&QDoubleSpinBox::valueChanged), &dlg, unitsChanged);
+
     QObject::connect(btn_copy, &QPushButton::clicked, &dlg, [&]() {
         cfg->save();
         copyFigureToClipboard(pw);
@@ -343,7 +393,13 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
     });
 
     toUi();
-    dlg.resize(1080, 680);
+    {
+        QSignalBlocker b1(cmb_x), b2(cmb_y);
+        cmb_x->setCurrentIndex(base->x_samples && base->dt > 0 ? 1 : 0);
+        cmb_y->setCurrentIndex(base->y_scale > 0 ? 1 : 0);
+    }
+    unitsChanged();
+    dlg.resize(1080, 720);
     dlg.show();
     QApplication::processEvents();   // let the preview label get its real size
     refresh();

@@ -25,6 +25,19 @@ wide, short strips trace plots usually are.
 In LaTeX, `\includegraphics[width=\textwidth]{figure.pdf}` (or `\columnwidth`)
 places it at exactly its exported size.
 
+## Axis units
+
+- **X axis: Sample index or Time.** Time comes from the TRS file's sample
+  interval (the `SCALE_X` tag, e.g. 2 ns per sample at 500 MS/s), shown with a
+  fitting unit: *Time [ms]*, *Time [µs]*. If the file has none, type the
+  sampling rate. t-test results remember where their window started, so their
+  time axis is absolute (a window from sample 10,000,000 at 2 ns starts at
+  20 ms). Joined pattern results stay in samples.
+- **Y axis (raw traces): Raw values or Voltage**, from the file's value scale
+  (`SCALE_Y`, e.g. 0.39 mV per ADC step): *Voltage [mV]*.
+
+Choosing a unit fills in the matching label, which you can still edit.
+
 ## Style
 
 The defaults follow how side-channel figures look in published papers:

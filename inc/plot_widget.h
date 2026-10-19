@@ -211,6 +211,12 @@ public:
     // palette, since figures go on white paper.
     FigureData figureData(int columns = 1600);
 
+    // What the x axis means physically, for figures: seconds per raw sample
+    // (0 = unknown) and the raw sample the plot's index 0 corresponds to;
+    // and, for raw traces, the value scale and unit (e.g. V per ADC step).
+    void setAxisMeta(double seconds_per_sample, int64_t raw_offset = 0,
+                     double y_scale = 0.0, const QString& y_unit = {});
+
     // Right-click on a plot: Export Figure… / Copy Figure (figure_dialog.h).
 
     // Per-trace sample shifts (set by AlignDrag; also settable programmatically)
@@ -325,6 +331,9 @@ private:
     // Match-marker overlay (read-only, e.g. template-match hits)
     std::vector<std::pair<int64_t,int64_t>> match_markers_;
     std::vector<PatternBand> pattern_bands_;
+    double  meta_dt_ = 0.0, meta_y_scale_ = 0.0;
+    int64_t meta_raw_offset_ = 0;
+    QString meta_y_unit_;
 
     // Pending cut selection (CropSelect mode: drag sets this, Enter confirms it)
     int64_t pending_cut_start_ = -1;
