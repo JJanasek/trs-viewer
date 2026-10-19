@@ -99,78 +99,114 @@ bool alignPattern(TrsFile* file,
     // worked at full resolution (and re-matching would change what a Peak
     // alignment means).
     if (def.refine_raw && decimated) {
-        // How far the coarse shift can be off: one resampling step, +1 for
-        // rounding.
+        // How far the coarse shift can be off: one resampling step.
         const int64_t step = (L + proc_len - 1) / proc_len;
-        const int64_t r    = std::min<int64_t>(step + 1, def.search_half + 1);
         auto refine_base   = countPreservingStages(pipeline, L);
-
-        // Template: the reference trace(s) at their coarse shifts, averaged.
-        std::vector<float> tmpl(static_cast<size_t>(L), 0.0f);
-        {
-            std::vector<float> buf(static_cast<size_t>(L));
-            auto stages = countPreservingStages(refine_base, L);
-            const int32_t rc = std::clamp(def.ref_count, 1, num_traces - def.ref_offset);
-            int used = 0;
-            for (int32_t k = 0; k < rc; k++) {
-                const int32_t ti = def.ref_offset + k;
-                const int32_t s  = out.shifts[static_cast<size_t>(ti)];
-                if (s == kAlignDiscardShift) continue;
-                readWindow(file, first_trace + ti, start + s, L, buf.data());
-                applyStages(stages, buf.data(), L);
-                for (int64_t i = 0; i < L; i++) tmpl[static_cast<size_t>(i)] += buf[static_cast<size_t>(i)];
-                used++;
-            }
-            if (used == 0) { error = "The reference trace was discarded."; return false; }
-            double mean = 0;
-            for (float v : tmpl) mean += v;
-            mean /= static_cast<double>(L);
-            double norm = 0;
-            for (float& v : tmpl) { v = static_cast<float>(v - mean); norm += double(v) * v; }
-            norm = std::sqrt(norm);
-            if (norm <= 1e-30) { error = "The template trace is flat in this region (nothing to align on) — "
-                                         "choose another template trace or average several."; return false; }
-            for (float& v : tmpl) v = static_cast<float>(v / norm);
-        }
-
         out.scores.assign(static_cast<size_t>(num_traces), 0.0f);
 #ifdef _OPENMP
         const int n_threads = std::clamp(omp_get_max_threads(), 1, 16);
 #else
         const int n_threads = 1;
 #endif
-        std::vector<std::vector<std::shared_ptr<ITransform>>> stages(static_cast<size_t>(n_threads));
-        std::vector<std::vector<float>> bufs(static_cast<size_t>(n_threads),
-                                             std::vector<float>(static_cast<size_t>(L + 2 * r)));
-        for (auto& s : stages) s = countPreservingStages(refine_base, L + 2 * r);
+        // Coarse-to-fine: each level narrows the uncertainty 8×, ending at
+        // full resolution, so a 64× resample costs ≈ 22·L per trace instead
+        // of ≈ 130·L for one exhaustive raw search, with the same result.
+        std::vector<std::pair<int64_t, int64_t>> levels;   // (decimation, radius in its units)
+        for (int64_t cur = step; cur > 1;) {
+            const int64_t dec = std::max<int64_t>(1, cur / 8);
+            levels.push_back({dec, cur / dec + 1});
+            cur = dec;
+        }
+        if (levels.empty()) levels.push_back({1, 2});
 
-        constexpr int32_t kChunk = 64;
-        for (int32_t c0 = 0; c0 < num_traces; c0 += kChunk) {
-            const int32_t c1 = std::min(num_traces, c0 + kChunk);
-            #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
-            for (int32_t ti = c0; ti < c1; ti++) {
-#ifdef _OPENMP
-                const size_t tid = static_cast<size_t>(omp_get_thread_num());
-#else
-                const size_t tid = 0;
-#endif
-                const int32_t s = out.shifts[static_cast<size_t>(ti)];
-                if (s == kAlignDiscardShift) continue;
-                float* w = bufs[tid].data();
-                readWindow(file, first_trace + ti, start + s - r, L + 2 * r, w);
-                applyStages(stages[tid], w, L + 2 * r);
-                double best = -2.0;
-                int64_t best_lag = 0;
-                for (int64_t lag = -r; lag <= r; lag++) {
-                    const double c = ncc(tmpl.data(), w + r + lag, L);
-                    if (c > best) { best = c; best_lag = lag; }
-                }
-                out.shifts[static_cast<size_t>(ti)] = static_cast<int32_t>(s + best_lag);
-                out.scores[static_cast<size_t>(ti)] = static_cast<float>(best);
+        // Block mean: n samples → n/dec.
+        auto decimate = [](const float* in, int64_t n, int64_t dec, float* outp) {
+            const int64_t m = n / dec;
+            for (int64_t k = 0; k < m; k++) {
+                double acc = 0;
+                for (int64_t q = 0; q < dec; q++) acc += in[k * dec + q];
+                outp[k] = static_cast<float>(acc / static_cast<double>(dec));
             }
-            if (progress && !progress(num_traces + c1, 2 * num_traces)) {
-                error = "Cancelled.";
-                return false;
+            return m;
+        };
+
+        for (size_t li = 0; li < levels.size(); li++) {
+            const int64_t dec = levels[li].first;
+            const int64_t r   = std::min<int64_t>(levels[li].second, def.search_half / dec + 1);
+            const int64_t Ld  = L / dec;
+            if (Ld < 4) continue;
+
+            // Template at this resolution: the reference trace(s) at their
+            // current shifts, averaged.
+            std::vector<float> tmpl(static_cast<size_t>(Ld), 0.0f);
+            {
+                std::vector<float> buf(static_cast<size_t>(L)), small(static_cast<size_t>(Ld));
+                auto stages = countPreservingStages(refine_base, L);
+                const int32_t rc = std::clamp(def.ref_count, 1, num_traces - def.ref_offset);
+                int used = 0;
+                for (int32_t k = 0; k < rc; k++) {
+                    const int32_t ti = def.ref_offset + k;
+                    const int32_t sh = out.shifts[static_cast<size_t>(ti)];
+                    if (sh == kAlignDiscardShift) continue;
+                    readWindow(file, first_trace + ti, start + sh, L, buf.data());
+                    applyStages(stages, buf.data(), L);
+                    decimate(buf.data(), L, dec, small.data());
+                    for (int64_t q = 0; q < Ld; q++) tmpl[static_cast<size_t>(q)] += small[static_cast<size_t>(q)];
+                    used++;
+                }
+                if (used == 0) { error = "The reference trace was discarded."; return false; }
+                double mean = 0;
+                for (float v : tmpl) mean += v;
+                mean /= static_cast<double>(Ld);
+                double norm = 0;
+                for (float& v : tmpl) { v = static_cast<float>(v - mean); norm += double(v) * v; }
+                norm = std::sqrt(norm);
+                if (norm <= 1e-30) { error = "The template trace is flat in this region (nothing to align on) — "
+                                             "choose another template trace or average several."; return false; }
+                for (float& v : tmpl) v = static_cast<float>(v / norm);
+            }
+
+            const int64_t wlen = L + 2 * r * dec;
+            std::vector<std::vector<std::shared_ptr<ITransform>>> stages(static_cast<size_t>(n_threads));
+            std::vector<std::vector<float>> bufs(static_cast<size_t>(n_threads),
+                                                 std::vector<float>(static_cast<size_t>(wlen)));
+            std::vector<std::vector<float>> smalls(static_cast<size_t>(n_threads),
+                                                   std::vector<float>(static_cast<size_t>(wlen / dec + 1)));
+            for (auto& st : stages) st = countPreservingStages(refine_base, wlen);
+
+            constexpr int32_t kChunk = 64;
+            for (int32_t c0 = 0; c0 < num_traces; c0 += kChunk) {
+                const int32_t c1 = std::min(num_traces, c0 + kChunk);
+                #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
+                for (int32_t ti = c0; ti < c1; ti++) {
+#ifdef _OPENMP
+                    const size_t tid = static_cast<size_t>(omp_get_thread_num());
+#else
+                    const size_t tid = 0;
+#endif
+                    const int32_t sh = out.shifts[static_cast<size_t>(ti)];
+                    if (sh == kAlignDiscardShift) continue;
+                    float* w = bufs[tid].data();
+                    readWindow(file, first_trace + ti, start + sh - r * dec, wlen, w);
+                    applyStages(stages[tid], w, wlen);
+                    const float* x = w;
+                    if (dec > 1) { decimate(w, wlen, dec, smalls[tid].data()); x = smalls[tid].data(); }
+                    double best = -2.0;
+                    int64_t best_lag = 0;
+                    for (int64_t lag = -r; lag <= r; lag++) {
+                        const double c = ncc(tmpl.data(), x + r + lag, Ld);
+                        if (c > best) { best = c; best_lag = lag; }
+                    }
+                    out.shifts[static_cast<size_t>(ti)] = static_cast<int32_t>(sh + best_lag * dec);
+                    out.scores[static_cast<size_t>(ti)] = static_cast<float>(best);
+                }
+                const int64_t done = static_cast<int64_t>(li) * num_traces + c1;
+                const int64_t total = static_cast<int64_t>(levels.size()) * num_traces;
+                if (progress && !progress(static_cast<int>(num_traces + num_traces * done / std::max<int64_t>(1, total)),
+                                          2 * num_traces)) {
+                    error = "Cancelled.";
+                    return false;
+                }
             }
         }
     }

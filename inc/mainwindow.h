@@ -46,6 +46,7 @@ struct DatasetSnapshot {
     int32_t align_tile_size    = 0;
     int32_t align_baked_tile   = 0;
     std::vector<Pattern> patterns;
+    std::vector<std::shared_ptr<ITransform>> pattern_pipeline;
     PlotViewState view;
 };
 
@@ -92,6 +93,10 @@ struct Dataset {
     // Pattern alignment (Process › Patterns): named regions, each aligned on
     // its own; only the per-trace shifts are kept. See pattern_align.h.
     std::vector<Pattern> patterns;
+    // The pipeline the patterns are aligned on (e.g. a Window Resample),
+    // kept after the view's pipeline is cleared so re-aligning a pattern
+    // later still runs on the reduced signal instead of the raw traces.
+    std::vector<std::shared_ptr<ITransform>> pattern_pipeline;
 
     // Plot state
     int32_t              plot_first_trace   = 0;

@@ -46,6 +46,12 @@ each one **on its own**, and keep only the shifts. The t-test then reads the
     removed **once every pattern is aligned**, so you can align them one at a
     time on the resampled view and the analyses still run on raw traces.
     Ctrl+Z undoes this.
+
+    The pipeline the patterns were aligned on is **remembered**: re-aligning
+    a pattern later (after Redraw Selected, say) still runs on the resampled
+    signal even though the view shows raw traces again. The window shows what
+    it aligns on. The final refinement works coarse-to-fine (e.g. 64× → 8× →
+    1×), so even long patterns refine to the exact sample quickly.
 4. **Run the t-test** (**Analyze → Welch t-test**). With aligned patterns the
    dialog shows **Use patterns** with a checklist. The selected patterns are
    tested on the raw traces with their own shifts, and shown side by side in

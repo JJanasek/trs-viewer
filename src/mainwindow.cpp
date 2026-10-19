@@ -1420,6 +1420,7 @@ void MainWindow::saveSnapshot() {
     snap.align_tile_size    = ds.align_tile_size;
     snap.align_baked_tile   = ds.align_baked_tile;
     snap.patterns           = ds.patterns;
+    for (const auto& t : ds.pattern_pipeline) snap.pattern_pipeline.push_back(t->clone());
     snap.view               = plotWidget()->captureViewState();
     ds.undo_stack.push_front(std::move(snap));
     if (static_cast<int>(ds.undo_stack.size()) > Dataset::kMaxUndo)
@@ -1437,6 +1438,7 @@ void MainWindow::restoreSnapshot(DatasetSnapshot snap) {
     ds.align_tile_size    = snap.align_tile_size;
     ds.align_baked_tile   = snap.align_baked_tile;
     ds.patterns           = std::move(snap.patterns);
+    ds.pattern_pipeline   = std::move(snap.pattern_pipeline);
     refreshPatternBands(ds);
 
     rebuildTransformList();
@@ -1612,6 +1614,7 @@ void MainWindow::onDiscardAlignment() {
     saveSnapshot();   // undoable — snapshots carry every align_* field and the patterns
     Dataset& ds = activeDs();
     ds.patterns.clear();
+    ds.pattern_pipeline.clear();
     refreshPatternBands(ds);
     ds.align_shifts.clear();
     ds.align_first_trace  = 0;
@@ -9730,6 +9733,10 @@ void MainWindow::onPatternEditor() {
     fl->addRow(chk_strip);
     vl->addWidget(grp);
 
+    auto* lbl_on = new QLabel;
+    lbl_on->setWordWrap(true);
+    lbl_on->setTextFormat(Qt::RichText);
+    vl->addWidget(lbl_on);
     auto* lbl_status = new QLabel;
     lbl_status->setWordWrap(true);
     vl->addWidget(lbl_status);
@@ -9749,6 +9756,19 @@ void MainWindow::onPatternEditor() {
     bottom->addWidget(btn_align_sel);
     bottom->addWidget(btn_align);
     vl->addLayout(bottom);
+
+    // Which pipeline alignment uses: the view's own if it has one (and that
+    // becomes the remembered one), otherwise the one the patterns were last
+    // aligned on — so clearing the view's pipeline afterwards doesn't send
+    // later re-alignments to the full-resolution raw traces.
+    auto alignmentPipeline = [this](const Dataset& ds) -> const std::vector<std::shared_ptr<ITransform>>& {
+        return ds.pipeline.empty() ? ds.pattern_pipeline : ds.pipeline;
+    };
+    auto describePipeline = [](const std::vector<std::shared_ptr<ITransform>>& pl) {
+        QStringList names;
+        for (const auto& t : pl) names << QString::fromStdString(t->name());
+        return names.join(" → ");
+    };
 
     // ---- model <-> table ----
     auto refreshing = std::make_shared<bool>(false);
@@ -9835,6 +9855,20 @@ void MainWindow::onPatternEditor() {
         *refreshing = false;
         int aligned = 0, n = tbl->rowCount();
         if (idx >= 0) for (const auto& p : datasets_[static_cast<size_t>(idx)].patterns) aligned += p.res.aligned;
+        if (idx >= 0) {
+            const Dataset& dsx = datasets_[static_cast<size_t>(idx)];
+            const auto& pl = alignmentPipeline(dsx);
+            if (pl.empty())
+                lbl_on->setText("<b>Aligning on:</b> the raw traces. For long patterns add a "
+                                "<i>Window Resample</i> stage first — it is much faster, and the "
+                                "shifts are still refined to the exact sample.");
+            else if (dsx.pipeline.empty())
+                lbl_on->setText(QString("<b>Aligning on:</b> %1 <i>(the pipeline the patterns "
+                                        "were aligned on; the view itself shows raw traces)</i>")
+                                    .arg(describePipeline(pl).toHtmlEscaped()));
+            else
+                lbl_on->setText(QString("<b>Aligning on:</b> %1").arg(describePipeline(pl).toHtmlEscaped()));
+        }
         lbl_status->setText(idx < 0 ? "The file this editor was opened on is closed."
                                     : QString("%1 pattern%2, %3 aligned.").arg(n).arg(n == 1 ? "" : "s").arg(aligned));
         btn_align->setEnabled(idx >= 0 && n > 0);
@@ -10047,7 +10081,7 @@ void MainWindow::onPatternEditor() {
         }
         std::shared_ptr<TrsFile> file = ds.file;
         std::vector<std::shared_ptr<ITransform>> pipeline;
-        for (const auto& t : ds.pipeline) pipeline.push_back(t->clone());
+        for (const auto& t : alignmentPipeline(ds)) pipeline.push_back(t->clone());
         const int32_t first = sp_first->value();
         const int32_t count = std::min(sp_count->value(), n_total - first);
         const bool strip = chk_strip->isChecked();
@@ -10087,6 +10121,9 @@ void MainWindow::onPatternEditor() {
                 tab_bar_->setCurrentIndex(j);
                 saveSnapshot();   // undoable, including the pipeline change below
                 Dataset& d = datasets_[static_cast<size_t>(j)];
+                // Remember what these patterns were aligned on.
+                d.pattern_pipeline.clear();
+                for (const auto& t : pipeline) d.pattern_pipeline.push_back(t->clone());
                 for (size_t k = 0; k < rows.size(); k++) {
                     const size_t row = static_cast<size_t>(rows[k]);
                     // Skip if the pattern was removed or moved meanwhile.
@@ -10829,6 +10866,8 @@ bool MainWindow::runAlignPatternsChainStep(const ChainStep& step, QWidget* msg_p
     saveSnapshot();
     Dataset& ds = activeDs();
     ds.patterns = std::move(pats);
+    ds.pattern_pipeline.clear();
+    for (const auto& t : ds.pipeline) ds.pattern_pipeline.push_back(t->clone());
     if (step.pattern_strip && !ds.pipeline.empty()) {
         ds.pipeline.clear();
         rebuildTransformList();
