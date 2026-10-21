@@ -281,3 +281,32 @@ TEST(TTestAccumulator, ComputeMergedNeedsTwoTracesPerGroup) {
     std::vector<TTestAccumulator> none;
     EXPECT_FALSE(TTestAccumulator::computeMerged(none, out, err, 2));
 }
+
+// ---------------------------------------------------------------------------
+// addTraces: parallel runs share one accumulator and add each group of
+// traces split by sample range. Must equal addTrace() on each, in order.
+// ---------------------------------------------------------------------------
+
+TEST(TTestAccumulator, AddTracesEqualsAddTraceInOrder) {
+    constexpr int32_t kNs = 100000;   // long enough to be split over threads
+    TTestAccumulator one(kNs), batched(kNs);
+    std::vector<std::vector<float>> trs(6, std::vector<float>(kNs));
+    for (int t = 0; t < 6; t++)
+        for (int32_t i = 0; i < kNs; i++)
+            trs[static_cast<size_t>(t)][static_cast<size_t>(i)] = std::sin(0.37f * t + 0.011f * i) + 0.1f * (t & 1);
+    const int     groups[6] = {0, 1, -1, 1, 0, 0};        // trace 2 is left out
+    const int32_t counts[6] = {kNs, kNs, kNs, kNs - 777, kNs, kNs};
+    std::vector<const float*> bufs;
+    for (auto& tr : trs) bufs.push_back(tr.data());
+    for (int t = 0; t < 6; t++)
+        if (groups[t] >= 0) one.addTrace(groups[t], bufs[static_cast<size_t>(t)], counts[t]);
+    batched.addTraces(groups, bufs.data(), counts, 3, 4);
+    batched.addTraces(groups + 3, bufs.data() + 3, counts + 3, 3, 4);
+    EXPECT_EQ(batched.countGroup(0), 3);
+    EXPECT_EQ(batched.countGroup(1), 2);
+    std::vector<float> want, got;
+    std::string err;
+    ASSERT_TRUE(one.compute(want, err)) << err;
+    ASSERT_TRUE(batched.compute(got, err, 4)) << err;
+    EXPECT_EQ(got, want);
+}

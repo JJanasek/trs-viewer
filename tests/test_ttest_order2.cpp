@@ -126,3 +126,50 @@ TEST(TTestOrder2, OrderOneMatchesTheCore) {
     ASSERT_EQ(a.t.size(), t.size());
     for (size_t i = 0; i < t.size(); i++) EXPECT_NEAR(a.t[i], t[i], 1e-5f);
 }
+
+TEST(TTestOrder2, WindowSumMatchesDirectComputation) {
+    Masked d(300, 2);
+    TTestOptions o; o.order = 2; o.integrate = 5;
+    RunOut r = run(d.file, 300, o);
+    ASSERT_TRUE(r.ok) << r.err.toStdString();
+
+    // Reference: group means, then y = Σ over the centred window of (x − μ)².
+    std::vector<double> mu[2] = {std::vector<double>(kNS, 0.0), std::vector<double>(kNS, 0.0)};
+    int cnt[2] = {0, 0};
+    for (int t = 0; t < 300; t++) {
+        const int g = d.data[static_cast<size_t>(t)];
+        cnt[g]++;
+        for (int s = 0; s < kNS; s++) mu[g][static_cast<size_t>(s)] += d.samples[static_cast<size_t>(t) * kNS + s];
+    }
+    for (int g = 0; g < 2; g++) for (double& m : mu[g]) m /= cnt[g];
+    TTestAccumulator ref(kNS);
+    std::vector<float> y(kNS);
+    for (int t = 0; t < 300; t++) {
+        const int g = d.data[static_cast<size_t>(t)];
+        for (int s = 0; s < kNS; s++) {
+            double sum = 0;
+            for (int k = std::max(0, s - 2); k <= std::min(kNS - 1, s + 2); k++) {
+                const double dd = d.samples[static_cast<size_t>(t) * kNS + k] - mu[g][static_cast<size_t>(k)];
+                sum += dd * dd;
+            }
+            y[static_cast<size_t>(s)] = static_cast<float>(sum);
+        }
+        ref.addTrace(g, y.data(), kNS);
+    }
+    std::vector<float> want;
+    std::string err;
+    ASSERT_TRUE(ref.compute(want, err)) << err;
+    ASSERT_EQ(r.t.size(), want.size());
+    for (size_t i = 0; i < want.size(); i++) EXPECT_NEAR(r.t[i], want[i], 1e-3f) << "sample " << i;
+}
+
+TEST(TTestOrder2, MemoryEstimateIsOneAccumulatorPlusThreadBuffers) {
+    // 1M samples, 8 threads: 32 MB accumulator + 8 × 4 MB trace buffers.
+    EXPECT_EQ(estimateTTestBytes(1000000, 1000000, 1, 8), 64000000);
+    // Order 2 adds the group means (2 doubles) and the 1st-order curve (a float).
+    EXPECT_EQ(estimateTTestBytes(1000000, 1000000, 2, 8), 84000000);
+    // A resampled pipeline: small accumulator, but raw-length buffers.
+    EXPECT_EQ(estimateTTestBytes(1000000, 10000, 1, 8), 320000 + 32000000);
+    // More cores than the run uses don't count.
+    EXPECT_EQ(estimateTTestBytes(1000000, 1000000, 1, 24), 64000000);
+}

@@ -92,6 +92,16 @@ bool computeTTestCore(TrsFile* file,
                       TTestLive* live = nullptr,
                       const TTestHooks* hooks = nullptr);
 
+// A run uses at most this many worker threads (more only add trace buffers
+// while the read and the accumulation stay memory-bound).
+constexpr int kTTestMaxThreads = 8;
+
+// Peak memory of a run, in bytes: the accumulator (4 doubles per output
+// sample), one trace buffer per worker thread (`threads` is capped at
+// kTTestMaxThreads, as in the run), and for order 2 the group means and the
+// first-order curve kept between the passes.
+int64_t estimateTTestBytes(int64_t raw_ns, int64_t effective_ns, int order, int threads);
+
 // ---------------------------------------------------------------------------
 // Higher-level runs: order, jitter tolerance and the sanity check.
 // ---------------------------------------------------------------------------

@@ -39,6 +39,15 @@ void summarizeTStat(const std::vector<float>& t, float threshold,
     }
 }
 
+int64_t estimateTTestBytes(int64_t raw_ns, int64_t effective_ns, int order, int threads) {
+    int64_t bytes = effective_ns * 4 * static_cast<int64_t>(sizeof(double))
+                  + std::clamp(threads, 1, kTTestMaxThreads) * std::max(raw_ns, effective_ns)
+                        * static_cast<int64_t>(sizeof(float));
+    if (order >= 2)
+        bytes += effective_ns * (2 * static_cast<int64_t>(sizeof(double)) + static_cast<int64_t>(sizeof(float)));
+    return bytes;
+}
+
 bool computeTTestCore(TrsFile* file,
                       const std::vector<std::shared_ptr<ITransform>>& pipeline,
                       int32_t eff_first, int32_t eff_count,
@@ -68,40 +77,44 @@ bool computeTTestCore(TrsFile* file,
     for (const auto& t : pipeline)
         effective_samples = t->transformedCount(effective_samples);
 
-    // Accumulation is parallelised across traces, one TTestAccumulator + one
-    // cloned pipeline per worker thread (merged together at the end) — the
-    // shared pipeline transforms aren't safe to call apply() on
-    // concurrently since they may cache internal state (e.g. FFT plans).
-    // Capped at 8 threads since each accumulator costs 4×effective_samples
-    // doubles; see confirmTTestMemory() in mainwindow.cpp.
+    // Accumulation is parallelised in two steps per group of traces: each
+    // worker thread reads and transforms one trace into its own slot buffer
+    // (with its own cloned pipeline — the shared transforms aren't safe to
+    // call apply() on concurrently since they may cache internal state, e.g.
+    // FFT plans), then all threads add the slots into the one accumulator,
+    // each owning a range of samples. A single accumulator (4 doubles per
+    // output sample) instead of one per thread keeps long traces affordable:
+    // see estimateTTestBytes().
 #ifdef _OPENMP
-    const int n_threads = std::clamp(omp_get_max_threads(), 1, 8);
+    const int n_threads = std::clamp(omp_get_max_threads(), 1, kTTestMaxThreads);
 #else
     const int n_threads = 1;
 #endif
 
     // --- Accumulation ---
     auto acc_ptr = std::make_shared<TTestAccumulator>(static_cast<int32_t>(effective_samples));
+    TTestAccumulator& acc = *acc_ptr;
 
-    std::vector<TTestAccumulator> thread_accs(
-        static_cast<size_t>(n_threads), TTestAccumulator(static_cast<int32_t>(effective_samples)));
     std::vector<std::vector<std::shared_ptr<ITransform>>> thread_pipelines(
         static_cast<size_t>(n_threads));
     for (auto& tp : thread_pipelines)
         for (const auto& t : pipeline) tp.push_back(t->clone());
-    std::vector<std::vector<float>> thread_bufs(
+    std::vector<std::vector<float>> slot_bufs(
         static_cast<size_t>(n_threads),
         std::vector<float>(static_cast<size_t>(std::max(raw_ns, effective_samples))));
+    std::vector<const float*> slot_ptrs(static_cast<size_t>(n_threads));
+    for (int k = 0; k < n_threads; k++) slot_ptrs[static_cast<size_t>(k)] = slot_bufs[static_cast<size_t>(k)].data();
+    std::vector<int>     slot_group(static_cast<size_t>(n_threads), -1);
+    std::vector<int32_t> slot_count(static_cast<size_t>(n_threads), 0);
     std::vector<int32_t> thread_skipped(static_cast<size_t>(n_threads), 0);
     std::vector<int32_t> thread_discarded(static_cast<size_t>(n_threads), 0);
 
     // Live snapshots: the t-curve over everything so far is computed straight
-    // from the per-thread accumulators between batches (the parallel region
-    // is idle then, so no locking), leaving the running state untouched.
+    // from the accumulator between batches (the parallel regions are idle
+    // then, so no locking), leaving the running state untouched.
     //
-    // A snapshot reads 4 × threads × samples doubles, so on long traces it
-    // is far from free (≈0.3 s single-threaded at 10M samples × 8 threads).
-    // It is split over the worker threads, and its measured cost throttles
+    // A snapshot reads 4 doubles per sample, so on long traces it is not
+    // free. It is split over the worker threads, and its measured cost throttles
     // how often it runs: the next one waits until at least
     // kSnapshotCostRatio × that cost has passed since it finished, which
     // keeps snapshots at ≲10% of the run whatever snapshot_every says.
@@ -122,15 +135,13 @@ bool computeTTestCore(TrsFile* file,
         snap->done  = done;
         snap->total = eff_count;
         snap->final = final;
-        for (const auto& a : thread_accs) {
-            snap->n0 += a.countGroup(0);
-            snap->n1 += a.countGroup(1);
-        }
+        snap->n0 = acc.countGroup(0);
+        snap->n1 = acc.countGroup(1);
         std::string cerr;
         if (final_tstat) {
             snap->tstat = *final_tstat;
             summarizeTStat(snap->tstat, live->threshold, snap->max_abs, snap->n_exceed);
-        } else if (TTestAccumulator::computeMerged(thread_accs, snap->tstat, cerr, n_threads)) {
+        } else if (acc.compute(snap->tstat, cerr, n_threads)) {
             if (abs_value)
                 for (float& v : snap->tstat) v = std::fabs(v);
             summarizeTStat(snap->tstat, live->threshold, snap->max_abs, snap->n_exceed);
@@ -191,59 +202,65 @@ bool computeTTestCore(TrsFile* file,
             prefetched_to = std::max(prefetched_to, to);
         }
 
-        #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
-        for (int32_t ti = batch_start; ti < batch_end; ti++) {
+        for (int32_t chunk = batch_start; chunk < batch_end; chunk += n_threads) {
+            const int m = std::min<int32_t>(n_threads, batch_end - chunk);
+            #pragma omp parallel for schedule(dynamic) num_threads(n_threads)
+            for (int k = 0; k < m; k++) {
 #ifdef _OPENMP
-            const size_t tid = static_cast<size_t>(omp_get_thread_num());
+                const size_t tid = static_cast<size_t>(omp_get_thread_num());
 #else
-            const size_t tid = 0;
+                const size_t tid = 0;
 #endif
-            TTestAccumulator&                        acc_local  = thread_accs[tid];
-            std::vector<std::shared_ptr<ITransform>>& pipeline_local = thread_pipelines[tid];
-            std::vector<float>&                      trace_buf  = thread_bufs[tid];
+                const int32_t ti = chunk + k;
+                std::vector<std::shared_ptr<ITransform>>& pipeline_local = thread_pipelines[tid];
+                std::vector<float>&                      trace_buf  = slot_bufs[static_cast<size_t>(k)];
+                slot_group[static_cast<size_t>(k)] = -1;
 
-            int32_t src_idx = trace_at(ti);
-            auto data_bytes = file->readData(src_idx);
-            if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
-            int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
-            if (hooks && hooks->group_map) {
-                group = hooks->group_map(group, src_idx);
-                if (group < 0) continue;   // deliberately left out (e.g. sanity split)
-            }
-
-            // Read window with per-trace shift, zero-pad out of bounds.
-            // Looked up by src_idx's position in the *alignment's own*
-            // range, not by ti — eff_first may start anywhere (a subset of
-            // the aligned traces), so ti==0 does not generally mean
-            // "the first aligned trace".
-            int32_t shift = 0;
-            if (!use_shifts.empty()) {
-                int64_t shift_idx = static_cast<int64_t>(src_idx) - shifts_first_trace;
-                if (shift_idx < 0 || shift_idx >= static_cast<int64_t>(use_shifts.size())) {
-                    thread_discarded[tid]++; continue;   // outside the alignment's coverage
+                int32_t src_idx = trace_at(ti);
+                auto data_bytes = file->readData(src_idx);
+                if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
+                int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
+                if (hooks && hooks->group_map) {
+                    group = hooks->group_map(group, src_idx);
+                    if (group < 0) continue;   // deliberately left out (e.g. sanity split)
                 }
-                shift = use_shifts[static_cast<size_t>(shift_idx)];
-                if (shift == kAlignDiscardShift) { thread_discarded[tid]++; continue; }
+
+                // Read window with per-trace shift, zero-pad out of bounds.
+                // Looked up by src_idx's position in the *alignment's own*
+                // range, not by ti — eff_first may start anywhere (a subset of
+                // the aligned traces), so ti==0 does not generally mean
+                // "the first aligned trace".
+                int32_t shift = 0;
+                if (!use_shifts.empty()) {
+                    int64_t shift_idx = static_cast<int64_t>(src_idx) - shifts_first_trace;
+                    if (shift_idx < 0 || shift_idx >= static_cast<int64_t>(use_shifts.size())) {
+                        thread_discarded[tid]++; continue;   // outside the alignment's coverage
+                    }
+                    shift = use_shifts[static_cast<size_t>(shift_idx)];
+                    if (shift == kAlignDiscardShift) { thread_discarded[tid]++; continue; }
+                }
+                const int64_t adj_start = eff_first_sample + shift;
+                std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
+                // Clamp to read_lo/read_hi (the whole file untiled, one tile's
+                // own bounds when tiled) rather than [0, h.num_samples) so a
+                // shift can't pull in a neighboring tile's samples.
+                if (adj_start < read_hi && adj_start + raw_ns > read_lo) {
+                    int64_t src_start = std::max<int64_t>(read_lo, adj_start);
+                    int64_t src_end   = std::min<int64_t>(read_hi, adj_start + raw_ns);
+                    int64_t dst_off   = src_start - adj_start;
+                    int64_t got = file->readSamples(src_idx, src_start, src_end - src_start,
+                                                          trace_buf.data() + dst_off);
+                    if (got <= 0) { thread_skipped[tid]++; continue; }
+                }
+                for (const auto& t : pipeline_local) t->reset();
+                int64_t n_out = raw_ns;
+                for (const auto& t : pipeline_local)
+                    n_out = t->apply(trace_buf.data(), n_out, 0);
+                if (hooks && hooks->post) hooks->post(group, trace_buf.data(), n_out);
+                slot_group[static_cast<size_t>(k)] = group;
+                slot_count[static_cast<size_t>(k)] = static_cast<int32_t>(n_out);
             }
-            const int64_t adj_start = eff_first_sample + shift;
-            std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
-            // Clamp to read_lo/read_hi (the whole file untiled, one tile's
-            // own bounds when tiled) rather than [0, h.num_samples) so a
-            // shift can't pull in a neighboring tile's samples.
-            if (adj_start < read_hi && adj_start + raw_ns > read_lo) {
-                int64_t src_start = std::max<int64_t>(read_lo, adj_start);
-                int64_t src_end   = std::min<int64_t>(read_hi, adj_start + raw_ns);
-                int64_t dst_off   = src_start - adj_start;
-                int64_t got = file->readSamples(src_idx, src_start, src_end - src_start,
-                                                      trace_buf.data() + dst_off);
-                if (got <= 0) { thread_skipped[tid]++; continue; }
-            }
-            for (const auto& t : pipeline_local) t->reset();
-            int64_t n_out = raw_ns;
-            for (const auto& t : pipeline_local)
-                n_out = t->apply(trace_buf.data(), n_out, 0);
-            if (hooks && hooks->post) hooks->post(group, trace_buf.data(), n_out);
-            acc_local.addTrace(group, trace_buf.data(), static_cast<int32_t>(n_out));
+            acc.addTraces(slot_group.data(), slot_ptrs.data(), slot_count.data(), m, n_threads);
         }
 
         // Re-aim the next batch at kTargetMs. Clamped per step so one slow
@@ -281,10 +298,8 @@ bool computeTTestCore(TrsFile* file,
         live->stopped_early = processed < eff_count;
     }
 
-    TTestAccumulator& acc = *acc_ptr;
     int32_t skipped = 0, discarded_by_align = 0;
     for (int t = 0; t < n_threads; t++) {
-        acc.mergeFrom(thread_accs[static_cast<size_t>(t)]);
         skipped            += thread_skipped[static_cast<size_t>(t)];
         discarded_by_align += thread_discarded[static_cast<size_t>(t)];
     }
@@ -304,7 +319,7 @@ bool computeTTestCore(TrsFile* file,
     // --- Compute ---
     std::vector<float> tstat;
     std::string cerr;
-    if (!acc.compute(tstat, cerr)) {
+    if (!acc.compute(tstat, cerr, n_threads)) {
         err = QString::fromStdString(cerr);
         return false;
     }
@@ -381,6 +396,7 @@ bool computeTTest(TrsFile* file,
     auto mean1 = std::make_shared<std::vector<double>>();
     acc1->groupMeans(0, *mean0);
     acc1->groupMeans(1, *mean1);
+    acc1.reset();   // pass 2 has its own; don't hold both
     if (first_order_out) {
         if (abs_value) for (float& v : t1) v = std::fabs(v);
         *first_order_out = std::move(t1);
@@ -398,16 +414,33 @@ bool computeTTest(TrsFile* file,
             }
             return;
         }
-        thread_local std::vector<double> prefix;
-        prefix.assign(static_cast<size_t>(m + 1), 0.0);
-        for (int64_t i = 0; i < m; i++) {
+        // Centred window sum, in place: buf[i + half_w] is still the input
+        // when buf[i] is written, and a small ring keeps the squares that
+        // leave the window (no per-trace copy of the whole trace).
+        const size_t w = static_cast<size_t>(2 * half_w + 1);
+        thread_local std::vector<double> ring;
+        ring.assign(w, 0.0);
+        auto sq = [&](int64_t i) {
             const double d = buf[i] - mu[static_cast<size_t>(i)];
-            prefix[static_cast<size_t>(i + 1)] = prefix[static_cast<size_t>(i)] + d * d;
+            return d * d;
+        };
+        double sum = 0.0;
+        for (int64_t i = 0; i < std::min<int64_t>(half_w, m); i++) {
+            const double v = sq(i);
+            ring[static_cast<size_t>(i) % w] = v;
+            sum += v;
         }
         for (int64_t i = 0; i < m; i++) {
-            const int64_t lo = std::max<int64_t>(0, i - half_w);
-            const int64_t hi = std::min<int64_t>(m, i + half_w + 1);
-            buf[i] = static_cast<float>(prefix[static_cast<size_t>(hi)] - prefix[static_cast<size_t>(lo)]);
+            // out and in share a ring slot (they are w apart): read out first.
+            const int64_t out = i - half_w - 1;   // leaves the window
+            if (out >= 0) sum -= ring[static_cast<size_t>(out) % w];
+            const int64_t in = i + half_w;        // enters it
+            if (in < m) {
+                const double v = sq(in);
+                ring[static_cast<size_t>(in) % w] = v;
+                sum += v;
+            }
+            buf[i] = static_cast<float>(std::max(0.0, sum));
         }
     };
     if (!computeTTestCore(file, pipeline, eff_first, eff_count, eff_first_sample,

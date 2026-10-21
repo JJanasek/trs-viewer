@@ -78,6 +78,13 @@ job carries on.
     the second group starts. The final result is the same in either order,
     apart from floating-point rounding in the last digits.
 
+!!! note "Memory"
+    A run needs about 32 bytes per sample of the result (four running sums)
+    plus one trace buffer per worker thread (at most 8), and 20 bytes per
+    sample more for 2nd order. Full 33M-sample traces take about 2–3 GB; a
+    *Window Resample* in the pipeline or a smaller sample range cuts that
+    down. The dialog asks before a run that needs more than 2 GB.
+
 !!! warning "The first crossing is only indicative"
     Looking at the curve after every update and stopping when it crosses 4.5
     is repeated testing, which raises the false-positive rate. Treat the first

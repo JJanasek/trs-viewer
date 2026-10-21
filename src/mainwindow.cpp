@@ -5270,21 +5270,23 @@ void MainWindow::onExportNpz() {
 // warning (not worth reporting as an error), otherwise a real failure
 // message from TTestAccumulator::compute().
 // ---------------------------------------------------------------------------
-// The t-test's accumulators dominate its memory: one per worker thread, four
-// doubles per output sample. Asked here, before a run is submitted, because
-// computeTTestCore() may then be running on a worker thread with no way to
-// put a question on screen.
+// Asked here, before a run is submitted, because computeTTestCore() may then
+// be running on a worker thread with no way to put a question on screen.
+// See estimateTTestBytes() for what is counted.
 static bool confirmTTestMemory(QWidget* parent,
                                 const std::vector<std::shared_ptr<ITransform>>& pipeline,
-                                int64_t raw_ns, int n_threads)
+                                int64_t raw_ns, int n_threads, int order = 1)
 {
     int64_t effective = raw_ns;
     for (const auto& t : pipeline) effective = t->transformedCount(effective);
-    const int64_t bytes = effective * 4LL * static_cast<int64_t>(sizeof(double)) * n_threads;
+    const int64_t bytes = estimateTTestBytes(raw_ns, effective, order, n_threads);
     if (bytes <= 2LL * 1024 * 1024 * 1024) return true;
     return QMessageBox::warning(parent, "Memory warning",
-        QString("Accumulators will require ~%1 GB across %2 worker thread(s).\nContinue?")
-            .arg(double(bytes) / (1024.0*1024*1024), 0, 'f', 1).arg(n_threads),
+        QString("The t-test will need ~%1 GB of memory (%2 samples per trace).\n"
+                "A smaller sample range or a resampling stage in the pipeline "
+                "needs less.\nContinue?")
+            .arg(double(bytes) / (1024.0*1024*1024), 0, 'f', 1)
+            .arg(QLocale().toString(static_cast<qlonglong>(effective))),
         QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes;
 }
 
@@ -5926,7 +5928,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
         int64_t longest = 0;
         for (const auto& p : pats) longest = std::max(longest, p.def.raw_end - p.def.raw_start);
-        if (!confirmTTestMemory(this, job_pipeline, longest, jobs_->plannedThreadBudget()))
+        if (!confirmTTestMemory(this, job_pipeline, longest, jobs_->plannedThreadBudget(), topt.order))
             return;
         const bool abs_value = chk_abs->isChecked();
 
@@ -6032,9 +6034,9 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         ? (h.num_samples - eff_first_sample)
         : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
     const bool want_live = chk_live->isChecked();
-    // Live snapshots are computed straight from the per-thread accumulators
-    // (TTestAccumulator::computeMerged), so a live run needs no extra one.
-    if (!confirmTTestMemory(this, job_pipeline, prompt_ns, jobs_->plannedThreadBudget()))
+    // Live snapshots are computed straight from the run's accumulator, so a
+    // live run needs no extra memory.
+    if (!confirmTTestMemory(this, job_pipeline, prompt_ns, jobs_->plannedThreadBudget(), topt.order))
         return;
 
     struct TTestOut {
@@ -11107,7 +11109,7 @@ bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, Q
 #else
     const int prompt_threads = 1;
 #endif
-    if (!confirmTTestMemory(msg_parent, activeDs().pipeline, prompt_ns, prompt_threads)) {
+    if (!confirmTTestMemory(msg_parent, activeDs().pipeline, prompt_ns, prompt_threads, topt.order)) {
         err = "Cancelled.";
         return false;
     }

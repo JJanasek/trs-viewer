@@ -58,6 +58,39 @@ void TTestAccumulator::addTrace(int group, const float* samples, int32_t count) 
     N_[group]++;
 }
 
+void TTestAccumulator::addTraces(const int* groups, const float* const* bufs,
+                                 const int32_t* counts, int n, int threads) {
+    int32_t width = 0;
+    for (int k = 0; k < n; k++) {
+        if (groups[k] < 0 || groups[k] > 1) continue;
+        width = std::max(width, std::min(counts[k], num_samples_));
+    }
+    // Slices of at least 16K samples; tiny traces stay on one thread.
+    constexpr int32_t kMinSlice = 1 << 14;
+    const int32_t n_slices = static_cast<int32_t>(std::clamp<int64_t>(
+        width / kMinSlice, 1, std::max(1, threads)));
+    #pragma omp parallel for schedule(static) num_threads(n_slices) if(n_slices > 1)
+    for (int32_t sl = 0; sl < n_slices; sl++) {
+        const int32_t lo = static_cast<int32_t>(static_cast<int64_t>(width) * sl / n_slices);
+        const int32_t hi = static_cast<int32_t>(static_cast<int64_t>(width) * (sl + 1) / n_slices);
+        for (int k = 0; k < n; k++) {
+            const int g = groups[k];
+            if (g < 0 || g > 1) continue;
+            const int32_t end = std::min({hi, counts[k], num_samples_});
+            const float* x = bufs[k];
+            double* s  = sum_[g].data();
+            double* s2 = sum2_[g].data();
+            for (int32_t i = lo; i < end; i++) {
+                const double v = static_cast<double>(x[i]);
+                s[i]  += v;
+                s2[i] += v * v;
+            }
+        }
+    }
+    for (int k = 0; k < n; k++)
+        if (groups[k] == 0 || groups[k] == 1) N_[groups[k]]++;
+}
+
 void TTestAccumulator::mergeFrom(const TTestAccumulator& other) {
     for (int g = 0; g < 2; g++) {
         for (int32_t i = 0; i < num_samples_; i++) {
@@ -98,7 +131,7 @@ int64_t TTestAccumulator::countGroup(int g) const {
     return (g == 0 || g == 1) ? N_[g] : 0;
 }
 
-bool TTestAccumulator::compute(std::vector<float>& out, std::string& error) const {
+bool TTestAccumulator::compute(std::vector<float>& out, std::string& error, int threads) const {
     if (N_[0] < 2 || N_[1] < 2) {
         error = notEnoughTraces(N_[0], N_[1]);
         return false;
@@ -106,6 +139,8 @@ bool TTestAccumulator::compute(std::vector<float>& out, std::string& error) cons
     out.resize(num_samples_);
     const double n0 = static_cast<double>(N_[0]);
     const double n1 = static_cast<double>(N_[1]);
+    (void)threads;
+    #pragma omp parallel for schedule(static) num_threads(std::max(1, threads)) if(threads > 1 && num_samples_ > (1 << 16))
     for (int32_t s = 0; s < num_samples_; s++)
         out[s] = welchT(sum_[0][s], sum2_[0][s], sum_[1][s], sum2_[1][s], n0, n1);
     return true;
