@@ -75,6 +75,19 @@ struct TTestHooks {
     std::function<void(int group, float* buf, int64_t n)> post;
 };
 
+// Reads raw samples [first_sample, first_sample + raw_ns) of trace src_idx,
+// moved by its shift (shifts empty = none; looked up at src_idx −
+// shifts_first_trace), zero outside [read_lo, read_hi), and runs `pipeline`
+// over them in buf (grown to raw_ns if needed). n_out: processed length.
+// `pipeline` must belong to the calling thread (transforms keep state).
+enum class TraceLoad { Ok, Skipped /* read failed */, Discarded /* no usable shift */ };
+TraceLoad loadProcessedTrace(TrsFile* file,
+                             const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                             int32_t src_idx, int64_t first_sample, int64_t raw_ns,
+                             const std::vector<int32_t>& shifts, int32_t shifts_first_trace,
+                             int64_t read_lo, int64_t read_hi,
+                             std::vector<float>& buf, int64_t& n_out);
+
 // shifts empty => no alignment; shift == kAlignDiscardShift excludes that
 // trace. Returns false on failure: err == "Cancelled." for a user cancel,
 // otherwise a real failure message from TTestAccumulator::compute().
@@ -119,6 +132,10 @@ struct TTestOptions {
     // leakage here; if it does, the preprocessing created it.
     bool    sanity_split = false;
 };
+
+// The random-split sanity check's group map: group-0 traces split into two
+// halves by a seeded hash of the trace index; group-1 traces left out (-1).
+int sanitySplitGroup(int group, int32_t trace);
 
 // Runs computeTTestCore according to `opt`. For order 2, `first_order_out`
 // (optional) receives the pass-1 first-order curve. `live` applies to the

@@ -4,6 +4,7 @@
 #include "heatmap_widget.h"
 #include "ttest.h"
 #include "ttest_run.h"
+#include "ttest_bivariate.h"
 #include "pattern_align.h"
 #include "theme.h"
 #include "figure_dialog.h"
@@ -4259,34 +4260,24 @@ static QWidget* makeHeatmapNavRow(HeatmapWidget* heatmap, int32_t rows, int32_t 
     return row;
 }
 
-void MainWindow::onLoadNpyHeatmap() {
-    QString path = QFileDialog::getOpenFileName(
-        this, "Load heatmap NPY", recentDir("npy"), "NumPy files (*.npy);;All files (*)");
-    if (path.isEmpty()) return;
-    updateRecentDir("npy", path);
+// A matrix in the heatmap window (colour, tone, navigate, annotate panel,
+// PNG / .npy export). Used by Load heatmap NPY and the bivariate t-test.
+struct MatrixWindowOptions {
+    QString title;
+    std::function<QString(int row, int col, float v)> hover;
+    float threshold = 0.0f;   // > 0: preset the binary-threshold level (off until ticked)
+};
 
-    std::vector<float> data;
-    std::vector<int64_t> shape;
-    QString err;
-    if (!loadNpy(path, data, shape, err)) {
-        QMessageBox::critical(this, "Load failed", err); return;
-    }
-    if (shape.size() != 2 || shape[0] != shape[1]) {
-        QMessageBox::critical(this, "Load failed",
-            shape.size() != 2
-                ? QString("Expected a 2-D array, got %1-D.").arg(shape.size())
-                : QString("Expected a square matrix, got %1×%2.").arg(shape[0]).arg(shape[1]));
-        return;
-    }
-    int32_t M = static_cast<int32_t>(shape[0]);
-
-    auto* dlg = new QDialog(this);
+static void showMatrixWindow(QWidget* parent, std::vector<float> data, int32_t rows, int32_t cols,
+                             const MatrixWindowOptions& opt)
+{
+    auto* dlg = new QDialog(parent);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
-    dlg->setWindowTitle(QString("Heatmap  M=%1 — %2").arg(M).arg(QFileInfo(path).fileName()));
+    dlg->setWindowTitle(opt.title);
     dlg->resize(820, 760);
 
     auto* heatmap = new HeatmapWidget(dlg);
-    heatmap->setMatrix(data, M);
+    heatmap->setMatrix(data, rows, cols);
 
     auto* lbl_hover = new QLabel("Hover over matrix to inspect values");
     lbl_hover->setTextInteractionFlags(Qt::TextSelectableByMouse);
@@ -4307,24 +4298,22 @@ void MainWindow::onLoadNpyHeatmap() {
         heatmap->setColorRange(-abs_max, abs_max);
     }
 
-    connect(sp_vmin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
+    QObject::connect(sp_vmin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
         heatmap->setColorRange(static_cast<float>(v), static_cast<float>(sp_vmax->value()));
     });
-    connect(sp_vmax, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
+    QObject::connect(sp_vmax, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
         heatmap->setColorRange(static_cast<float>(sp_vmin->value()), static_cast<float>(v));
     });
 
-    connect(heatmap, &HeatmapWidget::hoverInfo, dlg, [lbl_hover](int s1, int s2, float val) {
-        lbl_hover->setText(
-            QString("C[%1, %2] = %3").arg(s1).arg(s2)
-                .arg(static_cast<double>(val), 0, 'g', 6));
+    QObject::connect(heatmap, &HeatmapWidget::hoverInfo, dlg, [lbl_hover, hover = opt.hover](int s1, int s2, float val) {
+        lbl_hover->setText(hover(s1, s2, val));
     });
 
     // Processing controls
     auto* lbl_scheme  = new QLabel("Color scheme:");
     auto* combo_scheme = new QComboBox;
     combo_scheme->addItems({"RdBu", "Grayscale", "Hot", "Viridis", "Plasma"});
-    connect(combo_scheme, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int idx) {
+    QObject::connect(combo_scheme, QOverload<int>::of(&QComboBox::currentIndexChanged), [=](int idx) {
         heatmap->setColorScheme(static_cast<ColorScheme>(idx));
     });
 
@@ -4332,7 +4321,7 @@ void MainWindow::onLoadNpyHeatmap() {
     auto* sp_sigma    = new QDoubleSpinBox;
     sp_sigma->setRange(0.0, 50.0); sp_sigma->setDecimals(1); sp_sigma->setSingleStep(0.5);
     sp_sigma->setValue(0.0); sp_sigma->setSpecialValueText("off");
-    connect(sp_sigma, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
+    QObject::connect(sp_sigma, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
         heatmap->setGaussianSigma(static_cast<float>(v));
     });
 
@@ -4341,11 +4330,11 @@ void MainWindow::onLoadNpyHeatmap() {
     // A magnitude map wants a sequential colormap, a signed one a diverging
     // one: follow Abs value between RdBu (0) and Viridis (3) unless the user
     // picked something else.
-    connect(chk_abs, &QCheckBox::toggled, combo_scheme, [combo_scheme](bool on) {
+    QObject::connect(chk_abs, &QCheckBox::toggled, combo_scheme, [combo_scheme](bool on) {
         if (on && combo_scheme->currentIndex() == 0)       combo_scheme->setCurrentIndex(3);
         else if (!on && combo_scheme->currentIndex() == 3) combo_scheme->setCurrentIndex(0);
     });
-    connect(chk_abs, &QCheckBox::toggled, [=](bool on) {
+    QObject::connect(chk_abs, &QCheckBox::toggled, [=](bool on) {
         heatmap->setAbsValue(on);
         // Abs collapses all values to [0, vmax] — snap vmin to 0 so the
         // colour range is correct; restore symmetric range when unchecked.
@@ -4364,26 +4353,26 @@ void MainWindow::onLoadNpyHeatmap() {
     // min=1.0 so setSpecialValueText shows "off" at the off-state (gamma=1)
     sp_gamma->setRange(1.0, 10.0); sp_gamma->setDecimals(2); sp_gamma->setSingleStep(0.1);
     sp_gamma->setValue(1.0); sp_gamma->setSpecialValueText("off");
-    connect(sp_gamma, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
+    QObject::connect(sp_gamma, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
         heatmap->setPowerGamma(static_cast<float>(v));
     });
 
     auto* chk_thresh  = new QCheckBox("Binary threshold |v|≥");
     auto* sp_thresh   = new QDoubleSpinBox;
     sp_thresh->setRange(0.0, 1e9); sp_thresh->setDecimals(4);
-    sp_thresh->setSingleStep(0.05); sp_thresh->setValue(0.5);
+    sp_thresh->setSingleStep(0.05); sp_thresh->setValue(opt.threshold > 0.0f ? opt.threshold : 0.5);
     sp_thresh->setEnabled(false);
-    connect(chk_thresh, &QCheckBox::toggled, [=](bool on) {
+    QObject::connect(chk_thresh, &QCheckBox::toggled, [=](bool on) {
         sp_thresh->setEnabled(on);
         heatmap->setBinaryThreshold(on, static_cast<float>(sp_thresh->value()));
     });
-    connect(sp_thresh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
+    QObject::connect(sp_thresh, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [=](double v) {
         if (chk_thresh->isChecked())
             heatmap->setBinaryThreshold(true, static_cast<float>(v));
     });
 
     auto* btn_reset_view = new QPushButton("Reset View");
-    connect(btn_reset_view, &QPushButton::clicked, heatmap, &HeatmapWidget::resetView);
+    QObject::connect(btn_reset_view, &QPushButton::clicked, heatmap, &HeatmapWidget::resetView);
 
     QDoubleSpinBox* sp_clip_pct = nullptr;
     auto* btn_autoclip = makeAutoClipRow(heatmap, sp_vmin, sp_vmax, &sp_clip_pct);
@@ -4392,7 +4381,7 @@ void MainWindow::onLoadNpyHeatmap() {
     auto data_ptr = std::make_shared<std::vector<float>>(std::move(data));
 
     auto* btn_exp_png = new QPushButton("Export PNG…");
-    connect(btn_exp_png, &QPushButton::clicked, dlg, [=]() {
+    QObject::connect(btn_exp_png, &QPushButton::clicked, dlg, [=]() {
         QString p = QFileDialog::getSaveFileName(dlg, "Export as PNG", MainWindow::recentDir("export"), "PNG images (*.png)");
         if (p.isEmpty()) return;
         MainWindow::updateRecentDir("export", p);
@@ -4403,7 +4392,7 @@ void MainWindow::onLoadNpyHeatmap() {
     });
 
     auto* btn_exp_npy = new QPushButton("Export .npy…");
-    connect(btn_exp_npy, &QPushButton::clicked, dlg, [=]() {
+    QObject::connect(btn_exp_npy, &QPushButton::clicked, dlg, [=]() {
         QString p = QFileDialog::getSaveFileName(dlg, "Export as NumPy", MainWindow::recentDir("npy"), "NumPy files (*.npy)");
         if (p.isEmpty()) return;
         MainWindow::updateRecentDir("npy", p);
@@ -4412,7 +4401,7 @@ void MainWindow::onLoadNpyHeatmap() {
         const uint8_t magic[] = {0x93,'N','U','M','P','Y',0x01,0x00};
         std::fwrite(magic, 1, 8, fp);
         std::string dict = "{'descr': '<f4', 'fortran_order': False, 'shape': (" +
-                           std::to_string(M) + ", " + std::to_string(M) + "), }";
+                           std::to_string(rows) + ", " + std::to_string(cols) + "), }";
         size_t content_len = dict.size() + 1;
         size_t header_len  = ((content_len + 10 + 63) / 64) * 64 - 10;
         dict.resize(header_len - 1, ' '); dict += '\n';
@@ -4421,7 +4410,7 @@ void MainWindow::onLoadNpyHeatmap() {
         std::fwrite(hl_b, 1, 2, fp);
         std::fwrite(dict.c_str(), 1, dict.size(), fp);
         std::fwrite(data_ptr->data(), sizeof(float),
-                    static_cast<size_t>(M) * static_cast<size_t>(M), fp);
+                    static_cast<size_t>(rows) * static_cast<size_t>(cols), fp);
         std::fclose(fp);
         QMessageBox::information(dlg, "Saved", "Saved: " + p);
     });
@@ -4442,10 +4431,39 @@ void MainWindow::onLoadNpyHeatmap() {
         panelSection("Colour", makeHeatmapColourSection(combo_scheme, sp_vmin, sp_vmax, btn_autoclip,
                                                         chk_abs, sp_sigma, sp_gamma, chk_thresh, sp_thresh)),
         panelSection("Tone", tone_row),
-        panelSection("Navigate", makeHeatmapNavRow(heatmap, M, M, dlg)),
-        panelSection("Annotate", makeHeatmapAnnotateRow(heatmap, M, M, dlg)),
+        panelSection("Navigate", makeHeatmapNavRow(heatmap, rows, cols, dlg)),
+        panelSection("Annotate", makeHeatmapAnnotateRow(heatmap, rows, cols, dlg)),
     });
     dlg->show();
+}
+
+void MainWindow::onLoadNpyHeatmap() {
+    QString path = QFileDialog::getOpenFileName(
+        this, "Load heatmap NPY", recentDir("npy"), "NumPy files (*.npy);;All files (*)");
+    if (path.isEmpty()) return;
+    updateRecentDir("npy", path);
+
+    std::vector<float> data;
+    std::vector<int64_t> shape;
+    QString err;
+    if (!loadNpy(path, data, shape, err)) {
+        QMessageBox::critical(this, "Load failed", err); return;
+    }
+    if (shape.size() != 2 || shape[0] != shape[1]) {
+        QMessageBox::critical(this, "Load failed",
+            shape.size() != 2
+                ? QString("Expected a 2-D array, got %1-D.").arg(shape.size())
+                : QString("Expected a square matrix, got %1×%2.").arg(shape[0]).arg(shape[1]));
+        return;
+    }
+    const int32_t M = static_cast<int32_t>(shape[0]);
+
+    MatrixWindowOptions opt;
+    opt.title = QString("Heatmap  M=%1 — %2").arg(M).arg(QFileInfo(path).fileName());
+    opt.hover = [](int s1, int s2, float val) {
+        return QString("C[%1, %2] = %3").arg(s1).arg(s2).arg(static_cast<double>(val), 0, 'g', 6);
+    };
+    showMatrixWindow(this, std::move(data), M, M, opt);
 }
 
 // ---------------------------------------------------------------------------
@@ -5612,6 +5630,49 @@ void MainWindow::showPatternTTestResult(const std::vector<Pattern>& pats,
     }
 }
 
+// Bivariate t-test result: the A × B map of t-values in the heatmap window.
+// Hovering shows the raw sample positions of the pair.
+void MainWindow::showBivariateResult(const BivariateResult& r, const BivariateWindow& a,
+                                     const BivariateWindow& b,
+                                     const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                                     const QString& file_name, bool sanity)
+{
+    // Raw start of each processed sample, per window.
+    auto rawPositions = [&](const BivariateWindow& w, int32_t n) {
+        std::vector<int64_t> pos(static_cast<size_t>(n));
+        for (int32_t i = 0; i < n; i++)
+            pos[static_cast<size_t>(i)] = w.raw_start + rawStartForProcessedIndex(pipeline, i, w.raw_len);
+        return pos;
+    };
+    auto pos_a = std::make_shared<std::vector<int64_t>>(rawPositions(a, r.rows));
+    auto pos_b = std::make_shared<std::vector<int64_t>>(rawPositions(b, r.cols));
+    const QLocale loc;
+    auto at = [loc](const std::vector<int64_t>& p, int i) {
+        return (i >= 0 && i < static_cast<int>(p.size()))
+            ? loc.toString(static_cast<qlonglong>(p[static_cast<size_t>(i)])) : QString("?");
+    };
+
+    MatrixWindowOptions opt;
+    opt.title = QString("Bivariate t-test%1 — %2 × %3 — %4  (G0:%5  G1:%6)  max |t| %7 at %8 × %9, "
+                        "%10 over 4.5")
+        .arg(sanity ? QString(" · SANITY SPLIT") : QString())
+        .arg(a.name, b.name, file_name)
+        .arg(r.n0).arg(r.n1)
+        .arg(static_cast<double>(r.max_abs), 0, 'f', 2)
+        .arg(at(*pos_a, r.max_row), at(*pos_b, r.max_col))
+        .arg(r.n_exceed == 1 ? QString("1 pair")
+                             : QString("%1 pairs").arg(loc.toString(static_cast<qlonglong>(r.n_exceed))));
+    const QString na = a.name, nb = b.name;
+    opt.hover = [pos_a, pos_b, at, na, nb](int row, int col, float v) {
+        if (row < 0 || col < 0) return QString("Hover over the map: rows = %1, columns = %2").arg(na, nb);
+        return QString("%1 sample %2  ×  %3 sample %4    t = %5")
+            .arg(na, at(*pos_a, row), nb, at(*pos_b, col))
+            .arg(static_cast<double>(v), 0, 'f', 2);
+    };
+    opt.threshold = 4.5f;
+    showMatrixWindow(this, r.t, r.rows, r.cols, opt);
+}
+
 void MainWindow::onRunTTest() {
     showTTestDialog(nullptr);
 }
@@ -5790,10 +5851,14 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     auto* fl_order  = new QFormLayout(grp_order);
     auto* cmb_order = mem.bind(new QComboBox, "order");
     cmb_order->addItems({"1st order — compare means",
-                         "2nd order — compare variances (masked implementations)"});
-    cmb_order->setToolTip("2nd order tests y = (x − group mean)² in a second pass, which "
-                          "detects leakage that first-order masking hides. Needs good "
-                          "alignment — or a jitter window.");
+                         "2nd order, univariate — each sample with itself",
+                         "2nd order, bivariate — pairs of samples at different times (A × B)"});
+    cmb_order->setToolTip("2nd order, univariate: tests y = (x − group mean)², for masking "
+                          "whose shares are handled at the same time (hardware).\n"
+                          "2nd order, bivariate: tests y = (x_a − mean)·(x_b − mean) for every "
+                          "pair of samples a in window A and b in window B, for shares handled "
+                          "at different times (software masking). The result is an A × B map.\n"
+                          "Both need good alignment.");
     auto* sp_win = mem.bind(new QSpinBox, "integrate");
     sp_win->setRange(1, 100001);
     sp_win->setSingleStep(2);
@@ -5820,6 +5885,93 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     connect(cmb_order, QOverload<int>::of(&QComboBox::currentIndexChanged), &cfg, syncOrder);
     syncOrder(0);
     fl->addRow(grp_order);
+
+    // Bivariate: the two windows whose sample pairs are tested. Each is an
+    // aligned pattern (tested with its own shifts) or a raw sample range
+    // (with the last alignment's shifts, if applied).
+    struct PairWindow { QComboBox* src; QSpinBox* start; QSpinBox* len; };
+    auto* grp_pairs = new QGroupBox("Sample pairs (A × B)");
+    auto* fl_pairs  = new QFormLayout(grp_pairs);
+    auto makePairWindow = [&](const QString& label) {
+        PairWindow w;
+        w.src   = new QComboBox;
+        w.start = new QSpinBox;
+        w.len   = new QSpinBox;
+        w.src->addItem("Sample range", -1);
+        for (int i : aligned_patterns)
+            w.src->addItem(QString("Pattern %1").arg(QString::fromStdString(
+                               activeDs().patterns[static_cast<size_t>(i)].def.name)), i);
+        w.start->setRange(0, static_cast<int>(std::min<int64_t>(h.num_samples - 1, INT_MAX)));
+        w.len->setRange(1, static_cast<int>(std::min<int64_t>(h.num_samples, INT_MAX)));
+        w.start->setToolTip("First raw sample of the window.");
+        w.len->setToolTip("Length in raw samples. The pipeline (e.g. a Window Resample) "
+                          "shortens it before the pairs are formed.");
+        auto* row = widgetRow({w.src, new QLabel("from"), w.start, new QLabel("length"), w.len});
+        fl_pairs->addRow(label, row);
+        auto sync = [w, this](int) {
+            const int pi = w.src->currentData().toInt();
+            w.start->setEnabled(pi < 0);
+            w.len->setEnabled(pi < 0);
+            if (pi >= 0 && hasActiveDs() && pi < static_cast<int>(activeDs().patterns.size())) {
+                const auto& d = activeDs().patterns[static_cast<size_t>(pi)].def;
+                w.start->setValue(static_cast<int>(d.raw_start));
+                w.len->setValue(static_cast<int>(d.raw_end - d.raw_start));
+            }
+        };
+        connect(w.src, QOverload<int>::of(&QComboBox::currentIndexChanged), &cfg, sync);
+        return w;
+    };
+    const PairWindow win_a = makePairWindow("Window A:");
+    const PairWindow win_b = makePairWindow("Window B:");
+    auto* lbl_pairs = new QLabel;
+    lbl_pairs->setWordWrap(true);
+    fl_pairs->addRow(lbl_pairs);
+    grp_pairs->setToolTip("Every sample of A is paired with every sample of B, so keep the "
+                          "windows short: a pattern on a resampled pipeline, or a few thousand "
+                          "samples. A = B gives the symmetric map of all pairs inside one window.");
+    {
+        // Defaults: the first two aligned patterns, else the visible range.
+        const PlotWidget* pw = activeDs().plot_widget;
+        const int64_t v0 = pw ? std::clamp<int64_t>(pw->viewStart(), 0, h.num_samples - 1) : 0;
+        const int64_t v1 = pw ? std::clamp<int64_t>(pw->viewEnd(), v0 + 1, h.num_samples) : h.num_samples;
+        for (const PairWindow& w : {win_a, win_b}) {
+            w.start->setValue(static_cast<int>(v0));
+            w.len->setValue(static_cast<int>(std::min<int64_t>(v1 - v0, INT_MAX)));
+        }
+        if (!aligned_patterns.empty()) win_a.src->setCurrentIndex(1);
+        if (aligned_patterns.size() >= 2) win_b.src->setCurrentIndex(2);
+        else if (!aligned_patterns.empty()) win_b.src->setCurrentIndex(1);
+    }
+    auto pairShape = [=, this](int64_t& rows, int64_t& cols) {
+        rows = processedLength(activeDs().pipeline, win_a.len->value());
+        cols = processedLength(activeDs().pipeline, win_b.len->value());
+    };
+    auto updatePairs = [=, this]() {
+        int64_t rows = 0, cols = 0;
+        pairShape(rows, cols);
+        const int64_t pairs = rows * cols;
+        const QLocale loc;
+        if (pairs > kBivariateMaxPairs) {
+            lbl_pairs->setStyleSheet(themeErrorStyle());
+            lbl_pairs->setText(QString("%1 × %2 = %3 pairs after the pipeline — too many "
+                                       "(at most %4). Shorten the windows or resample.")
+                .arg(loc.toString(static_cast<qlonglong>(rows)), loc.toString(static_cast<qlonglong>(cols)),
+                     loc.toString(static_cast<qlonglong>(pairs)),
+                     loc.toString(static_cast<qlonglong>(kBivariateMaxPairs))));
+        } else {
+            lbl_pairs->setStyleSheet(QString());
+            lbl_pairs->setText(QString("%1 × %2 = %3 pairs after the pipeline, ~%4 MB.")
+                .arg(loc.toString(static_cast<qlonglong>(rows)), loc.toString(static_cast<qlonglong>(cols)),
+                     loc.toString(static_cast<qlonglong>(pairs)))
+                .arg(estimateBivariateBytes(rows, cols, jobs_->plannedThreadBudget()) / (1024 * 1024)));
+        }
+    };
+    for (const PairWindow& w : {win_a, win_b}) {
+        connect(w.len, QOverload<int>::of(&QSpinBox::valueChanged), &cfg, updatePairs);
+        connect(w.src, QOverload<int>::of(&QComboBox::currentIndexChanged), &cfg, updatePairs);
+    }
+    updatePairs();
+    fl->addRow(grp_pairs);
 
     // Live progress: intermediate t-curves while the job runs (ttest_run.h).
     auto* grp_live = new QGroupBox("Live progress");
@@ -5866,12 +6018,34 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         fl->addRow(chk_add_chain);
     }
 
+    // Bivariate runs use the A × B windows instead of the sample range and
+    // patterns list, and have no live view or chain step (yet).
+    auto syncBivariate = [=, &cfg](int idx) {
+        const bool bi = idx == 2;
+        grp_pairs->setVisible(bi);
+        if (grp_pat) grp_pat->setEnabled(!bi);
+        const bool pat_mode = grp_pat && grp_pat->isEnabled() && grp_pat->isChecked();
+        sp_s_first->setEnabled(!bi && !pat_mode);
+        sp_s_count->setEnabled(!bi && !pat_mode);
+        grp_align->setEnabled(!pat_mode);
+        grp_live->setEnabled(!bi && !pat_mode);
+        if (chk_add_chain) {
+            chk_add_chain->setEnabled(!bi);
+            chk_add_chain->setToolTip(bi ? "Bivariate runs can't be added to a chain yet." : QString());
+        }
+        cfg.adjustSize();
+    };
+    connect(cmb_order, QOverload<int>::of(&QComboBox::currentIndexChanged), &cfg, syncBivariate);
+    if (grp_pat)
+        connect(grp_pat, &QGroupBox::toggled, &cfg, [=]() { syncBivariate(cmb_order->currentIndex()); });
+
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     cfg_bb->button(QDialogButtonBox::Ok)->setText("Run t-test");
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
     mem.restore();
+    syncBivariate(cmb_order->currentIndex());
     if (cfg.exec() != QDialog::Accepted) return;
     mem.save();
 
@@ -5897,6 +6071,82 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         c.setAlpha(150);
         plotWidget()->addTrace(std::make_shared<std::vector<float>>(t1), c, "1st order");
     };
+
+    // ---- Bivariate run: every pair (a in A, b in B) ----
+    if (cmb_order->currentIndex() == 2) {
+        int64_t rows = 0, cols = 0;
+        pairShape(rows, cols);
+        if (rows * cols > kBivariateMaxPairs) {
+            QMessageBox::warning(this, "T-test", lbl_pairs->text());
+            return;
+        }
+        const int64_t bytes = estimateBivariateBytes(rows, cols, jobs_->plannedThreadBudget());
+        if (bytes > 2LL * 1024 * 1024 * 1024
+            && QMessageBox::warning(this, "Memory warning",
+                   QString("The bivariate t-test will need ~%1 GB of memory.\nContinue?")
+                       .arg(double(bytes) / (1024.0 * 1024 * 1024), 0, 'f', 1),
+                   QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+            return;
+
+        const int32_t tile_idx = sp_tile ? sp_tile->value() : 0;
+        const ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), tile_idx);
+        auto makeWindow = [&](const PairWindow& w, const QString& tag) {
+            BivariateWindow bw;
+            const int pi = w.src->currentData().toInt();
+            if (pi >= 0) {
+                const Pattern& p = activeDs().patterns[static_cast<size_t>(pi)];
+                bw.name      = QString::fromStdString(p.def.name);
+                bw.raw_start = p.def.raw_start;
+                bw.raw_len   = p.def.raw_end - p.def.raw_start;
+                bw.shifts    = p.res.shifts;
+                bw.shifts_first_trace = p.res.first_trace;
+            } else {
+                bw.name      = tag;
+                bw.raw_start = w.start->value();
+                bw.raw_len   = std::min<int64_t>(w.len->value(), h.num_samples - bw.raw_start);
+                if (chk_shifts->isChecked()) {
+                    bw.shifts = resolved.shifts;
+                    bw.shifts_first_trace = activeDs().align_first_trace;
+                }
+            }
+            return bw;
+        };
+        const BivariateWindow wa = makeWindow(win_a, "A");
+        const BivariateWindow wb = makeWindow(win_b, "B");
+        const int64_t read_lo = ds_tiled && chk_shifts->isChecked() ? resolved.first_sample : 0;
+        const int64_t read_hi = ds_tiled && chk_shifts->isChecked()
+            ? resolved.first_sample + resolved.n_samples : h.num_samples;
+
+        std::shared_ptr<TrsFile> job_file = activeDs().file;
+        std::vector<std::shared_ptr<ITransform>> job_pipeline;
+        for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
+        const bool abs_value = chk_abs->isChecked();
+        const bool sanity    = chk_sanity->isChecked();
+        struct BiOut { BivariateResult r; QString warn, err; };
+        auto out = std::make_shared<BiOut>();
+        const QString fname = activeDs().display_name;
+
+        jobs_->submit(QString("Bivariate t-test — %1 × %2 of %3").arg(wa.name, wb.name, fname),
+            [=](JobContext& ctx) {
+                auto prog = [&](int64_t done, int64_t total) {
+                    ctx.setProgress(done, total);
+                    return !ctx.cancelled();
+                };
+                return computeBivariateTTest(job_file.get(), job_pipeline, first, count, byte_idx,
+                                             wa, wb, read_lo, read_hi, sanity, abs_value, prog,
+                                             out->r, out->warn, out->err);
+            },
+            [=](bool ok) {
+                if (!ok) {
+                    if (!out->err.isEmpty() && out->err != "Cancelled.")
+                        QMessageBox::critical(this, "T-test failed", out->err);
+                    return;
+                }
+                if (!out->warn.isEmpty()) QMessageBox::warning(this, "T-test", out->warn);
+                showBivariateResult(out->r, wa, wb, job_pipeline, fname, sanity);
+            });
+        return;
+    }
 
     // ---- Pattern run: each selected pattern on the raw traces, own shifts ----
     if (grp_pat && grp_pat->isChecked()) {

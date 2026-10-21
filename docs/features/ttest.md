@@ -11,7 +11,8 @@ The **Test** group in the dialog:
 | Setting | Effect |
 |---|---|
 | **Order: 1st** | Compares the groups' means at each sample (classic TVLA). |
-| **Order: 2nd** | Compares their **variances**, for masked implementations whose first-order leakage is hidden. |
+| **Order: 2nd, univariate** | Compares their **variances** at each sample, for masking whose shares are handled at the same time (hardware). |
+| **Order: 2nd, bivariate** | Combines **two samples at different times** — every pair from window A × window B — for masking whose shares are handled one after the other (software). The result is an A × B map. |
 | **Jitter window** | 2nd order: adds up the centred squares over this many samples, so leftover misalignment smaller than the window still counts. Use about 2–4× the remaining jitter. |
 | **Show the 1st-order curve alongside** | Drawn faded behind a 2nd-order result. For a masked design, expect a flat 1st order and a peaked 2nd order. |
 | **Random-split sanity check** | Uses only group-0 traces, split into two random halves. Nothing should leak; if it does, the alignment or preprocessing created it. |
@@ -30,10 +31,43 @@ Second order is much more sensitive to misalignment than first order. Align
 first. When different parts of the trace need different shifts, use
 [pattern alignment](patterns.md). Live progress shows the second pass.
 
-The test is *univariate*: it finds leakage where the shares are processed at
-the same moment (typical of hardware masking). Software masking that handles
-the shares at different times needs a bivariate test, which is not available
-yet.
+The univariate test finds leakage where the shares are processed at the same
+moment (typical of hardware masking). When they are processed at different
+times, each sample alone looks random in both groups and only a **pair** of
+samples reveals the secret: use the bivariate test.
+
+### Bivariate second order (pairs of samples)
+
+Choose **Order: 2nd order, bivariate** and set **Window A** and **Window B**
+in *Sample pairs (A × B)*. Each window is either a raw **sample range** (with
+the last alignment's shifts, if applied) or an aligned **pattern** (with its
+own shifts). For every pair `(a, b)`, each trace gives
+
+```
+y_ab = (x_a − mean_a of its group) · (x_b − mean_b of its group)
+```
+
+and the Welch t-test runs on `y_ab` (Schneider & Moradi, §4). The group means
+come from a first pass over both windows. Only traces usable in both windows
+(a valid shift in each) take part.
+
+The result opens as a heatmap: rows are window A, columns window B, hovering
+shows the raw sample of each and the t-value. The title gives the largest
+|t|, where it is, and how many pairs exceed 4.5. *Binary threshold* in the
+side panel is preset to 4.5, and *Find hotspots…* lists the strongest pairs.
+With A = B the map is symmetric and its diagonal is the univariate test.
+
+The number of pairs is |A| · |B|, after the pipeline, and is limited to
+16.7 million (4096 × 4096). Typical use: two patterns (e.g. where the mask
+is loaded and where the masked value is used) on a *Window Resample*d
+pipeline. Memory is about 32 bytes per pair plus 4 bytes per pair per worker
+thread; the dialog shows the estimate. Live progress and chain steps are not
+available for bivariate runs yet.
+
+Bivariate tests need many more traces than univariate ones, and each pair is
+a separate test: with a million pairs, expect a few above 4.5 by chance
+(use **Calc TH…**-style reasoning, or the sanity check, before trusting a
+lone hit).
 
 ## Using patterns
 

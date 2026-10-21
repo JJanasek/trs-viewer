@@ -48,6 +48,42 @@ int64_t estimateTTestBytes(int64_t raw_ns, int64_t effective_ns, int order, int 
     return bytes;
 }
 
+TraceLoad loadProcessedTrace(TrsFile* file,
+                             const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                             int32_t src_idx, int64_t first_sample, int64_t raw_ns,
+                             const std::vector<int32_t>& shifts, int32_t shifts_first_trace,
+                             int64_t read_lo, int64_t read_hi,
+                             std::vector<float>& buf, int64_t& n_out)
+{
+    // Looked up by src_idx's position in the *alignment's own* range — the
+    // run may start anywhere (a subset of the aligned traces).
+    int32_t shift = 0;
+    if (!shifts.empty()) {
+        const int64_t shift_idx = static_cast<int64_t>(src_idx) - shifts_first_trace;
+        if (shift_idx < 0 || shift_idx >= static_cast<int64_t>(shifts.size()))
+            return TraceLoad::Discarded;   // outside the alignment's coverage
+        shift = shifts[static_cast<size_t>(shift_idx)];
+        if (shift == kAlignDiscardShift) return TraceLoad::Discarded;
+    }
+    if (static_cast<int64_t>(buf.size()) < raw_ns) buf.resize(static_cast<size_t>(raw_ns));
+    const int64_t adj_start = first_sample + shift;
+    std::fill(buf.begin(), buf.end(), 0.0f);
+    // Clamp to read_lo/read_hi (the whole file untiled, one tile's own
+    // bounds when tiled) rather than [0, num_samples) so a shift can't pull
+    // in a neighboring tile's samples. Out of bounds reads as zero.
+    if (adj_start < read_hi && adj_start + raw_ns > read_lo) {
+        const int64_t src_start = std::max<int64_t>(read_lo, adj_start);
+        const int64_t src_end   = std::min<int64_t>(read_hi, adj_start + raw_ns);
+        const int64_t got = file->readSamples(src_idx, src_start, src_end - src_start,
+                                              buf.data() + (src_start - adj_start));
+        if (got <= 0) return TraceLoad::Skipped;
+    }
+    for (const auto& t : pipeline) t->reset();
+    n_out = raw_ns;
+    for (const auto& t : pipeline) n_out = t->apply(buf.data(), n_out, 0);
+    return TraceLoad::Ok;
+}
+
 bool computeTTestCore(TrsFile* file,
                       const std::vector<std::shared_ptr<ITransform>>& pipeline,
                       int32_t eff_first, int32_t eff_count,
@@ -225,38 +261,14 @@ bool computeTTestCore(TrsFile* file,
                     if (group < 0) continue;   // deliberately left out (e.g. sanity split)
                 }
 
-                // Read window with per-trace shift, zero-pad out of bounds.
-                // Looked up by src_idx's position in the *alignment's own*
-                // range, not by ti — eff_first may start anywhere (a subset of
-                // the aligned traces), so ti==0 does not generally mean
-                // "the first aligned trace".
-                int32_t shift = 0;
-                if (!use_shifts.empty()) {
-                    int64_t shift_idx = static_cast<int64_t>(src_idx) - shifts_first_trace;
-                    if (shift_idx < 0 || shift_idx >= static_cast<int64_t>(use_shifts.size())) {
-                        thread_discarded[tid]++; continue;   // outside the alignment's coverage
-                    }
-                    shift = use_shifts[static_cast<size_t>(shift_idx)];
-                    if (shift == kAlignDiscardShift) { thread_discarded[tid]++; continue; }
-                }
-                const int64_t adj_start = eff_first_sample + shift;
-                std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
-                // Clamp to read_lo/read_hi (the whole file untiled, one tile's
-                // own bounds when tiled) rather than [0, h.num_samples) so a
-                // shift can't pull in a neighboring tile's samples.
-                if (adj_start < read_hi && adj_start + raw_ns > read_lo) {
-                    int64_t src_start = std::max<int64_t>(read_lo, adj_start);
-                    int64_t src_end   = std::min<int64_t>(read_hi, adj_start + raw_ns);
-                    int64_t dst_off   = src_start - adj_start;
-                    int64_t got = file->readSamples(src_idx, src_start, src_end - src_start,
-                                                          trace_buf.data() + dst_off);
-                    if (got <= 0) { thread_skipped[tid]++; continue; }
-                }
-                for (const auto& t : pipeline_local) t->reset();
-                int64_t n_out = raw_ns;
-                for (const auto& t : pipeline_local)
-                    n_out = t->apply(trace_buf.data(), n_out, 0);
+                int64_t n_out = 0;
+                const TraceLoad ld = loadProcessedTrace(file, pipeline_local, src_idx, eff_first_sample,
+                                                        raw_ns, use_shifts, shifts_first_trace,
+                                                        read_lo, read_hi, trace_buf, n_out);
+                if (ld == TraceLoad::Discarded) { thread_discarded[tid]++; continue; }
+                if (ld == TraceLoad::Skipped)   { thread_skipped[tid]++;   continue; }
                 if (hooks && hooks->post) hooks->post(group, trace_buf.data(), n_out);
+                slot_ptrs[static_cast<size_t>(k)]  = trace_buf.data();
                 slot_group[static_cast<size_t>(k)] = group;
                 slot_count[static_cast<size_t>(k)] = static_cast<int32_t>(n_out);
             }
@@ -349,6 +361,11 @@ uint64_t splitmix(uint64_t x) {
 }
 }  // namespace
 
+int sanitySplitGroup(int group, int32_t trace) {
+    if (group != 0) return -1;
+    return static_cast<int>(splitmix(static_cast<uint64_t>(trace) ^ 0x5A17ULL) & 1);
+}
+
 bool computeTTest(TrsFile* file,
                   const std::vector<std::shared_ptr<ITransform>>& pipeline,
                   int32_t eff_first, int32_t eff_count,
@@ -364,10 +381,7 @@ bool computeTTest(TrsFile* file,
 {
     TTestHooks hooks;
     if (opt.sanity_split) {
-        hooks.group_map = [](int group, int32_t trace) {
-            if (group != 0) return -1;
-            return static_cast<int>(splitmix(static_cast<uint64_t>(trace) ^ 0x5A17ULL) & 1);
-        };
+        hooks.group_map = sanitySplitGroup;
     }
 
     if (opt.order <= 1) {

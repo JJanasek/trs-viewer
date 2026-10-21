@@ -64,7 +64,11 @@ each one **on its own**, and keep only the shifts. The t-test then reads the
    dialog shows **Use patterns** with a checklist. The selected patterns are
    tested on the raw traces with their own shifts, and shown side by side in
    one result tab with labelled bands. First or second order: see
-   [Welch t-test](ttest.md#second-order).
+   [Welch t-test](ttest.md#second-order). For software masking, the
+   **bivariate** second order tests every pair of samples between two
+   patterns (e.g. where the mask is loaded and where the masked value is
+   used), each with its own shifts: see
+   [bivariate second order](ttest.md#bivariate-second-order-pairs-of-samples).
 
 **Save Shifts…** / **Load Shifts…** store the patterns and their shifts (see
 [file format](#shift-file-format)). The *Alignment & View* box in the side panel

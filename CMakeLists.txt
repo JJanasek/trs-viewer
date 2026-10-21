@@ -95,6 +95,7 @@ set(SOURCES
     inc/theme.h
     src/ttest.cpp
     src/ttest_run.cpp
+    src/ttest_bivariate.cpp
     inc/ttest_run.h
     src/xcorr.cpp
     src/align.cpp

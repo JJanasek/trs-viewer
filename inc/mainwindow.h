@@ -6,6 +6,7 @@
 #include "ttest.h"
 #include "align.h"
 #include "pattern_align.h"
+#include "ttest_bivariate.h"
 
 #include <QButtonGroup>
 #include <QMenu>
@@ -170,6 +171,12 @@ public:
     // Opens by extension: .npy/.npz as a trace matrix, anything else as TRS.
     void openAnyFile(const QString& path);
 
+    // Last directory used for a kind of file ("npy", "export", …), so file
+    // dialogs reopen where the user was. Public for result windows built by
+    // free functions.
+    static QString recentDir(const QString& key);
+    static void    updateRecentDir(const QString& key, const QString& file_path);
+
 protected:
     // Drop .trs/.npy/.npz files anywhere on the window to open them.
     void dragEnterEvent(QDragEnterEvent* e) override;
@@ -250,8 +257,6 @@ private:
 
     // Shared tail of onAddTransform() — see its definition.
     void addTransformToPipeline(std::shared_ptr<ITransform> tx);
-    static QString recentDir(const QString& key);
-    static void    updateRecentDir(const QString& key, const QString& file_path);
     void saveSnapshot();
     void restoreSnapshot(DatasetSnapshot snap);
     void updateUndoButton();
@@ -401,6 +406,10 @@ private:
                               const QString& title_override = {});
     // Live t-test: a result tab that shows intermediate t-curves and the
     // max|t|-vs-traces history while the job runs. See ttest_run.h.
+    void showBivariateResult(const BivariateResult& r, const BivariateWindow& a,
+                             const BivariateWindow& b,
+                             const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                             const QString& file_name, bool sanity);
     void showPatternTTestResult(const std::vector<Pattern>& pats,
                                 const std::vector<std::shared_ptr<TTestAccumulator>>& accs,
                                 std::vector<std::vector<float>> ts,

@@ -36,6 +36,7 @@ add_library(trs-core-test OBJECT
     ${CMAKE_SOURCE_DIR}/src/snr.cpp
     ${CMAKE_SOURCE_DIR}/src/ttest.cpp
     ${CMAKE_SOURCE_DIR}/src/ttest_run.cpp
+    ${CMAKE_SOURCE_DIR}/src/ttest_bivariate.cpp
     ${CMAKE_SOURCE_DIR}/src/pattern_align.cpp
     ${CMAKE_SOURCE_DIR}/src/cpa.cpp
     ${CMAKE_SOURCE_DIR}/src/xcorr.cpp
@@ -88,6 +89,7 @@ add_trs_test(test_snr)
 add_trs_test(test_ttest)
 add_trs_test(test_ttest_live)
 add_trs_test(test_ttest_order2)
+add_trs_test(test_ttest_bivariate)
 add_trs_test(test_pattern_align)
 add_trs_test(test_trs_file)
 add_trs_test(test_cpa)
