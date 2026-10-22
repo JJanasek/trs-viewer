@@ -78,13 +78,15 @@ QString resolveFontStyle(FigureFont f);      // installed family to use
 bool    fontStyleIsExact(FigureFont f);      // true if the preferred family is installed
 
 struct FigurePreset {
-    QString name;
+    QString group;           // "Paper", "Thesis", "Slides" — a heading in the list
+    QString name;            // what it is for, in plain words
     double  width_cm, height_cm;
     FigureFont font;
     double  font_pt;
     double  line_pt;
     bool    mono;            // black data lines (papers) vs colour (slides)
-    QString note;            // where it fits (shown as a tooltip)
+    QString note;            // where it fits (shown under the list)
+    QString tex_width;       // LaTeX width it equals ("\\textwidth"), or empty
 };
 const std::vector<FigurePreset>& figurePresets();
 

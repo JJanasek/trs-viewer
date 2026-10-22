@@ -29,31 +29,34 @@ const std::vector<FigurePreset>& figurePresets() {
     // plots usually are (≈3:1 full width, ≈2:1 half width). Serif to match
     // the body text in papers and theses, sans for slides; data in black for
     // print, as published SCA figures do.
+    // The order is stored in the settings (the last preset used): append only.
     static const std::vector<FigurePreset> presets = {
-        {"LNCS — full width",          12.2, 4.5, FigureFont::LatexSerif, 8.0, 0.5, true,
-         "Springer LNCS (CARDIS, COSADE, CT-RSA, older CHES): \\textwidth = 12.2 cm"},
-        {"LNCS — half width",           5.9, 3.0, FigureFont::LatexSerif, 7.0, 0.4, true,
-         "Two subfigures side by side in LNCS"},
-        {"TCHES — full width",         13.6, 4.8, FigureFont::LatexSerif, 8.0, 0.5, true,
-         "IACR Transactions (iacrtrans / iacrj): \\textwidth = 13.65 cm"},
-        {"TCHES — half width",          6.6, 3.2, FigureFont::LatexSerif, 7.0, 0.4, true,
-         "Two subfigures side by side in TCHES"},
-        {"IEEE — one column",           8.8, 4.0, FigureFont::Times, 8.0, 0.5, true,
-         "IEEEtran two-column: \\columnwidth = 8.85 cm (3.49 in)"},
-        {"IEEE — two columns",         18.1, 5.0, FigureFont::Times, 8.0, 0.5, true,
-         "IEEEtran figure* across both columns: \\textwidth = 18.1 cm (7.14 in)"},
-        {"Thesis (A4) — full width",   15.0, 5.5, FigureFont::LatexSerif, 9.0, 0.6, true,
-         "Typical A4 thesis text width (KOMA DIV 10–12: 14.7–15.8 cm)"},
-        {"Beamer 16:9 — full width",   14.0, 6.0, FigureFont::Sans, 9.0, 0.8, false,
-         "Beamer aspectratio=169: 16 × 9 cm frame, \\textwidth = 14 cm"},
-        {"Beamer 16:9 — half width",    6.8, 5.0, FigureFont::Sans, 8.0, 0.8, false,
-         "One of two columns on a 16:9 Beamer slide"},
-        {"Beamer 4:3 — full width",    10.8, 5.5, FigureFont::Sans, 9.0, 0.8, false,
-         "Default Beamer: 12.8 × 9.6 cm frame, \\textwidth = 10.8 cm"},
-        {"PowerPoint 16:9 — full",     30.0, 12.0, FigureFont::Sans, 16.0, 1.5, false,
-         "33.9 × 19.1 cm slide; export SVG (or PNG at 300 dpi)"},
-        {"PowerPoint 16:9 — half",     15.0, 10.0, FigureFont::Sans, 16.0, 1.5, false,
-         "One of two columns on a PowerPoint slide"},
+        {"Paper", "Springer conference paper — page width", 12.2, 4.5, FigureFont::LatexSerif, 8.0, 0.5, true,
+         "Springer LNCS format, used by CARDIS, COSADE, CT-RSA and older CHES. "
+         "As wide as the text on the page.", "\\textwidth"},
+        {"Paper", "Springer conference paper — half width", 5.9, 3.0, FigureFont::LatexSerif, 7.0, 0.4, true,
+         "Springer LNCS format: two figures side by side.", ""},
+        {"Paper", "CHES / TCHES paper — page width", 13.6, 4.8, FigureFont::LatexSerif, 8.0, 0.5, true,
+         "IACR Transactions on Cryptographic Hardware (TCHES, where CHES papers appear) "
+         "and other IACR journals. As wide as the text on the page.", "\\textwidth"},
+        {"Paper", "CHES / TCHES paper — half width", 6.6, 3.2, FigureFont::LatexSerif, 7.0, 0.4, true,
+         "TCHES: two figures side by side.", ""},
+        {"Paper", "IEEE paper — one column", 8.8, 4.0, FigureFont::Times, 8.0, 0.5, true,
+         "IEEE two-column papers (conferences and Transactions): one column wide.", "\\columnwidth"},
+        {"Paper", "IEEE paper — across both columns", 18.1, 5.0, FigureFont::Times, 8.0, 0.5, true,
+         "IEEE two-column papers: a figure spanning the whole page width (figure*).", "\\textwidth"},
+        {"Thesis", "Thesis on A4 — page width", 15.0, 5.5, FigureFont::LatexSerif, 9.0, 0.6, true,
+         "Typical text width of an A4 thesis (14.7–15.8 cm).", ""},
+        {"Slides", "LaTeX slides (Beamer) 16:9 — full width", 14.0, 6.0, FigureFont::Sans, 9.0, 0.8, false,
+         "Beamer slides in 16:9 (aspectratio=169).", "\\textwidth"},
+        {"Slides", "LaTeX slides (Beamer) 16:9 — half width", 6.8, 5.0, FigureFont::Sans, 8.0, 0.8, false,
+         "Beamer 16:9: one of two columns.", ""},
+        {"Slides", "LaTeX slides (Beamer) 4:3 — full width", 10.8, 5.5, FigureFont::Sans, 9.0, 0.8, false,
+         "Beamer slides in the default 4:3.", "\\textwidth"},
+        {"Slides", "PowerPoint 16:9 — full width", 30.0, 12.0, FigureFont::Sans, 16.0, 1.5, false,
+         "A PowerPoint or LibreOffice slide. Export as SVG (or PNG at 300 dpi).", ""},
+        {"Slides", "PowerPoint 16:9 — half width", 15.0, 10.0, FigureFont::Sans, 16.0, 1.5, false,
+         "PowerPoint: one of two columns.", ""},
     };
     return presets;
 }
@@ -78,9 +81,9 @@ const QStringList& fontCandidates(FigureFont f) {
 
 QString fontStyleName(FigureFont f) {
     switch (f) {
-    case FigureFont::LatexSerif: return "Serif — LaTeX look";
-    case FigureFont::Times:      return "Times — IEEE / ACM";
-    case FigureFont::Sans:       return "Sans — slides";
+    case FigureFont::LatexSerif: return "Serif — like LaTeX papers";
+    case FigureFont::Times:      return "Times — like IEEE papers and Word";
+    case FigureFont::Sans:       return "Sans — for slides";
     }
     return {};
 }

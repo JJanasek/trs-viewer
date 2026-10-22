@@ -26,6 +26,7 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QStandardItemModel>
 #include <QSvgGenerator>
 #include <QVBoxLayout>
 
@@ -37,7 +38,7 @@ namespace {
 // Everything the dialog remembers between uses (QSettings "figure/…").
 struct FigureSettings {
     int    preset    = 0;          // index into figurePresets(); -1 = custom
-    double width_cm  = 12.2, height_cm = 4.5;   // = the first preset (LNCS full width)
+    double width_cm  = 12.2, height_cm = 4.5;   // = the first preset (Springer, page width)
     int    font      = 0;          // FigureFont
     double font_pt   = 8.0, line_pt = 0.5;
     int    legend    = 0;          // FigureStyle::Legend
@@ -147,12 +148,31 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
     auto* form_w = new QWidget;
     form_w->setMaximumWidth(360);
     auto* fl = new QFormLayout(form_w);
+    // Presets under their group headings (not selectable); item data = the
+    // preset's index, -1 for Custom.
     auto* cmb_preset = new QComboBox;
-    for (const auto& pr : figurePresets()) {
-        cmb_preset->addItem(pr.name);
-        cmb_preset->setItemData(cmb_preset->count() - 1, pr.note, Qt::ToolTipRole);
+    cmb_preset->setToolTip("What the figure is for. Sets the size and fonts so the figure goes "
+                           "into the document without scaling.");
+    {
+        QString group;
+        for (size_t i = 0; i < figurePresets().size(); i++) {
+            const FigurePreset& pr = figurePresets()[i];
+            if (pr.group != group) {
+                group = pr.group;
+                cmb_preset->addItem(group, -2);
+                if (auto* m = qobject_cast<QStandardItemModel*>(cmb_preset->model())) {
+                    QStandardItem* it = m->item(cmb_preset->count() - 1);
+                    it->setFlags(it->flags() & ~(Qt::ItemIsSelectable | Qt::ItemIsEnabled));
+                    QFont f = it->font(); f.setBold(true); it->setFont(f);
+                }
+            }
+            cmb_preset->addItem(pr.name, static_cast<int>(i));
+            cmb_preset->setItemData(cmb_preset->count() - 1, pr.note, Qt::ToolTipRole);
+        }
     }
-    cmb_preset->addItem("Custom");
+    cmb_preset->addItem("Custom size", -1);
+    auto* lbl_preset = new QLabel;
+    lbl_preset->setWordWrap(true);
     auto* sp_w = new QDoubleSpinBox; sp_w->setRange(2, 60); sp_w->setDecimals(1); sp_w->setSuffix(" cm");
     auto* sp_h = new QDoubleSpinBox; sp_h->setRange(1.5, 40); sp_h->setDecimals(1); sp_h->setSuffix(" cm");
     auto* cmb_font = new QComboBox;
@@ -203,7 +223,8 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
     lbl_hint->setWordWrap(true);
     lbl_hint->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
-    fl->addRow("Preset:", cmb_preset);
+    fl->addRow("For:", cmb_preset);
+    fl->addRow("", lbl_preset);
     fl->addRow("Size:", [&]{ auto* w = new QWidget; auto* l = new QHBoxLayout(w);
                              l->setContentsMargins(0,0,0,0); l->addWidget(sp_w);
                              l->addWidget(new QLabel("×")); l->addWidget(sp_h); return w; }());
@@ -251,8 +272,9 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
     bool loading = true;
     auto toUi = [&]() {
         loading = true;
-        cmb_preset->setCurrentIndex(cfg->preset >= 0 && cfg->preset < static_cast<int>(figurePresets().size())
-                                    ? cfg->preset : cmb_preset->count() - 1);
+        const int ci = cmb_preset->findData(cfg->preset >= 0 && cfg->preset < static_cast<int>(figurePresets().size())
+                                            ? cfg->preset : -1);
+        cmb_preset->setCurrentIndex(ci >= 0 ? ci : cmb_preset->count() - 1);
         sp_w->setValue(cfg->width_cm);   sp_h->setValue(cfg->height_cm);
         cmb_font->setCurrentIndex(cfg->font);
         sp_fpt->setValue(cfg->font_pt);  sp_lw->setValue(cfg->line_pt);
@@ -275,12 +297,12 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
         chk_trans->setEnabled(cfg->format != 0);
         // Full-width presets are exactly \textwidth / \columnwidth.
         QString width_tex = QString("%1cm").arg(cfg->width_cm);
-        if (cfg->preset >= 0 && cfg->preset < static_cast<int>(figurePresets().size())) {
-            const QString n = figurePresets()[static_cast<size_t>(cfg->preset)].name;
-            if (n.contains("IEEE — one column")) width_tex = "\\columnwidth";
-            else if (n.contains("full width") && !n.contains("Thesis") && !n.contains("PowerPoint"))
-                width_tex = "\\textwidth";
-        }
+        const bool is_preset = cfg->preset >= 0 && cfg->preset < static_cast<int>(figurePresets().size());
+        if (is_preset && !figurePresets()[static_cast<size_t>(cfg->preset)].tex_width.isEmpty())
+            width_tex = figurePresets()[static_cast<size_t>(cfg->preset)].tex_width;
+        lbl_preset->setText(is_preset
+            ? QString("<small>%1</small>").arg(figurePresets()[static_cast<size_t>(cfg->preset)].note.toHtmlEscaped())
+            : QString("<small>Your own size and fonts.</small>"));
         lbl_hint->setText(QString("<small>LaTeX: <tt>\\includegraphics[width=%1]{figure}</tt><br>"
                                   "Already that wide, so the text stays at %2 pt.</small>")
                               .arg(width_tex).arg(cfg->font_pt));
@@ -325,9 +347,10 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
         loading = false;
         fromUi();
     };
-    QObject::connect(cmb_preset, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [&](int i) {
+    QObject::connect(cmb_preset, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, [&](int ci) {
         if (loading) return;
-        if (i < 0 || i >= static_cast<int>(figurePresets().size())) { cfg->preset = -1; return; }
+        const int i = cmb_preset->itemData(ci).toInt();
+        if (i < 0 || i >= static_cast<int>(figurePresets().size())) { cfg->preset = -1; refresh(); return; }
         const FigurePreset& pr = figurePresets()[static_cast<size_t>(i)];
         cfg->preset = i;
         cfg->width_cm = pr.width_cm; cfg->height_cm = pr.height_cm;

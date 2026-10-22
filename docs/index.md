@@ -27,7 +27,7 @@ analyses over the result — each in its own tab, several files at a time.
 | **[Cross-correlation](features/xcorr.md)** · **[Heatmap](features/heatmap.md)** | Trace similarity matrices, with red-box peak annotations that export with the figure |
 | **[FFT](features/fft.md)** | Averaged spectra over a selected region |
 | **[Narrowband interference](features/interference.md)** | Find and remove carriers, switcher combs and clock harmonics; see which frequencies actually leak |
-| **[Figures](features/figures.md)** | Publication-ready PDF / SVG / PNG of any plot, sized for LNCS, TCHES, IEEE, theses and slides |
+| **[Figures](features/figures.md)** | Publication-ready PDF / SVG / PNG of any plot, sized for papers (Springer, CHES/TCHES, IEEE), theses and slides |
 | **[Export](features/export.md)** · **[Dataset export](features/export-dataset.md)** | TRS, NPY and NPZ out |
 | **[Chain editor](features/chain.md)** | Save a whole workflow and replay it with one click |
 

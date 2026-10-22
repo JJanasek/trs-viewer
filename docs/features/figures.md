@@ -8,22 +8,23 @@ loaded curves) exports through the same renderer. It draws the **visible
 range** as a vector figure at its final printed size, so it can go straight
 into LaTeX without scaling, and its text stays at the size you chose.
 
-## Presets
+## What the figure is for
 
-Widths are the text and column widths of the LaTeX classes; heights give the
-wide, short strips trace plots usually are.
+**For:** picks the size and fonts for where the figure goes, so it fits
+without scaling. The line under the list says what each choice means.
 
-| Preset | Size | Font | Use |
-|---|---|---|---|
-| LNCS — full / half width | 12.2 × 4.5 / 5.9 × 3.0 cm | serif 8 / 7 pt | Springer LNCS: CARDIS, COSADE, CT-RSA |
-| TCHES — full / half width | 13.6 × 4.8 / 6.6 × 3.2 cm | serif 8 / 7 pt | IACR Transactions (`iacrtrans`, `iacrj`) |
-| IEEE — one / two columns | 8.8 × 4.0 / 18.1 × 5.0 cm | Times 8 pt | `IEEEtran` |
-| Thesis (A4) — full width | 15 × 5.5 cm | serif 9 pt | typical A4 thesis |
-| Beamer 16:9 — full / half, Beamer 4:3 | 14 × 6 / 6.8 × 5 / 10.8 × 5.5 cm | sans 9 / 8 pt | slides |
-| PowerPoint 16:9 — full / half | 30 × 12 / 15 × 10 cm | sans 16 pt | slides |
+| For | Size | Font |
+|---|---|---|
+| **Paper** — Springer conference paper (LNCS: CARDIS, COSADE, CT-RSA, older CHES), page / half width | 12.2 × 4.5 / 5.9 × 3.0 cm | serif 8 / 7 pt |
+| **Paper** — CHES / TCHES paper (IACR journals), page / half width | 13.6 × 4.8 / 6.6 × 3.2 cm | serif 8 / 7 pt |
+| **Paper** — IEEE paper, one column / across both columns | 8.8 × 4.0 / 18.1 × 5.0 cm | Times 8 pt |
+| **Thesis** on A4 — page width | 15 × 5.5 cm | serif 9 pt |
+| **Slides** — LaTeX (Beamer) 16:9 full / half, 4:3 full | 14 × 6 / 6.8 × 5 / 10.8 × 5.5 cm | sans 9 / 8 pt |
+| **Slides** — PowerPoint 16:9 full / half | 30 × 12 / 15 × 10 cm | sans 16 pt |
 
-In LaTeX, `\includegraphics[width=\textwidth]{figure.pdf}` (or `\columnwidth`)
-places it at exactly its exported size.
+Changing the size or font by hand switches to **Custom size**. In LaTeX,
+`\includegraphics[width=\textwidth]{figure.pdf}` (or `\columnwidth`; the
+dialog shows which) places it at exactly its exported size.
 
 ## Axis units
 
@@ -54,9 +55,9 @@ The defaults follow how side-channel figures look in published papers:
 - Dense data (millions of samples) is drawn as a min/max envelope at figure
   resolution, so PDFs stay small.
 
-**Fonts**: *Serif — LaTeX look* uses Latin Modern when it is installed (an
-exact match for LaTeX's default font), otherwise a Times-like serif. *Times*
-suits IEEE, and *Sans* suits slides. The dialog shows which font is used.
+**Fonts**: *Serif — like LaTeX papers* uses Latin Modern when it is installed
+(an exact match for LaTeX's default font), otherwise a Times-like serif.
+*Times — like IEEE papers and Word* suits IEEE, and *Sans* suits slides. The dialog shows which font is used.
 
 ## Formats
 
