@@ -406,6 +406,10 @@ private:
                               const QString& title_override = {});
     // Live t-test: a result tab that shows intermediate t-curves and the
     // max|t|-vs-traces history while the job runs. See ttest_run.h.
+    void showLagResult(const LagResult& r, const BivariateWindow& w,
+                       const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                       const std::shared_ptr<TrsFile>& file, const QString& file_name,
+                       int32_t trace_count, bool abs_value, bool sanity);
     void showBivariateResult(const BivariateResult& r, const BivariateWindow& a,
                              const BivariateWindow& b,
                              const std::vector<std::shared_ptr<ITransform>>& pipeline,

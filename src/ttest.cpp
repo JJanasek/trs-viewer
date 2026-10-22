@@ -91,6 +91,36 @@ void TTestAccumulator::addTraces(const int* groups, const float* const* bufs,
         if (groups[k] == 0 || groups[k] == 1) N_[groups[k]]++;
 }
 
+void TTestAccumulator::addGenerated(const int* groups, int n, int threads,
+                                    const std::function<void(int, int32_t, int32_t, float*)>& gen) {
+    // 8K samples: the block's four sums (256 KB) stay in L2 over all n traces.
+    constexpr int32_t kBlock = 1 << 13;
+    const int32_t n_blocks = (num_samples_ + kBlock - 1) / kBlock;
+    #pragma omp parallel num_threads(std::max(1, threads)) if(threads > 1 && n_blocks > 1)
+    {
+        std::vector<float> y(static_cast<size_t>(kBlock));
+        #pragma omp for schedule(dynamic, 4)
+        for (int32_t b = 0; b < n_blocks; b++) {
+            const int32_t lo = b * kBlock;
+            const int32_t hi = std::min(num_samples_, lo + kBlock);
+            for (int k = 0; k < n; k++) {
+                const int g = groups[k];
+                if (g < 0 || g > 1) continue;
+                gen(k, lo, hi, y.data());
+                double* s  = sum_[g].data() + lo;
+                double* s2 = sum2_[g].data() + lo;
+                for (int32_t i = 0; i < hi - lo; i++) {
+                    const double v = static_cast<double>(y[static_cast<size_t>(i)]);
+                    s[i]  += v;
+                    s2[i] += v * v;
+                }
+            }
+        }
+    }
+    for (int k = 0; k < n; k++)
+        if (groups[k] == 0 || groups[k] == 1) N_[groups[k]]++;
+}
+
 void TTestAccumulator::mergeFrom(const TTestAccumulator& other) {
     for (int g = 0; g < 2; g++) {
         for (int32_t i = 0; i < num_samples_; i++) {
@@ -129,6 +159,18 @@ void TTestAccumulator::groupMeans(int g, std::vector<double>& out) const {
 
 int64_t TTestAccumulator::countGroup(int g) const {
     return (g == 0 || g == 1) ? N_[g] : 0;
+}
+
+TTestAccumulator TTestAccumulator::gather(const std::vector<int64_t>& samples) const {
+    TTestAccumulator out(static_cast<int32_t>(samples.size()));
+    out.N_[0] = N_[0];
+    out.N_[1] = N_[1];
+    for (int g = 0; g < 2; g++)
+        for (size_t k = 0; k < samples.size(); k++) {
+            out.sum_[g][k]  = sum_[g][static_cast<size_t>(samples[k])];
+            out.sum2_[g][k] = sum2_[g][static_cast<size_t>(samples[k])];
+        }
+    return out;
 }
 
 bool TTestAccumulator::compute(std::vector<float>& out, std::string& error, int threads) const {

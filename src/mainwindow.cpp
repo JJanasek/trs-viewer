@@ -5673,6 +5673,79 @@ void MainWindow::showBivariateResult(const BivariateResult& r, const BivariateWi
     showMatrixWindow(this, r.t, r.rows, r.cols, opt);
 }
 
+// Fixed-offset bivariate result: a t-test tab over the window with, per
+// sample, the t-value of its strongest offset; with several offsets also the
+// offset × sample map in the heatmap window (pooled to at most 4096 columns,
+// each keeping its strongest value).
+void MainWindow::showLagResult(const LagResult& r, const BivariateWindow& w,
+                               const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                               const std::shared_ptr<TrsFile>& file, const QString& file_name,
+                               int32_t trace_count, bool abs_value, bool sanity)
+{
+    const QLocale loc;
+    const int32_t best_lag = r.max_lag >= 0 ? r.lags[static_cast<size_t>(r.max_lag)] : 0;
+    const QString lag_list = r.lags.size() == 1
+        ? QString("Δ = %1").arg(r.lags.front())
+        : QString("Δ = %1…%2 (%3 offsets)").arg(r.lags.front()).arg(r.lags.back()).arg(r.lags.size());
+    const int64_t raw_max = w.raw_start + (r.max_t >= 0 ? rawStartForProcessedIndex(pipeline, r.max_t, w.raw_len) : 0);
+    const QString title = QString("Bivariate t-test%1 — %2, %3 — %4 traces (G0:%5  G1:%6)%7, "
+                                  "max |t| %8 at Δ %9")
+        .arg(sanity ? QString(" · SANITY SPLIT") : QString())
+        .arg(w.name, lag_list).arg(trace_count).arg(r.n0).arg(r.n1)
+        .arg(abs_value ? QString(" |t|") : QString())
+        .arg(static_cast<double>(r.max_abs), 0, 'f', 2).arg(best_lag);
+    std::vector<double> df;
+    r.best_acc->computeWelchDf(df);
+    buildTTestResultTab(r.best_acc, r.best, r.n0, r.n1, trace_count, abs_value, &df, {}, title);
+    plotWidget()->setAxisLabels(QString("Sample t of %1 (paired with t + Δ, strongest Δ per sample)").arg(w.name),
+                                abs_value ? "|t|-value" : "t-value");
+    if (keepsSamplePositions(pipeline))
+        plotWidget()->setAxisMeta(fileSampleInterval(file->header()), w.raw_start);
+    statusBar()->showMessage(QString("Bivariate t-test (%1): max |t| %2 at sample %3 with Δ %4, %5 over 4.5")
+        .arg(lag_list).arg(static_cast<double>(r.max_abs), 0, 'f', 2)
+        .arg(loc.toString(static_cast<qlonglong>(raw_max))).arg(best_lag)
+        .arg(loc.toString(static_cast<qlonglong>(r.n_exceed))), 15000);
+    if (r.lags.size() < 2) return;
+
+    // Offset × sample map, columns pooled by their strongest value.
+    const int32_t rows = static_cast<int32_t>(r.lags.size());
+    const int32_t pool = std::max<int32_t>(1, (r.len + 4095) / 4096);
+    const int32_t cols = (r.len + pool - 1) / pool;
+    std::vector<float> map(static_cast<size_t>(rows) * static_cast<size_t>(cols), 0.0f);
+    for (int32_t d = 0; d < rows; d++)
+        for (int32_t t = 0; t < r.len; t++) {
+            const float v = r.t[static_cast<size_t>(d) * static_cast<size_t>(r.len) + static_cast<size_t>(t)];
+            float& m = map[static_cast<size_t>(d) * static_cast<size_t>(cols) + static_cast<size_t>(t / pool)];
+            if (std::fabs(v) > std::fabs(m)) m = v;
+        }
+    auto pos = std::make_shared<std::vector<int64_t>>(static_cast<size_t>(r.len));
+    for (int32_t t = 0; t < r.len; t++)
+        (*pos)[static_cast<size_t>(t)] = w.raw_start + rawStartForProcessedIndex(pipeline, t, w.raw_len);
+    auto lags = std::make_shared<std::vector<int32_t>>(r.lags);
+    auto lag_max = std::make_shared<std::vector<float>>(r.lag_max_abs);
+    MatrixWindowOptions opt;
+    opt.title = QString("Bivariate t-test%1 — offset × sample — %2 — %3%4")
+        .arg(sanity ? QString(" · SANITY SPLIT") : QString())
+        .arg(w.name, file_name)
+        .arg(pool > 1 ? QString(" (columns: strongest of %1 samples)").arg(pool) : QString());
+    const int32_t len = r.len;
+    opt.hover = [pos, lags, lag_max, pool, len, loc](int row, int col, float v) {
+        if (row < 0 || col < 0 || row >= static_cast<int>(lags->size()))
+            return QString("Hover over the map: rows = offsets Δ, columns = samples t");
+        const int32_t t0 = col * pool, t1 = std::min(len, t0 + pool) - 1;
+        const QString at = t0 == t1
+            ? loc.toString(static_cast<qlonglong>((*pos)[static_cast<size_t>(t0)]))
+            : QString("%1–%2").arg(loc.toString(static_cast<qlonglong>((*pos)[static_cast<size_t>(t0)])),
+                                   loc.toString(static_cast<qlonglong>((*pos)[static_cast<size_t>(t1)])));
+        return QString("Δ = %1    sample %2    t = %3    (max |t| at this Δ: %4)")
+            .arg((*lags)[static_cast<size_t>(row)]).arg(at)
+            .arg(static_cast<double>(v), 0, 'f', 2)
+            .arg(static_cast<double>((*lag_max)[static_cast<size_t>(row)]), 0, 'f', 2);
+    };
+    opt.threshold = 4.5f;
+    showMatrixWindow(this, std::move(map), rows, cols, opt);
+}
+
 void MainWindow::onRunTTest() {
     showTTestDialog(nullptr);
 }
@@ -5852,13 +5925,17 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     auto* cmb_order = mem.bind(new QComboBox, "order");
     cmb_order->addItems({"1st order — compare means",
                          "2nd order, univariate — each sample with itself",
-                         "2nd order, bivariate — pairs of samples at different times (A × B)"});
+                         "2nd order, bivariate — pairs of samples at different times (A × B)",
+                         "2nd order, bivariate — fixed offset Δ, for long or raw ranges (t × t+Δ)"});
     cmb_order->setToolTip("2nd order, univariate: tests y = (x − group mean)², for masking "
                           "whose shares are handled at the same time (hardware).\n"
                           "2nd order, bivariate: tests y = (x_a − mean)·(x_b − mean) for every "
                           "pair of samples a in window A and b in window B, for shares handled "
                           "at different times (software masking). The result is an A × B map.\n"
-                          "Both need good alignment.");
+                          "Fixed offset: the same, but only for pairs (t, t + Δ) over a few offsets Δ "
+                          "and every sample t — cheap enough for long raw ranges (Schneider & Moradi "
+                          "swept Δ over 1–31 clock cycles on raw traces).\n"
+                          "All need good alignment.");
     auto* sp_win = mem.bind(new QSpinBox, "integrate");
     sp_win->setRange(1, 100001);
     sp_win->setSingleStep(2);
@@ -5923,12 +6000,25 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     };
     const PairWindow win_a = makePairWindow("Window A:");
     const PairWindow win_b = makePairWindow("Window B:");
+    // Fixed offset: Δ from, to, step (processed samples).
+    auto* sp_lag_lo   = mem.bind(new QSpinBox, "lag_from");
+    auto* sp_lag_hi   = mem.bind(new QSpinBox, "lag_to");
+    auto* sp_lag_step = mem.bind(new QSpinBox, "lag_step");
+    sp_lag_lo->setRange(0, 10000000);
+    sp_lag_hi->setRange(0, 10000000);
+    sp_lag_step->setRange(1, 10000000);
+    sp_lag_lo->setValue(1);
+    sp_lag_hi->setValue(100);
+    sp_lag_step->setValue(1);
+    for (QSpinBox* sp : {sp_lag_lo, sp_lag_hi, sp_lag_step})
+        sp->setToolTip("Offset Δ between the two samples of a pair, in samples after the "
+                       "pipeline (raw samples without one). With a known clock, a step of one "
+                       "clock period in samples tests one offset per cycle.");
+    auto* row_lag = widgetRow({sp_lag_lo, new QLabel("to"), sp_lag_hi, new QLabel("step"), sp_lag_step});
+    fl_pairs->addRow("Offsets Δ:", row_lag);
     auto* lbl_pairs = new QLabel;
     lbl_pairs->setWordWrap(true);
     fl_pairs->addRow(lbl_pairs);
-    grp_pairs->setToolTip("Every sample of A is paired with every sample of B, so keep the "
-                          "windows short: a pattern on a resampled pipeline, or a few thousand "
-                          "samples. A = B gives the symmetric map of all pairs inside one window.");
     {
         // Defaults: the first two aligned patterns, else the visible range.
         const PlotWidget* pw = activeDs().plot_widget;
@@ -5946,11 +6036,40 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         rows = processedLength(activeDs().pipeline, win_a.len->value());
         cols = processedLength(activeDs().pipeline, win_b.len->value());
     };
+    auto lagShape = [=, this](int64_t& len, std::vector<int32_t>& lags) {
+        len  = processedLength(activeDs().pipeline, win_a.len->value());
+        lags = bivariateLags(sp_lag_lo->value(), sp_lag_hi->value(), sp_lag_step->value());
+    };
     auto updatePairs = [=, this]() {
+        const QLocale loc;
+        if (cmb_order->currentIndex() == 3) {
+            int64_t len = 0;
+            std::vector<int32_t> lags;
+            lagShape(len, lags);
+            const int64_t cells = len * static_cast<int64_t>(lags.size());
+            if (lags.empty()) {
+                lbl_pairs->setStyleSheet(themeErrorStyle());
+                lbl_pairs->setText("The offset range is empty.");
+            } else if (cells > kLagMaxCells) {
+                lbl_pairs->setStyleSheet(themeErrorStyle());
+                lbl_pairs->setText(QString("%1 samples × %2 offsets = %3 values after the pipeline — "
+                                           "too many (at most %4). Shorten the range or test fewer offsets.")
+                    .arg(loc.toString(static_cast<qlonglong>(len)), loc.toString(static_cast<qlonglong>(lags.size())),
+                         loc.toString(static_cast<qlonglong>(cells)),
+                         loc.toString(static_cast<qlonglong>(kLagMaxCells))));
+            } else {
+                lbl_pairs->setStyleSheet(QString());
+                lbl_pairs->setText(QString("%1 samples × %2 offsets = %3 pairs after the pipeline, ~%4 MB.")
+                    .arg(loc.toString(static_cast<qlonglong>(len)), loc.toString(static_cast<qlonglong>(lags.size())),
+                         loc.toString(static_cast<qlonglong>(cells)))
+                    .arg(estimateLagBytes(len, static_cast<int64_t>(lags.size()), lags.back(),
+                                          jobs_->plannedThreadBudget()) / (1024 * 1024)));
+            }
+            return;
+        }
         int64_t rows = 0, cols = 0;
         pairShape(rows, cols);
         const int64_t pairs = rows * cols;
-        const QLocale loc;
         if (pairs > kBivariateMaxPairs) {
             lbl_pairs->setStyleSheet(themeErrorStyle());
             lbl_pairs->setText(QString("%1 × %2 = %3 pairs after the pipeline — too many "
@@ -5970,6 +6089,8 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         connect(w.len, QOverload<int>::of(&QSpinBox::valueChanged), &cfg, updatePairs);
         connect(w.src, QOverload<int>::of(&QComboBox::currentIndexChanged), &cfg, updatePairs);
     }
+    for (QSpinBox* sp : {sp_lag_lo, sp_lag_hi, sp_lag_step})
+        connect(sp, QOverload<int>::of(&QSpinBox::valueChanged), &cfg, updatePairs);
     updatePairs();
     fl->addRow(grp_pairs);
 
@@ -6021,8 +6142,22 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     // Bivariate runs use the A × B windows instead of the sample range and
     // patterns list, and have no live view or chain step (yet).
     auto syncBivariate = [=, &cfg](int idx) {
-        const bool bi = idx == 2;
+        const bool bi  = idx >= 2;
+        const bool lag = idx == 3;
         grp_pairs->setVisible(bi);
+        grp_pairs->setTitle(lag ? "Sample pairs (t, t + Δ)" : "Sample pairs (A × B)");
+        grp_pairs->setToolTip(lag
+            ? "Every sample t of the window is paired with t + Δ for each offset Δ (read past "
+              "the end of the window where needed). Cost grows with length × offsets, so long "
+              "raw ranges work."
+            : "Every sample of A is paired with every sample of B, so keep the "
+              "windows short: a pattern on a resampled pipeline, or a few thousand "
+              "samples. A = B gives the symmetric map of all pairs inside one window.");
+        fl_pairs->setRowVisible(win_b.src->parentWidget(), !lag);
+        if (auto* l = qobject_cast<QLabel*>(fl_pairs->labelForField(win_a.src->parentWidget())))
+            l->setText(lag ? "Window:" : "Window A:");
+        fl_pairs->setRowVisible(row_lag, lag);
+        updatePairs();
         if (grp_pat) grp_pat->setEnabled(!bi);
         const bool pat_mode = grp_pat && grp_pat->isEnabled() && grp_pat->isChecked();
         sp_s_first->setEnabled(!bi && !pat_mode);
@@ -6072,15 +6207,29 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         plotWidget()->addTrace(std::make_shared<std::vector<float>>(t1), c, "1st order");
     };
 
-    // ---- Bivariate run: every pair (a in A, b in B) ----
-    if (cmb_order->currentIndex() == 2) {
-        int64_t rows = 0, cols = 0;
-        pairShape(rows, cols);
-        if (rows * cols > kBivariateMaxPairs) {
-            QMessageBox::warning(this, "T-test", lbl_pairs->text());
-            return;
+    // ---- Bivariate run: every pair (a in A, b in B), or (t, t + Δ) ----
+    if (cmb_order->currentIndex() >= 2) {
+        const bool lag_mode = cmb_order->currentIndex() == 3;
+        int64_t bytes = 0;
+        std::vector<int32_t> lags;
+        if (lag_mode) {
+            int64_t len = 0;
+            lagShape(len, lags);
+            if (lags.empty() || len * static_cast<int64_t>(lags.size()) > kLagMaxCells) {
+                QMessageBox::warning(this, "T-test", lbl_pairs->text());
+                return;
+            }
+            bytes = estimateLagBytes(len, static_cast<int64_t>(lags.size()), lags.back(),
+                                     jobs_->plannedThreadBudget());
+        } else {
+            int64_t rows = 0, cols = 0;
+            pairShape(rows, cols);
+            if (rows * cols > kBivariateMaxPairs) {
+                QMessageBox::warning(this, "T-test", lbl_pairs->text());
+                return;
+            }
+            bytes = estimateBivariateBytes(rows, cols, jobs_->plannedThreadBudget());
         }
-        const int64_t bytes = estimateBivariateBytes(rows, cols, jobs_->plannedThreadBudget());
         if (bytes > 2LL * 1024 * 1024 * 1024
             && QMessageBox::warning(this, "Memory warning",
                    QString("The bivariate t-test will need ~%1 GB of memory.\nContinue?")
@@ -6111,7 +6260,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
             }
             return bw;
         };
-        const BivariateWindow wa = makeWindow(win_a, "A");
+        const BivariateWindow wa = makeWindow(win_a, lag_mode ? "range" : "A");
         const BivariateWindow wb = makeWindow(win_b, "B");
         const int64_t read_lo = ds_tiled && chk_shifts->isChecked() ? resolved.first_sample : 0;
         const int64_t read_hi = ds_tiled && chk_shifts->isChecked()
@@ -6125,6 +6274,31 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         struct BiOut { BivariateResult r; QString warn, err; };
         auto out = std::make_shared<BiOut>();
         const QString fname = activeDs().display_name;
+
+        if (lag_mode) {
+            struct LagOut { LagResult r; QString warn, err; };
+            auto lout = std::make_shared<LagOut>();
+            jobs_->submit(QString("Bivariate t-test — %1, %2 offsets of %3").arg(wa.name).arg(lags.size()).arg(fname),
+                [=](JobContext& ctx) {
+                    auto prog = [&](int64_t done, int64_t total) {
+                        ctx.setProgress(done, total);
+                        return !ctx.cancelled();
+                    };
+                    return computeLagTTest(job_file.get(), job_pipeline, first, count, byte_idx,
+                                           wa, lags, read_lo, read_hi, sanity, abs_value, prog,
+                                           lout->r, lout->warn, lout->err);
+                },
+                [=](bool ok) {
+                    if (!ok) {
+                        if (!lout->err.isEmpty() && lout->err != "Cancelled.")
+                            QMessageBox::critical(this, "T-test failed", lout->err);
+                        return;
+                    }
+                    if (!lout->warn.isEmpty()) QMessageBox::warning(this, "T-test", lout->warn);
+                    showLagResult(lout->r, wa, job_pipeline, job_file, fname, count, abs_value, sanity);
+                });
+            return;
+        }
 
         jobs_->submit(QString("Bivariate t-test — %1 × %2 of %3").arg(wa.name, wb.name, fname),
             [=](JobContext& ctx) {

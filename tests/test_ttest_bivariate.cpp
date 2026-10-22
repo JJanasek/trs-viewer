@@ -204,5 +204,88 @@ TEST(TTestBivariate, TooManyPairsIsRefused) {
     EXPECT_FALSE(computeBivariateTTest(&d.file, {}, 0, 10, 0, a, a, 0, kNS, false, false, {},
                                        r, warn, err));
     EXPECT_TRUE(err.contains("too many")) << err.toStdString();
-    EXPECT_EQ(estimateBivariateBytes(1000, 1000, 8), 32000000 + 8 * 4000000);
+    // Accumulator + a batch of 64 centred A and B windows + a read buffer per thread.
+    EXPECT_EQ(estimateBivariateBytes(1000, 1000, 8), 32000000 + 64 * 2000 * 4 + 8 * 1000 * 4);
+}
+
+// ---- Fixed offset (pairs t, t + Δ) ----
+
+namespace {
+
+bool runLag(TrsFile& f, int nt, const BivariateWindow& w, const std::vector<int32_t>& lags,
+            LagResult& r) {
+    QString warn, err;
+    const bool ok = computeLagTTest(&f, {}, 0, nt, 0, w, lags, 0, kNS, false, false, {},
+                                    r, warn, err);
+    EXPECT_TRUE(ok) << err.toStdString();
+    return ok;
+}
+
+float lagAt(const LagResult& r, int d, int i) { return r.t[static_cast<size_t>(d) * r.len + i]; }
+
+}  // namespace
+
+TEST(TTestBivariate, LagRange) {
+    EXPECT_EQ(bivariateLags(1, 7, 3), (std::vector<int32_t>{1, 4, 7}));
+    EXPECT_EQ(bivariateLags(5, 5, 1), (std::vector<int32_t>{5}));
+    EXPECT_TRUE(bivariateLags(5, 4, 1).empty());
+    EXPECT_TRUE(bivariateLags(-1, 4, 1).empty());
+    EXPECT_TRUE(bivariateLags(0, 4, 0).empty());
+}
+
+TEST(TTestBivariate, LagFindsTheOffsetOfTheShares) {
+    Shares d(4000);
+    LagResult r;
+    ASSERT_TRUE(runLag(d.file, 4000, whole("A"), bivariateLags(1, 40, 1), r));
+    ASSERT_EQ(r.len, kNS);
+    ASSERT_EQ(r.lags.size(), 40u);
+    EXPECT_EQ(r.lags[static_cast<size_t>(r.max_lag)], kS2 - kS1);
+    EXPECT_EQ(r.max_t, kS1);
+    EXPECT_GT(r.max_abs, 20.0f);
+    for (size_t k = 0; k < r.lags.size(); k++)
+        if (r.lags[k] != kS2 - kS1) EXPECT_LT(r.lag_max_abs[k], 5.5f) << "lag " << r.lags[k];
+    // The per-sample curve takes the strongest offset, and its accumulator
+    // gives the same t-values.
+    EXPECT_EQ(r.lags[static_cast<size_t>(r.best_lag[kS1])], kS2 - kS1);
+    EXPECT_FLOAT_EQ(r.best[kS1], lagAt(r, r.max_lag, kS1));
+    ASSERT_TRUE(r.best_acc);
+    std::vector<float> t;
+    std::string e;
+    ASSERT_TRUE(r.best_acc->compute(t, e));
+    ASSERT_EQ(t.size(), r.best.size());
+    for (size_t i = 0; i < t.size(); i++) EXPECT_FLOAT_EQ(t[i], r.best[i]);
+}
+
+TEST(TTestBivariate, LagIsADiagonalOfTheFullMap) {
+    Shares d(500);
+    BivariateResult full;
+    ASSERT_TRUE(run(d.file, 500, whole("A"), whole("A"), full));
+    const std::vector<int32_t> lags{0, 3, 30, 63};
+    LagResult r;
+    ASSERT_TRUE(runLag(d.file, 500, whole("A"), lags, r));
+    for (size_t k = 0; k < lags.size(); k++)
+        for (int i = 0; i < kNS; i++) {
+            const int j = i + lags[k];
+            if (j < kNS) EXPECT_NEAR(lagAt(r, static_cast<int>(k), i), at(full, i, j), 1e-3f) << lags[k] << "," << i;
+            else         EXPECT_EQ(lagAt(r, static_cast<int>(k), i), 0.0f) << "past the end";
+        }
+}
+
+TEST(TTestBivariate, LagReadsPastTheEndOfTheWindow) {
+    // The window holds only the first share; its partner lies Δ past the end.
+    Shares d(3000);
+    BivariateWindow w = whole("A");
+    w.raw_start = 5; w.raw_len = 10;          // samples 5..14
+    LagResult r;
+    ASSERT_TRUE(runLag(d.file, 3000, w, {kS2 - kS1}, r));
+    ASSERT_EQ(r.len, 10);
+    EXPECT_EQ(r.max_t, kS1 - 5);
+    EXPECT_GT(r.max_abs, 20.0f);
+}
+
+TEST(TTestBivariate, LagExtensionFollowsTheResampling) {
+    std::vector<std::shared_ptr<ITransform>> pl{std::make_shared<WindowResampleTransform>(4)};
+    EXPECT_EQ(lagExtendedRawLength(pl, 400, 10, 100000), 440);
+    EXPECT_EQ(lagExtendedRawLength(pl, 400, 10, 420), 420);   // trace ends
+    EXPECT_EQ(lagExtendedRawLength({}, 400, 0, 100000), 400);
 }

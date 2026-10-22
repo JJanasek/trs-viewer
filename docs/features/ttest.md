@@ -60,14 +60,43 @@ With A = B the map is symmetric and its diagonal is the univariate test.
 The number of pairs is |A| · |B|, after the pipeline, and is limited to
 16.7 million (4096 × 4096). Typical use: two patterns (e.g. where the mask
 is loaded and where the masked value is used) on a *Window Resample*d
-pipeline. Memory is about 32 bytes per pair plus 4 bytes per pair per worker
-thread; the dialog shows the estimate. Live progress and chain steps are not
-available for bivariate runs yet.
+pipeline. Memory is about 32 bytes per pair; the dialog shows the estimate.
+Live progress and chain steps are not available for bivariate runs yet.
+For long or raw windows, use the fixed-offset form below.
 
 Bivariate tests need many more traces than univariate ones, and each pair is
 a separate test: with a million pairs, expect a few above 4.5 by chance
 (use **Calc TH…**-style reasoning, or the sanity check, before trusting a
 lone hit).
+
+### Bivariate second order with a fixed offset (long or raw ranges)
+
+Choose **Order: 2nd order, bivariate — fixed offset Δ**. Only pairs
+`(t, t + Δ)` are tested, for every sample `t` of the **Window** (sample range
+or pattern) and every offset in **Offsets Δ** (*from*, *to*, *step*, in
+samples after the pipeline). These are diagonals of the A × A map, so the
+cost grows with length × offsets, not length². No resampling is needed: this
+is how Schneider & Moradi ran the bivariate test on raw traces, with offsets
+of 1 to 31 clock cycles over all sample points. With a known clock, set the
+step to one clock period in samples. Δ = 0 is the univariate second order.
+
+The window is read Δ samples past its end, so every `t` has its partner;
+past the end of the trace there is none (t = 0). It works when the two shares
+are a fixed distance apart once the traces are aligned. If that distance
+varies (random delays), align each part with [patterns](patterns.md) and use
+the A × B form.
+
+The result tab shows, for each sample `t`, the t-value of its strongest
+offset; the title gives the largest |t| and its Δ. With several offsets, a
+heatmap opens as well: rows are offsets, columns samples (columns pooled to
+at most 4096, each keeping its strongest value); hovering gives Δ, the raw
+sample and the largest |t| at that Δ. At most 67 million (sample, offset)
+values per run, e.g. 1M samples × 64 offsets; memory is about 32 bytes per
+value. On a 5000-trace file, 1M raw samples × 31 offsets takes about 35 s.
+
+Each (sample, offset) is a separate test, so expect occasional values above
+4.5 by chance when there are millions; run the sanity check before trusting
+a lone hit.
 
 ## Using patterns
 

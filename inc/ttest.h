@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -19,6 +20,14 @@ public:
     // parallel runs share one accumulator instead of one per thread.
     void addTraces(const int* groups, const float* const* bufs, const int32_t* counts,
                    int n, int threads);
+    // Adds n traces whose values are generated on the fly: gen(k, lo, hi, y)
+    // writes samples [lo, hi) of trace k into y. The samples are split into
+    // small blocks spread over `threads` OpenMP threads, and each block takes
+    // all n traces while its sums stay in cache — for derived values (e.g.
+    // products of sample pairs) far too many to buffer per trace. gen is
+    // called concurrently. Same result as addTrace() on each in order.
+    void addGenerated(const int* groups, int n, int threads,
+                      const std::function<void(int k, int32_t lo, int32_t hi, float* y)>& gen);
     // Adds another accumulator's totals into this one (same num_samples).
     // Used to combine per-thread partial accumulators after parallel
     // accumulation, since addTrace() itself isn't safe to call concurrently
@@ -41,6 +50,9 @@ public:
     int64_t countGroup(int g) const;
     // Per-sample mean of group g (resized to num_samples; zeros if empty).
     void groupMeans(int g, std::vector<double>& out) const;
+    // A new accumulator over the given samples of this one, in that order
+    // (e.g. one chosen cell per position of a larger map).
+    TTestAccumulator gather(const std::vector<int64_t>& samples) const;
     int32_t numSamples() const { return num_samples_; }
     int64_t estimatedBytes() const {
         return static_cast<int64_t>(num_samples_) * 4LL * static_cast<int64_t>(sizeof(double));

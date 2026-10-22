@@ -69,6 +69,9 @@ each one **on its own**, and keep only the shifts. The t-test then reads the
    patterns (e.g. where the mask is loaded and where the masked value is
    used), each with its own shifts: see
    [bivariate second order](ttest.md#bivariate-second-order-pairs-of-samples).
+   If the two shares are a fixed distance apart within one pattern, the
+   [fixed-offset](ttest.md#bivariate-second-order-with-a-fixed-offset-long-or-raw-ranges)
+   form tests that pattern on raw samples without resampling.
 
 **Save Shifts…** / **Load Shifts…** store the patterns and their shifts (see
 [file format](#shift-file-format)). The *Alignment & View* box in the side panel
