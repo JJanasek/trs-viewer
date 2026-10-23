@@ -346,14 +346,25 @@ int PlotWidget::laneIndexAt(int py, const QRect& pr) const {
 }
 
 void PlotWidget::setThresholds(bool show, double pos, double neg) {
+    if (show == show_thresholds_ && pos == threshold_pos_ && neg == threshold_neg_) return;
     show_thresholds_ = show;
     threshold_pos_   = pos;
     threshold_neg_   = neg;
-    update();
+    refitForThresholds();
 }
 
 void PlotWidget::setThresholdOneSided(bool one_sided) {
+    if (one_sided == threshold_one_sided_) return;
     threshold_one_sided_ = one_sided;
+    refitForThresholds();
+}
+
+// The auto-fit Y range includes the threshold lines (computeYRange), but it
+// only ever grows while panning; refit it so a changed threshold is in view
+// (and a lowered one doesn't leave the plot zoomed out).
+void PlotWidget::refitForThresholds() {
+    sticky_ymin_ =  std::numeric_limits<float>::infinity();
+    sticky_ymax_ = -std::numeric_limits<float>::infinity();
     update();
 }
 
@@ -738,6 +749,12 @@ void PlotWidget::computeYRange(float& ymin, float& ymax) {
     }
 
     if (ymin == std::numeric_limits<float>::max()) { ymin = -1; ymax = 1; return; }
+    // Threshold lines are always in view: a t-curve that stays below them
+    // shows how far below.
+    if (show_thresholds_) {
+        ymax = std::max(ymax, static_cast<float>(threshold_pos_));
+        if (!threshold_one_sided_) ymin = std::min(ymin, static_cast<float>(threshold_neg_));
+    }
     if (ymin == ymax) { ymin -= 1; ymax += 1; return; }
 
     float pad = (ymax - ymin) * 0.05f;
@@ -831,7 +848,9 @@ void PlotWidget::renderTrace(const TraceEntry& te, QPainter& p,
             p.drawPolygon(poly.data(), static_cast<int>(poly.size()));
             p.setBrush(Qt::NoBrush);
         }
-        return;
+        // Then the line on top: where a pixel column holds a single sample
+        // the band has no height, and that sample (a peak, say) would not
+        // show at all.
     }
 
     // ------------------------------------------------------------------

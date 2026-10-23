@@ -158,7 +158,9 @@ job carries on.
 The result tab has a single row of controls; pan, zoom, measure and amplitude
 come from the main toolbar, as for any tab.
 
-- **Threshold ±**: adjustable threshold line (orange dashed)
+- **Threshold ±**: adjustable threshold line (orange dashed). The y axis
+  always reaches the line, so a curve that stays below it shows how far
+  below; changing the threshold rescales the axis to match.
 - **One-sided**: show only the positive threshold (for abs-preprocessed signals)
 - **Calc TH…** — significance-threshold calculator. The per-sample level for an overall type-I error rate α over `n_L` samples uses the **Šidák** correction `α_TH = 1 − (1 − α)^(1/n_L)`, and the threshold is `TH = CDF_t⁻¹(1 − α_TH/2, ν̂)` with Welch–Satterthwaite degrees of freedom computed from the trace data. The dialog reports both the median and approximate ν̂. Follows Zhang, Ding, Durvaux, Standaert & Fei, *Towards Sound and Optimal Leakage Detection Procedure* (IACR ePrint 2017/287, EuroS&P 2018)
 - **Cut**: drag across the plot to cut a region out of the exported result

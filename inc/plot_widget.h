@@ -143,6 +143,7 @@ public:
     // Directly set the Y-zoom multiplier (clamped like zoomInY/zoomOutY).
     // Used to restore amplitude zoom after a trace-list reload.
     void setYScale(float s);
+    // Shown lines are kept in view: the auto-fit Y range includes them.
     void setThresholds(bool show, double pos = 4.5, double neg = -4.5);
     // When one_sided=true only the positive threshold line is drawn (use after abs() preprocessing).
     void setThresholdOneSided(bool one_sided);
@@ -368,6 +369,7 @@ private:
 
     bool   stacked_              = false;
 
+    void refitForThresholds();
     bool   show_thresholds_      = false;
     bool   threshold_one_sided_  = false;
     double threshold_pos_        =  4.5;
