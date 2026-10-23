@@ -65,9 +65,14 @@ QString traceListBaseName(const QStringList& paths) {
         while (k < prefix.size() && k < n.size() && prefix[k] == n[k]) k++;
         prefix.truncate(k);
     }
-    // One file: its own name without the number. Several: what they share.
-    while (!prefix.isEmpty() && (prefix.back().isDigit() || QString("_-. ").contains(prefix.back())))
-        prefix.chop(1);
+    // One file: its own name without the number. Several: what they share,
+    // without a trailing part number ("…_part000", "…_part001" → "…").
+    auto trim = [&prefix](bool digits) {
+        while (!prefix.isEmpty() && ((digits && prefix.back().isDigit()) || QString("_-. ").contains(prefix.back())))
+            prefix.chop(1);
+    };
+    trim(true);
+    if (prefix.endsWith("part", Qt::CaseInsensitive)) { prefix.chop(4); trim(false); }
     return prefix.isEmpty() ? QString("combined") : prefix;
 }
 
