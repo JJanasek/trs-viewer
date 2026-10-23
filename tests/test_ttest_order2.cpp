@@ -173,3 +173,68 @@ TEST(TTestOrder2, MemoryEstimateIsOneAccumulatorPlusThreadBuffers) {
     // More cores than the run uses don't count.
     EXPECT_EQ(estimateTTestBytes(1000000, 1000000, 1, 24), 64000000);
 }
+
+// ---------------------------------------------------------------------------
+// Mean traces (computeMeanTraces): same reading as the t-test, sums only
+// ---------------------------------------------------------------------------
+
+TEST(MeanTraces, AllTracesWithoutDataBytes) {
+    // 5 traces of 4 samples: x[t][s] = t + 10 s. Mean over t = 2 + 10 s,
+    // sample std of 0..4 = sqrt(2.5).
+    std::vector<float> x;
+    for (int t = 0; t < 5; t++)
+        for (int s = 0; s < 4; s++) x.push_back(static_cast<float>(t + 10 * s));
+    TrsFile f;
+    f.openFromArray(x.data(), 5, 4, "mean");   // no data bytes at all
+    MeanTraceResult r;
+    QString warn, err;
+    ASSERT_TRUE(computeMeanTraces(&f, {}, 0, 5, 0, 0, -1, {}, 0, 0, 4, {}, r, warn, err))
+        << err.toStdString();
+    EXPECT_EQ(r.n[0], 5);
+    EXPECT_EQ(r.n[1], 0);
+    ASSERT_EQ(r.mean[0].size(), 4u);
+    for (int s = 0; s < 4; s++) {
+        EXPECT_FLOAT_EQ(r.mean[0][s], 2.0f + 10.0f * s);
+        EXPECT_NEAR(r.stddev[0][s], std::sqrt(2.5f), 1e-5f);
+    }
+    EXPECT_TRUE(r.mean[1].empty());
+}
+
+TEST(MeanTraces, PerGroupAndSampleRange) {
+    // Group = trace parity (data byte); group 1 traces are 100 higher.
+    std::vector<float> x;
+    std::vector<uint8_t> d;
+    for (int t = 0; t < 6; t++) {
+        d.push_back(static_cast<uint8_t>(t & 1));
+        for (int s = 0; s < 8; s++) x.push_back(static_cast<float>(s + (t & 1) * 100));
+    }
+    TrsFile f;
+    f.openFromArray(x.data(), 6, 8, "groups", d.data(), 1);
+    MeanTraceResult r;
+    QString warn, err;
+    ASSERT_TRUE(computeMeanTraces(&f, {}, 0, 6, 2, 3, 0, {}, 0, 0, 8, {}, r, warn, err))
+        << err.toStdString();
+    EXPECT_EQ(r.n[0], 3);
+    EXPECT_EQ(r.n[1], 3);
+    ASSERT_EQ(r.mean[0].size(), 3u);
+    for (int s = 0; s < 3; s++) {
+        EXPECT_FLOAT_EQ(r.mean[0][s], 2.0f + s);           // samples 2..4
+        EXPECT_FLOAT_EQ(r.mean[1][s], 102.0f + s);
+        EXPECT_FLOAT_EQ(r.stddev[0][s], 0.0f);
+    }
+}
+
+TEST(MeanTraces, FollowsTheAlignmentShifts) {
+    // A spike at sample 10 + t in trace t; shifts of t line them all up at 10.
+    std::vector<float> x(4 * 32, 0.0f);
+    std::vector<int32_t> shifts;
+    for (int t = 0; t < 4; t++) { x[static_cast<size_t>(t) * 32 + 10 + t] = 1.0f; shifts.push_back(t); }
+    TrsFile f;
+    f.openFromArray(x.data(), 4, 32, "shifted");
+    MeanTraceResult r;
+    QString warn, err;
+    ASSERT_TRUE(computeMeanTraces(&f, {}, 0, 4, 0, 0, -1, shifts, 0, 0, 32, {}, r, warn, err))
+        << err.toStdString();
+    EXPECT_FLOAT_EQ(r.mean[0][10], 1.0f);
+    EXPECT_FLOAT_EQ(r.mean[0][11], 0.0f);
+}

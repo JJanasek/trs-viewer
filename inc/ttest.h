@@ -50,6 +50,8 @@ public:
     int64_t countGroup(int g) const;
     // Per-sample mean of group g (resized to num_samples; zeros if empty).
     void groupMeans(int g, std::vector<double>& out) const;
+    // Per-sample sample standard deviation of group g (n − 1; zeros if n < 2).
+    void groupStd(int g, std::vector<double>& out) const;
     // A new accumulator over the given samples of this one, in that order
     // (e.g. one chosen cell per position of a larger map).
     TTestAccumulator gather(const std::vector<int64_t>& samples) const;

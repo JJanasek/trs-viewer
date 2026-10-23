@@ -253,9 +253,12 @@ bool computeTTestCore(TrsFile* file,
                 slot_group[static_cast<size_t>(k)] = -1;
 
                 int32_t src_idx = trace_at(ti);
-                auto data_bytes = file->readData(src_idx);
-                if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
-                int group = (data_bytes[byte_idx] != 0) ? 1 : 0;
+                int group = 0;   // byte_idx < 0: no groups, every trace in group 0
+                if (byte_idx >= 0) {
+                    auto data_bytes = file->readData(src_idx);
+                    if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
+                    group = (data_bytes[static_cast<size_t>(byte_idx)] != 0) ? 1 : 0;
+                }
                 if (hooks && hooks->group_map) {
                     group = hooks->group_map(group, src_idx);
                     if (group < 0) continue;   // deliberately left out (e.g. sanity split)
@@ -327,6 +330,14 @@ bool computeTTestCore(TrsFile* file,
                        "correlation threshold).")
                    .arg(discarded_by_align);
     if (!msg.isEmpty()) warn_out = msg.join("\n");
+
+    if (hooks && hooks->accumulate_only) {   // the sums are the result
+        acc_out = acc_ptr;
+        tstat_out.clear();
+        n0_out = acc.countGroup(0);
+        n1_out = acc.countGroup(1);
+        return true;
+    }
 
     // --- Compute ---
     std::vector<float> tstat;
@@ -462,5 +473,35 @@ bool computeTTest(TrsFile* file,
                           read_lo, read_hi, abs_value, half(1), acc_out, tstat_out,
                           n0_out, n1_out, warn_out, err, live, &hooks))
         return false;
+    return true;
+}
+
+bool computeMeanTraces(TrsFile* file,
+                       const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                       int32_t first, int32_t count,
+                       int64_t first_sample, int64_t n_samples,
+                       int32_t byte_idx, const std::vector<int32_t>& shifts,
+                       int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
+                       const std::function<bool(int64_t, int64_t)>& progress,
+                       MeanTraceResult& out, QString& warn, QString& err)
+{
+    out = MeanTraceResult{};
+    TTestHooks hooks;
+    hooks.accumulate_only = true;
+    std::shared_ptr<TTestAccumulator> acc;
+    std::vector<float> unused;
+    if (!computeTTestCore(file, pipeline, first, count, first_sample, n_samples, byte_idx, shifts,
+                          shifts_first_trace, read_lo, read_hi, false, progress, acc, unused,
+                          out.n[0], out.n[1], warn, err, nullptr, &hooks))
+        return false;
+    if (out.n[0] + out.n[1] == 0) { err = "No traces could be read."; return false; }
+    std::vector<double> m, sd;
+    for (int g = 0; g < 2; g++) {
+        if (out.n[g] == 0) continue;
+        acc->groupMeans(g, m);
+        acc->groupStd(g, sd);
+        out.mean[g].assign(m.begin(), m.end());
+        out.stddev[g].assign(sd.begin(), sd.end());
+    }
     return true;
 }

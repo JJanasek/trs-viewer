@@ -38,6 +38,7 @@ nav:
       - Trace alignment: features/alignment.md
       - Pattern alignment: features/patterns.md
       - Welch t-test: features/ttest.md
+      - Average trace: features/average.md
       - Cross-correlation: features/xcorr.md
       - CPA: features/cpa.md
       - SNR: features/snr.md

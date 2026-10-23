@@ -1389,6 +1389,11 @@ void MainWindow::setupMenuBar() {
     connect(act_spec_leak, &QAction::triggered, this, &MainWindow::onRunSpectralLeakage);
     sca_menu->addAction(act_spec_leak);
     sca_menu->addSeparator();
+    auto* act_avg = new QAction("&Average Trace…", this);
+    act_avg->setToolTip("Mean of a range of traces (± standard deviation), over all of them or "
+                        "per t-test group with the difference of the group means.");
+    connect(act_avg, &QAction::triggered, this, &MainWindow::onRunAverage);
+    sca_menu->addAction(act_avg);
     auto* act_snr = new QAction("&SNR…", this);
     connect(act_snr, &QAction::triggered, this, &MainWindow::onRunSNR);
     sca_menu->addAction(act_snr);
@@ -5962,6 +5967,194 @@ void MainWindow::showLagResult(const LagResult& r, const BivariateWindow& w,
 
 void MainWindow::onRunTTest() {
     showTTestDialog(nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Average Trace — the per-sample mean (± σ) over a range of traces, all
+// together or per t-test group, read exactly as the t-test reads them
+// (alignment shifts, pipeline) by computeMeanTraces(). The result is an
+// ordinary result tab, so every plot tool, figure export and Tile Tabs work
+// on it.
+// ---------------------------------------------------------------------------
+void MainWindow::onRunAverage() {
+    if (!hasActiveDs() || activeDs().is_result || !activeDs().file) {
+        QMessageBox::information(this, "Average Trace", "No file loaded.");
+        return;
+    }
+    const TrsHeader& h = activeDs().file->header();
+    const int n_total = h.num_traces;
+
+    QDialog cfg(this);
+    cfg.setWindowTitle("Average Trace");
+    auto* fl = new QFormLayout(&cfg);
+    auto* sp_first   = new QSpinBox; sp_first->setRange(0, std::max(0, n_total - 1));
+    auto* sp_count   = new QSpinBox; sp_count->setRange(1, std::max(1, n_total)); sp_count->setValue(n_total);
+    auto* sp_s_first = new QSpinBox; sp_s_first->setRange(0, std::max(0, h.num_samples - 1));
+    auto* sp_s_count = new QSpinBox; sp_s_count->setRange(0, h.num_samples);
+    sp_s_count->setSpecialValueText("All");
+    fl->addRow("First trace:", sp_first);
+    fl->addRow("Count:", sp_count);
+    addSelectAllTracesButton(fl, sp_first, sp_count, n_total);
+    fl->addRow("First sample:", sp_s_first);
+    fl->addRow("Sample count (0=all):", sp_s_count);
+
+    // Alignment: the stored shifts (one tile's, when tiled), as in the t-test.
+    const bool has_alignment = activeDs().align_n_samples > 0;
+    const bool ds_tiled = has_alignment && activeDs().align_tile_size > 0;
+    const int32_t n_tiles = ds_tiled ? static_cast<int32_t>(h.num_samples / activeDs().align_tile_size) : 1;
+    auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
+    chk_shifts->setChecked(has_alignment);
+    chk_shifts->setEnabled(has_alignment);
+    chk_shifts->setToolTip(has_alignment ? QString("Average the traces as aligned, so a jittered "
+                                                   "feature stays sharp instead of smearing out.")
+                                         : QString("No alignment has been applied yet."));
+    fl->addRow(chk_shifts);
+    QSpinBox* sp_tile = nullptr;
+    if (ds_tiled) {
+        sp_tile = new QSpinBox;
+        sp_tile->setRange(0, std::max(0, n_tiles - 1));
+        sp_tile->setValue(std::clamp(activeDs().align_baked_tile, 0, std::max(0, n_tiles - 1)));
+        fl->addRow("Tile:", sp_tile);
+    }
+
+    DialogMemory mem("average");
+    auto* cmb_mode = mem.bind(new QComboBox, "mode");
+    cmb_mode->addItems({"All traces together", "Each t-test group separately"});
+    cmb_mode->setToolTip("Per group: the mean of group 0 and of group 1 (from the group data "
+                         "byte, as in the t-test), and optionally their difference.");
+    const bool have_ttest_param = h.param_map.count("ttest") > 0;
+    auto* sp_byte = new QSpinBox;
+    sp_byte->setRange(0, std::max(0, static_cast<int>(h.data_length) - 1));
+    sp_byte->setValue(have_ttest_param ? h.param_map.at("ttest").offset : 0);
+    sp_byte->setToolTip(have_ttest_param ? QString("From the file's \"ttest\" field.")
+                                         : QString("Data byte holding the group (0 or not 0)."));
+    auto* chk_std  = mem.bind(new QCheckBox("Show ± 1 standard deviation"), "std");
+    chk_std->setChecked(true);
+    auto* chk_diff = mem.bind(new QCheckBox("Also the difference of the group means (G1 − G0)"), "diff");
+    chk_diff->setChecked(true);
+    chk_diff->setToolTip("In its own tab: where the groups' average power differs (a "
+                         "difference-of-means view; the t-test adds the noise to this).");
+    fl->addRow("Average:", cmb_mode);
+    fl->addRow("Group byte:", sp_byte);
+    fl->addRow(chk_std);
+    fl->addRow(chk_diff);
+    auto syncMode = [=]() {
+        const bool groups = cmb_mode->currentIndex() == 1;
+        sp_byte->setEnabled(groups && h.data_length > 0);
+        chk_diff->setEnabled(groups);
+    };
+    if (h.data_length <= 0) {
+        cmb_mode->setCurrentIndex(0);
+        cmb_mode->setEnabled(false);
+        cmb_mode->setToolTip("This file has no per-trace data bytes, so no groups.");
+    }
+    connect(cmb_mode, QOverload<int>::of(&QComboBox::currentIndexChanged), &cfg, syncMode);
+
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
+    bb->button(QDialogButtonBox::Ok)->setText("Run Average");
+    fl->addRow(bb);
+    connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
+    connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    mem.restore();
+    if (h.data_length <= 0) cmb_mode->setCurrentIndex(0);
+    syncMode();
+    if (cfg.exec() != QDialog::Accepted) return;
+    mem.save();
+
+    const int32_t first = sp_first->value();
+    const int32_t count = std::min(sp_count->value(), n_total - first);
+    const int64_t s_first = sp_s_first->value();
+    const int64_t s_count = sp_s_count->value();
+    const bool groups  = cmb_mode->currentIndex() == 1 && h.data_length > 0;
+    const int32_t byte_idx = groups ? sp_byte->value() : -1;
+    const bool show_std  = chk_std->isChecked();
+    const bool show_diff = groups && chk_diff->isChecked();
+    const ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
+    const bool use_shifts = chk_shifts->isChecked();
+    const std::vector<int32_t> shifts = use_shifts ? resolved.shifts : std::vector<int32_t>{};
+    const int32_t shifts_first = activeDs().align_first_trace;
+    const int64_t read_lo = ds_tiled && use_shifts ? resolved.first_sample : 0;
+    const int64_t read_hi = ds_tiled && use_shifts ? resolved.first_sample + resolved.n_samples : h.num_samples;
+
+    std::shared_ptr<TrsFile> job_file = activeDs().file;
+    std::vector<std::shared_ptr<ITransform>> job_pipeline;
+    for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
+    const QString fname = activeDs().display_name;
+    struct AvgOut { MeanTraceResult r; QString warn, err; };
+    auto out = std::make_shared<AvgOut>();
+
+    jobs_->submit(QString("Average — %1 traces of %2").arg(count).arg(fname),
+        [=](JobContext& ctx) {
+            return computeMeanTraces(job_file.get(), job_pipeline, first, count, s_first, s_count,
+                                     byte_idx, shifts, shifts_first, read_lo, read_hi,
+                                     [&ctx](int64_t done, int64_t total) {
+                                         ctx.setProgress(done, total);
+                                         return !ctx.cancelled();
+                                     },
+                                     out->r, out->warn, out->err);
+        },
+        [=](bool ok) {
+            if (!ok) {
+                if (!out->err.isEmpty() && out->err != "Cancelled.")
+                    QMessageBox::critical(this, "Average failed", out->err);
+                return;
+            }
+            if (!out->warn.isEmpty()) QMessageBox::warning(this, "Average Trace", out->warn);
+            const MeanTraceResult& r = out->r;
+            const bool keep_x = keepsSamplePositions(job_pipeline);
+            auto finishTab = [&](const QString& y_label) {
+                PlotWidget* pw = plotWidget();
+                pw->setAxisLabels("Sample Index", y_label);
+                if (keep_x) pw->setAxisMeta(fileSampleInterval(job_file->header()), s_first);
+                pw->resetView();
+            };
+            // ± σ as faint curves around a mean.
+            auto addStd = [&](int g, const QColor& c) {
+                if (!show_std || r.n[g] < 2) return;
+                QColor faint = c;
+                faint.setAlpha(110);
+                auto hi = std::make_shared<std::vector<float>>(r.mean[g]);
+                auto lo = std::make_shared<std::vector<float>>(r.mean[g]);
+                for (size_t i = 0; i < hi->size(); i++) {
+                    (*hi)[i] += r.stddev[g][i];
+                    (*lo)[i] -= r.stddev[g][i];
+                }
+                const QString tag = groups ? QString("G%1 ").arg(g) : QString();
+                plotWidget()->addTrace(hi, faint, tag + "mean + σ");
+                plotWidget()->addTrace(lo, faint, tag + "mean − σ");
+            };
+            if (!groups) {
+                addResultTab(r.mean[0], QString("Average — %1 traces of %2").arg(r.n[0]).arg(fname),
+                             themeTraceColor(0), "Mean");
+                addStd(0, themeTraceColor(0));
+                finishTab("Mean");
+                return;
+            }
+            if (r.n[0] == 0 || r.n[1] == 0) {
+                QMessageBox::warning(this, "Average Trace",
+                    QString("Only one group present (G0: %1, G1: %2 traces); showing it alone.")
+                        .arg(r.n[0]).arg(r.n[1]));
+            }
+            const int g_first = r.n[0] > 0 ? 0 : 1;
+            addResultTab(r.mean[g_first],
+                         QString("Average per group — G0:%1  G1:%2 of %3").arg(r.n[0]).arg(r.n[1]).arg(fname),
+                         themeTraceColor(g_first), QString("Group %1 mean").arg(g_first));
+            if (g_first == 0 && r.n[1] > 0)
+                plotWidget()->addTrace(std::make_shared<std::vector<float>>(r.mean[1]),
+                                       themeTraceColor(1), "Group 1 mean");
+            addStd(0, themeTraceColor(0));
+            addStd(1, themeTraceColor(1));
+            finishTab("Mean");
+            if (show_diff && r.n[0] > 0 && r.n[1] > 0) {
+                std::vector<float> diff(r.mean[1].size());
+                for (size_t i = 0; i < diff.size(); i++) diff[i] = r.mean[1][i] - r.mean[0][i];
+                addResultTab(diff, QString("Difference of means (G1 − G0) — G0:%1  G1:%2 of %3")
+                                       .arg(r.n[0]).arg(r.n[1]).arg(fname),
+                             themeTraceColor(2), "G1 − G0");
+                plotWidget()->setTraceFilled(0, true);
+                finishTab("G1 − G0");
+            }
+        });
 }
 
 void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToChain)
@@ -13612,52 +13805,46 @@ void MainWindow::onRunFFT() {
         else if (out_mode == 1) y_label = "Magnitude (dB)";
         else y_label = "Phase (rad)";
 
-        // --- Result window ---
-        auto* dlg = new QDialog(this);
-        dlg->setAttribute(Qt::WA_DeleteOnClose);
-        dlg->setWindowTitle(QString("FFT Spectrum — %1 traces, %2, N=%3%4")
-                                .arg(n_ok)
-                                .arg(cmb_window->currentText())
-                                .arg(fft_in_n)
-                                .arg(pad_pow2 ? QString(" (padded from %1)").arg(win_n) : QString()));
-        dlg->resize(1200, 560);
-
-        auto* pw = new PlotWidget(dlg);
+        // --- Result tab: in the main window like every other result, so the
+        // plot tools, Tile Tabs (next to a t-test, say) and figure export all
+        // work on it. ---
+        const QString title = QString("FFT Spectrum — %1 traces, %2, N=%3%4")
+                                  .arg(n_ok)
+                                  .arg(cmb_window->currentText())
+                                  .arg(fft_in_n)
+                                  .arg(pad_pow2 ? QString(" (padded from %1)").arg(win_n) : QString());
+        if (show_env && n_ok > 1) {
+            // Envelope first, so the average is drawn on top of it.
+            addResultTab(acc_min, title, themeTraceColor(0), "Min");
+            plotWidget()->addTrace(std::make_shared<std::vector<float>>(acc_max), themeTraceColor(0), "Max");
+            plotWidget()->addTrace(avg_ptr, themeTraceColor(1), "Average");
+        } else {
+            addResultTab(*avg_ptr, title, themeTraceColor(1), "Average");
+            plotWidget()->setTraceFilled(0, true);
+        }
+        PlotWidget* pw = plotWidget();
 
         // Set x-axis scale so ticks show frequency (in x_label's unit)
         // instead of bin indices.
         if (has_freq_axis) pw->setXScale(x_scale, 0.0);
-
-        if (show_env && n_ok > 1) {
-            auto min_ptr = std::make_shared<std::vector<float>>(acc_min);
-            auto max_ptr = std::make_shared<std::vector<float>>(acc_max);
-            pw->addTrace(min_ptr, themeTraceColor(0), "Min");
-            pw->addTrace(max_ptr, themeTraceColor(0), "Max");
-            pw->addTrace(avg_ptr, themeTraceColor(1), "Average");
-        } else {
-            pw->addTrace(avg_ptr, themeTraceColor(1), "Average");
-            pw->setTraceFilled(0, true);
-        }
-
         pw->setAxisLabels(x_label, y_label);
-        pw->setThresholds(false, 0.0, 0.0);
         pw->resetView();
 
         auto* btn_exp_npy = new QPushButton("Export .npy…");
-        connect(btn_exp_npy, &QPushButton::clicked, dlg, [dlg, avg_ptr]() {
-            QString path = QFileDialog::getSaveFileName(dlg, "Export FFT spectrum as NumPy",
+        connect(btn_exp_npy, &QPushButton::clicked, pw, [this, avg_ptr]() {
+            QString path = QFileDialog::getSaveFileName(this, "Export FFT spectrum as NumPy",
                                                         MainWindow::recentDir("npy"), "NumPy files (*.npy)");
             if (path.isEmpty()) return;
             MainWindow::updateRecentDir("npy", path);
             QString e;
             if (!saveNpy(path, avg_ptr->data(), static_cast<int64_t>(avg_ptr->size()), e))
-                QMessageBox::critical(dlg, "Export failed", e);
+                QMessageBox::critical(this, "Export failed", e);
             else
-                QMessageBox::information(dlg, "Export complete", "Saved: " + path);
+                QMessageBox::information(this, "Export complete", "Saved: " + path);
         });
 
         auto* btn_exp_pdf = new QPushButton("Export Figure…");
-        connect(btn_exp_pdf, &QPushButton::clicked, dlg, [this, pw]() { showFigureExportDialog(pw, this); });
+        connect(btn_exp_pdf, &QPushButton::clicked, pw, [this, pw]() { showFigureExportDialog(pw, this); });
 
         // Phase output has no magnitude floor to stand a line against, so
         // detection is only offered for the magnitude modes.
@@ -13671,22 +13858,23 @@ void MainWindow::onRunFFT() {
                           "standing above the local noise floor, and optionally "
                           "excise it."));
         btn_lines->setEnabled(out_mode != 2);
-        connect(btn_lines, &QPushButton::clicked, dlg, [=]() {
-            showSpectralLineDialog(dlg, pw, avg_ptr, /*spec_is_db=*/out_mode == 1,
+        // The line dialog draws on this tab's plot, so it belongs to it and
+        // closes with the tab.
+        connect(btn_lines, &QPushButton::clicked, pw, [=]() {
+            showSpectralLineDialog(pw, pw, avg_ptr, /*spec_is_db=*/out_mode == 1,
                                     fft_in_n, fs_hz);
         });
 
-        auto* hl = new QHBoxLayout;
+        auto* extra = new QWidget;
+        auto* hl = new QHBoxLayout(extra);
+        hl->setContentsMargins(4, 2, 4, 2);
         hl->addWidget(btn_lines);
         hl->addWidget(btn_exp_npy);
         hl->addWidget(btn_exp_pdf);
         hl->addStretch();
+        activeDs().extra_toolbar = extra;
+        updateViewLayout();
 
-        auto* vl = new QVBoxLayout(dlg);
-        vl->addWidget(pw, 1);
-        vl->addLayout(hl);
-
-        dlg->show();
         cfg->accept();   // close the config dialog now that the run succeeded
     });
 

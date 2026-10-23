@@ -217,6 +217,7 @@ private slots:
     void onRunStaticSNR();
     void onRunSpectralLeakage();
     void onRunFFT();
+    void onRunAverage();
     void onExportDataset();
     void onDragAlignChanged();
     void onUndoAction();

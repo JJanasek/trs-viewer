@@ -157,6 +157,17 @@ void TTestAccumulator::groupMeans(int g, std::vector<double>& out) const {
     for (int32_t s = 0; s < num_samples_; s++) out[static_cast<size_t>(s)] = sum_[g][s] / n;
 }
 
+void TTestAccumulator::groupStd(int g, std::vector<double>& out) const {
+    out.assign(static_cast<size_t>(num_samples_), 0.0);
+    if ((g != 0 && g != 1) || N_[g] < 2) return;
+    const double n = static_cast<double>(N_[g]);
+    for (int32_t s = 0; s < num_samples_; s++) {
+        const double mean = sum_[g][s] / n;
+        const double var  = (sum2_[g][s] - sum_[g][s] * mean) / (n - 1.0);
+        out[static_cast<size_t>(s)] = var > 0.0 ? std::sqrt(var) : 0.0;
+    }
+}
+
 int64_t TTestAccumulator::countGroup(int g) const {
     return (g == 0 || g == 1) ? N_[g] : 0;
 }
