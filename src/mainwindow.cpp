@@ -6153,10 +6153,15 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
             : "Every sample of A is paired with every sample of B, so keep the "
               "windows short: a pattern on a resampled pipeline, or a few thousand "
               "samples. A = B gives the symmetric map of all pairs inside one window.");
-        fl_pairs->setRowVisible(win_b.src->parentWidget(), !lag);
+        // A form row = its label + its field (QFormLayout::setRowVisible needs Qt 6.4).
+        auto showRow = [fl_pairs](QWidget* field, bool on) {
+            field->setVisible(on);
+            if (QWidget* l = fl_pairs->labelForField(field)) l->setVisible(on);
+        };
+        showRow(win_b.src->parentWidget(), !lag);
         if (auto* l = qobject_cast<QLabel*>(fl_pairs->labelForField(win_a.src->parentWidget())))
             l->setText(lag ? "Window:" : "Window A:");
-        fl_pairs->setRowVisible(row_lag, lag);
+        showRow(row_lag, lag);
         updatePairs();
         if (grp_pat) grp_pat->setEnabled(!bi);
         const bool pat_mode = grp_pat && grp_pat->isEnabled() && grp_pat->isChecked();
