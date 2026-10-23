@@ -98,6 +98,10 @@ set(SOURCES
     src/ttest.cpp
     src/ttest_run.cpp
     src/ttest_bivariate.cpp
+    src/dcor.cpp
+    inc/dcor.h
+    src/ttest_dcor.cpp
+    inc/ttest_dcor.h
     inc/ttest_run.h
     src/xcorr.cpp
     src/align.cpp

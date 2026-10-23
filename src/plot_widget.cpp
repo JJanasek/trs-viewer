@@ -1200,7 +1200,8 @@ void PlotWidget::paintEvent(QPaintEvent*) {
         } else {
             // Scaled axis (e.g. Hz) — use SI prefixes.
             double av = std::abs(sv);
-            if      (av >= 1e9)  lbl = QString("%1G").arg(sv / 1e9,  0, 'f', 2);
+            if      (av < 1e-12) lbl = "0";
+            else if (av >= 1e9)  lbl = QString("%1G").arg(sv / 1e9,  0, 'f', 2);
             else if (av >= 1e6)  lbl = QString("%1M").arg(sv / 1e6,  0, 'f', 2);
             else if (av >= 1e3)  lbl = QString("%1k").arg(sv / 1e3,  0, 'f', 1);
             else if (av >= 1.0)  lbl = QString("%1").arg(sv,          0, 'f', 1);

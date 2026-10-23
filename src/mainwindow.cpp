@@ -6,6 +6,8 @@
 #include "ttest_run.h"
 #include "ttest_bivariate.h"
 #include "combine_dialog.h"
+#include "dcor.h"
+#include "ttest_dcor.h"
 #include "pattern_align.h"
 #include "theme.h"
 #include "figure_dialog.h"
@@ -6333,7 +6335,9 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     cmb_order->addItems({"1st order — compare means",
                          "2nd order, univariate — each sample with itself",
                          "2nd order, bivariate — pairs of samples at different times (A × B)",
-                         "2nd order, bivariate — fixed offset Δ, for long or raw ranges (t × t+Δ)"});
+                         "2nd order, bivariate — fixed offset Δ, for long or raw ranges (t × t+Δ)",
+                         "Any order, per sample — distance correlation (dcor)",
+                         "Any order, multivariate — distance correlation over windows"});
     cmb_order->setToolTip("2nd order, univariate: tests y = (x − group mean)², for masking "
                           "whose shares are handled at the same time (hardware).\n"
                           "2nd order, bivariate: tests y = (x_a − mean)·(x_b − mean) for every "
@@ -6342,6 +6346,13 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                           "Fixed offset: the same, but only for pairs (t, t + Δ) over a few offsets Δ "
                           "and every sample t — cheap enough for long raw ranges (Schneider & Moradi "
                           "swept Δ over 1–31 clock cycles on raw traces).\n"
+                          "Distance correlation (Chowdhury & Oswald, TCHES 2026): sees any "
+                          "difference between the groups' distributions, not only in the mean — "
+                          "1st, 2nd or higher order in one test. Per sample: a curve like the "
+                          "t-test's. Over windows: one test per window or pattern, which also sees "
+                          "leakage spread over several samples (masked shares at different times), "
+                          "but not where in the window. Both report z, which behaves like |t| when "
+                          "nothing leaks.\n"
                           "All need good alignment.");
     auto* sp_win = mem.bind(new QSpinBox, "integrate");
     sp_win->setRange(1, 100001);
@@ -6501,6 +6512,70 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     updatePairs();
     fl->addRow(grp_pairs);
 
+    // Multivariate distance correlation: one test per window — windows
+    // sliding over the sample range, or each selected pattern.
+    auto* grp_mv = new QGroupBox("Windows (multivariate)");
+    auto* fl_mv  = new QFormLayout(grp_mv);
+    auto* sp_mv_len  = mem.bind(new QSpinBox, "mv_len");
+    auto* sp_mv_step = mem.bind(new QSpinBox, "mv_step");
+    sp_mv_len->setRange(2, std::max(2, static_cast<int>(std::min<int64_t>(h.num_samples, INT_MAX))));
+    sp_mv_step->setRange(1, std::max(1, static_cast<int>(std::min<int64_t>(h.num_samples, INT_MAX))));
+    sp_mv_len->setValue(64);
+    sp_mv_step->setValue(64);
+    sp_mv_len->setToolTip("Raw samples per window. Keep windows short: leakage that only shows "
+                          "when samples are combined (masked shares) fades roughly as 1 / width "
+                          "here. Use a resampled pipeline (about one point per clock cycle) and "
+                          "windows of tens of points, or patterns around the operations.");
+    sp_mv_step->setToolTip("Raw samples from one window's start to the next (equal to the "
+                           "length: windows side by side).");
+    auto* chk_mv_unit = mem.bind(new QCheckBox("Scale each sample to unit variance"), "mv_unit");
+    chk_mv_unit->setChecked(true);
+    chk_mv_unit->setToolTip("Every sample counts equally in the distances between traces. "
+                            "Otherwise samples with a large spread (noise, big swings) drown out "
+                            "quiet ones that may carry the leak.");
+    auto* lbl_mv = new QLabel;
+    lbl_mv->setWordWrap(true);
+    fl_mv->addRow("Window:", widgetRow({sp_mv_len, new QLabel("step"), sp_mv_step}));
+    fl_mv->addRow(chk_mv_unit);
+    fl_mv->addRow(lbl_mv);
+    auto mvPatternMode = [=]() { return grp_pat && grp_pat->isEnabled() && grp_pat->isChecked(); };
+    auto updateMv = [=, this]() {
+        const bool pat = mvPatternMode();
+        sp_mv_len->setEnabled(!pat);
+        sp_mv_step->setEnabled(!pat);
+        const QLocale loc;
+        const int64_t n_traces = sp_count->value();
+        if (pat) {
+            lbl_mv->setStyleSheet(QString());
+            lbl_mv->setText("Each ticked pattern is one window, with its own shifts.");
+            return;
+        }
+        const int64_t start = sp_s_first->value();
+        const int64_t range = sp_s_count->value() == 0 ? h.num_samples - start
+                                                       : std::min<int64_t>(sp_s_count->value(), h.num_samples - start);
+        const int64_t len = sp_mv_len->value(), step = sp_mv_step->value();
+        const int64_t count = range >= len ? (range - len) / step + 1 : 0;
+        const int64_t plen = processedLength(activeDs().pipeline, len);
+        if (count == 0) {
+            lbl_mv->setStyleSheet(themeErrorStyle());
+            lbl_mv->setText("The sample range is shorter than one window.");
+        } else if (plen > maxDcorWindow(n_traces)) {
+            lbl_mv->setStyleSheet(themeErrorStyle());
+            lbl_mv->setText(QString("A window of %1 samples (after the pipeline) × %2 traces doesn't fit "
+                                    "in memory: at most %3 samples. Shorten it or resample.")
+                .arg(loc.toString(static_cast<qlonglong>(plen)), loc.toString(static_cast<qlonglong>(n_traces)),
+                     loc.toString(static_cast<qlonglong>(maxDcorWindow(n_traces)))));
+        } else {
+            lbl_mv->setStyleSheet(QString());
+            lbl_mv->setText(QString("%1 windows of %2 samples after the pipeline, ~%3 MB each.")
+                .arg(loc.toString(static_cast<qlonglong>(count)), loc.toString(static_cast<qlonglong>(plen)))
+                .arg(std::max<int64_t>(1, plen * n_traces * 4 / (1024 * 1024))));
+        }
+    };
+    for (QSpinBox* sp : {sp_mv_len, sp_mv_step, sp_s_first, sp_s_count, sp_count})
+        connect(sp, QOverload<int>::of(&QSpinBox::valueChanged), &cfg, updateMv);
+    fl->addRow(grp_mv);
+
     // Live progress: intermediate t-curves while the job runs (ttest_run.h).
     auto* grp_live = new QGroupBox("Live progress");
     auto* fl_live  = new QFormLayout(grp_live);
@@ -6549,9 +6624,11 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     // Bivariate runs use the A × B windows instead of the sample range and
     // patterns list, and have no live view or chain step (yet).
     auto syncBivariate = [=, &cfg](int idx) {
-        const bool bi  = idx >= 2;
+        const bool bi  = idx == 2 || idx == 3;
         const bool lag = idx == 3;
+        const bool dc  = idx >= 4;          // distance correlation
         grp_pairs->setVisible(bi);
+        grp_mv->setVisible(idx == 5);
         grp_pairs->setTitle(lag ? "Sample pairs (t, t + Δ)" : "Sample pairs (A × B)");
         grp_pairs->setToolTip(lag
             ? "Every sample t of the window is paired with t + Δ for each offset Δ (read past "
@@ -6575,11 +6652,12 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         sp_s_first->setEnabled(!bi && !pat_mode);
         sp_s_count->setEnabled(!bi && !pat_mode);
         grp_align->setEnabled(!pat_mode);
-        grp_live->setEnabled(!bi && !pat_mode);
+        grp_live->setEnabled(!bi && !dc && !pat_mode);
         if (chk_add_chain) {
-            chk_add_chain->setEnabled(!bi);
-            chk_add_chain->setToolTip(bi ? "Bivariate runs can't be added to a chain yet." : QString());
+            chk_add_chain->setEnabled(!bi && !dc);
+            chk_add_chain->setToolTip(bi || dc ? "This test can't be added to a chain yet." : QString());
         }
+        updateMv();
         cfg.adjustSize();
     };
     connect(cmb_order, QOverload<int>::of(&QComboBox::currentIndexChanged), &cfg, syncBivariate);
@@ -6619,8 +6697,179 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         plotWidget()->addTrace(std::make_shared<std::vector<float>>(t1), c, "1st order");
     };
 
+    // ---- Distance correlation: any order, per sample (4) or per window (5) ----
+    if (cmb_order->currentIndex() >= 4) {
+        const bool per_window = cmb_order->currentIndex() == 5;
+        const int32_t tile_idx = sp_tile ? sp_tile->value() : 0;
+        const ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), tile_idx);
+        const bool use_shifts = chk_shifts->isChecked();
+        const bool pat_mode = mvPatternMode();
+        // Patterns read the whole trace with their own shifts; the sample
+        // range uses the last alignment's (one tile's bounds, when tiled).
+        const int64_t read_lo = !pat_mode && ds_tiled && use_shifts ? resolved.first_sample : 0;
+        const int64_t read_hi = !pat_mode && ds_tiled && use_shifts
+            ? resolved.first_sample + resolved.n_samples : h.num_samples;
+        std::vector<BivariateWindow> ranges;   // per sample: what to test; per window: the windows
+        if (pat_mode) {
+            for (int r = 0; r < lst_pat->count(); r++) {
+                if (lst_pat->item(r)->checkState() != Qt::Checked) continue;
+                const Pattern& p = activeDs().patterns[static_cast<size_t>(lst_pat->item(r)->data(Qt::UserRole).toInt())];
+                BivariateWindow w;
+                w.name      = QString::fromStdString(p.def.name);
+                w.raw_start = p.def.raw_start;
+                w.raw_len   = p.def.raw_end - p.def.raw_start;
+                w.shifts    = p.res.shifts;
+                w.shifts_first_trace = p.res.first_trace;
+                ranges.push_back(w);
+            }
+            if (ranges.empty()) {
+                QMessageBox::information(this, "T-test", "Tick at least one pattern.");
+                return;
+            }
+        } else {
+            BivariateWindow range;
+            range.name      = "range";
+            range.raw_start = sp_s_first->value();
+            range.raw_len   = sp_s_count->value() == 0
+                ? h.num_samples - range.raw_start
+                : std::min<int64_t>(sp_s_count->value(), h.num_samples - range.raw_start);
+            if (use_shifts) {
+                range.shifts = resolved.shifts;
+                range.shifts_first_trace = activeDs().align_first_trace;
+            }
+            if (!per_window) {
+                ranges.push_back(range);
+            } else {
+                const int64_t len = sp_mv_len->value(), step = sp_mv_step->value();
+                for (int64_t a = range.raw_start; a + len <= range.raw_start + range.raw_len; a += step) {
+                    BivariateWindow w = range;
+                    w.name      = QString::number(a);
+                    w.raw_start = a;
+                    w.raw_len   = len;
+                    ranges.push_back(w);
+                }
+                if (ranges.empty()) {
+                    QMessageBox::warning(this, "T-test", lbl_mv->text());
+                    return;
+                }
+            }
+        }
+        const int64_t step = sp_mv_step->value();
+        const bool standardize = chk_mv_unit->isChecked();
+        const bool sanity = chk_sanity->isChecked();
+        std::shared_ptr<TrsFile> job_file = activeDs().file;
+        std::vector<std::shared_ptr<ITransform>> job_pipeline;
+        for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
+        const QString fname = activeDs().display_name;
+        struct DcOut {
+            std::vector<DcorCurveResult> curves;   // per sample: one per range
+            DcorWindowResult windows;              // per window
+            QString warn, err;
+        };
+        auto out = std::make_shared<DcOut>();
+
+        jobs_->submit(QString("Distance correlation%1 — %2").arg(per_window ? " (windows)" : "").arg(fname),
+            [=](JobContext& ctx) {
+                if (per_window)
+                    return computeWindowDcor(job_file.get(), job_pipeline, first, count, ranges, byte_idx,
+                                             read_lo, read_hi, sanity, standardize,
+                                             [&ctx](int64_t done, int64_t total) {
+                                                 ctx.setProgress(done, total);
+                                                 return !ctx.cancelled();
+                                             },
+                                             out->windows, out->warn, out->err);
+                out->curves.resize(ranges.size());
+                for (size_t k = 0; k < ranges.size(); k++) {
+                    QString warn;
+                    auto prog = [&](int64_t done, int64_t total) {
+                        ctx.setProgress(static_cast<int64_t>(k) * total + done,
+                                        static_cast<int64_t>(ranges.size()) * total);
+                        return !ctx.cancelled();
+                    };
+                    if (!computeDcorCurve(job_file.get(), job_pipeline, first, count, ranges[k], byte_idx,
+                                          read_lo, read_hi, sanity, prog, out->curves[k], warn, out->err)) {
+                        if (out->err != "Cancelled." && pat_mode)
+                            out->err = QString("Pattern \"%1\": %2").arg(ranges[k].name, out->err);
+                        return false;
+                    }
+                    if (!warn.isEmpty())
+                        out->warn += (out->warn.isEmpty() ? "" : "\n")
+                                   + (pat_mode ? ranges[k].name + ": " : QString()) + warn;
+                }
+                return true;
+            },
+            [=](bool ok) {
+                if (!ok) {
+                    if (!out->err.isEmpty() && out->err != "Cancelled.")
+                        QMessageBox::critical(this, "T-test failed", out->err);
+                    return;
+                }
+                if (!out->warn.isEmpty()) QMessageBox::warning(this, "T-test", out->warn);
+                const QString tag = sanity ? QString(" · SANITY SPLIT") : QString();
+                const QString z_label = "dcor z (≈ |t|)";
+                if (!per_window) {
+                    // One curve per range, side by side for patterns.
+                    std::vector<float> joined;
+                    std::vector<PlotWidget::PatternBand> bands;
+                    int64_t n0 = 0, n1 = 0;
+                    for (size_t k = 0; k < out->curves.size(); k++) {
+                        const auto& c = out->curves[k];
+                        const int64_t off = static_cast<int64_t>(joined.size());
+                        joined.insert(joined.end(), c.z.begin(), c.z.end());
+                        if (pat_mode)
+                            bands.push_back({off, static_cast<int64_t>(joined.size()), ranges[k].name,
+                                             themeTraceColor(static_cast<int>(k)), true});
+                        n0 = std::max(n0, c.n0);
+                        n1 = std::max(n1, c.n1);
+                    }
+                    const std::vector<double> df(joined.size(), 1e9);   // z is normal: no df
+                    buildTTestResultTab(nullptr, std::move(joined), n0, n1, count, true, &df, bands,
+                        QString("Distance correlation, any order%1 — %2%3 traces (G0:%4  G1:%5)")
+                            .arg(tag).arg(pat_mode ? QString("%1 patterns, ").arg(ranges.size()) : QString())
+                            .arg(count).arg(n0).arg(n1), z_label);
+                    plotWidget()->setAxisLabels(pat_mode ? "Patterns (joined, raw samples)" : "Sample Index", z_label);
+                    if (!pat_mode && keepsSamplePositions(job_pipeline))
+                        plotWidget()->setAxisMeta(fileSampleInterval(job_file->header()), ranges.front().raw_start);
+                    return;
+                }
+                // One value per window.
+                const DcorWindowResult& r = out->windows;
+                std::vector<PlotWidget::PatternBand> bands;
+                if (pat_mode)
+                    for (size_t k = 0; k < ranges.size(); k++)
+                        bands.push_back({static_cast<int64_t>(k), static_cast<int64_t>(k) + 1, ranges[k].name,
+                                         themeTraceColor(static_cast<int>(k)), true});
+                int64_t n0 = 0, n1 = 0;
+                for (size_t k = 0; k < r.z.size(); k++) { n0 = std::max(n0, r.n0[k]); n1 = std::max(n1, r.n1[k]); }
+                const std::vector<double> df(r.z.size(), 1e9);
+                buildTTestResultTab(nullptr, r.z, n0, n1, count, true, &df, bands,
+                    QString("Multivariate distance correlation%1 — %2 (G0:%3  G1:%4)")
+                        .arg(tag)
+                        .arg(pat_mode ? QString("%1 patterns").arg(ranges.size())
+                                      : QString("%1 windows of %2").arg(ranges.size()).arg(ranges.front().raw_len))
+                        .arg(n0).arg(n1), z_label);
+                PlotWidget* pw = plotWidget();
+                if (pat_mode) {
+                    pw->setAxisLabels("Pattern", z_label);
+                } else {
+                    pw->setXScale(static_cast<double>(step), static_cast<double>(ranges.front().raw_start));
+                    pw->setAxisLabels("Window start (raw sample)", z_label);
+                }
+                pw->resetView();
+                const auto best = std::max_element(r.z.begin(), r.z.end());
+                const size_t bi = static_cast<size_t>(best - r.z.begin());
+                statusBar()->showMessage(QString("Strongest window: %1 (z = %2, p ≈ %3, R*² = %4)")
+                    .arg(pat_mode ? ranges[bi].name : QString("samples %1–%2").arg(ranges[bi].raw_start)
+                                                          .arg(ranges[bi].raw_start + ranges[bi].raw_len - 1))
+                    .arg(static_cast<double>(*best), 0, 'f', 2)
+                    .arg(dcorPValue(*best), 0, 'g', 2)
+                    .arg(r.r2[bi], 0, 'g', 3), 20000);
+            });
+        return;
+    }
+
     // ---- Bivariate run: every pair (a in A, b in B), or (t, t + Δ) ----
-    if (cmb_order->currentIndex() >= 2) {
+    if (cmb_order->currentIndex() == 2 || cmb_order->currentIndex() == 3) {
         const bool lag_mode = cmb_order->currentIndex() == 3;
         int64_t bytes = 0;
         std::vector<int32_t> lags;
@@ -6972,7 +7221,8 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
                                       int32_t eff_count, bool abs_value,
                                       const std::vector<double>* df_override,
                                       const std::vector<PlotWidget::PatternBand>& bands,
-                                      const QString& title_override)
+                                      const QString& title_override,
+                                      const QString& value_label_override)
 {
     auto tstat_ptr  = std::make_shared<std::vector<float>>(std::move(tstat));
     auto current_ptr = std::make_shared<std::vector<float>>(*tstat_ptr);
@@ -6981,7 +7231,8 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     else             acc_ptr->computeWelchDf(*df_orig);
     auto current_df = std::make_shared<std::vector<double>>(*df_orig);
 
-    const QString value_label = abs_value ? "|t|-value" : "t-value";
+    const QString value_label = !value_label_override.isEmpty() ? value_label_override
+                              : abs_value ? "|t|-value" : "t-value";
     QString tab_title = !title_override.isEmpty() ? title_override
                       : QString("Welch t-test — %1 traces (G0:%2  G1:%3)%4")
                             .arg(eff_count).arg(n0).arg(n1)
@@ -7086,9 +7337,11 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
         auto* lbl_th  = new QLabel;
         lbl_th->setTextFormat(Qt::RichText);
 
-        // Compute median Welch df from the accumulator (data-driven)
+        // Compute median Welch df from the accumulator (data-driven); a
+        // result without one (distance correlation) brings its own df.
         std::vector<double> df_vec;
-        acc_ptr->computeWelchDf(df_vec);
+        if (acc_ptr) acc_ptr->computeWelchDf(df_vec);
+        else         df_vec = *df_orig;
         std::vector<double> df_sorted = df_vec;
         std::sort(df_sorted.begin(), df_sorted.end());
         double median_nu = df_sorted.empty()

@@ -411,7 +411,8 @@ private:
                               int32_t eff_count, bool abs_value,
                               const std::vector<double>* df_override = nullptr,
                               const std::vector<PlotWidget::PatternBand>& bands = {},
-                              const QString& title_override = {});
+                              const QString& title_override = {},
+                              const QString& value_label_override = {});
     // Live t-test: a result tab that shows intermediate t-curves and the
     // max|t|-vs-traces history while the job runs. See ttest_run.h.
     void showLagResult(const LagResult& r, const BivariateWindow& w,

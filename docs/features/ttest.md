@@ -98,6 +98,56 @@ Each (sample, offset) is a separate test, so expect occasional values above
 4.5 by chance when there are millions; run the sanity check before trusting
 a lone hit.
 
+### Distance correlation: any order (per sample, or over windows)
+
+Two more choices under **Order** test fixed vs random with *distance
+correlation* instead of comparing means (Chowdhury & Oswald, *Multivariate
+Leakage Detection*, TCHES 2026(2)). Distance correlation is zero only when the
+class says nothing at all about the traces, so it reacts to any difference
+between the two groups — in the mean, the variance or any higher moment — in
+one test, without choosing an order or a combining function.
+
+Both report **z = √(n·R*² + 1)**, where R*² is the unbiased squared distance
+correlation (Székely & Rizzo). When nothing leaks, n·R*² + 1 follows (at most)
+a χ² distribution with one degree of freedom (Shen, Panda & Vogelstein 2022),
+so z behaves like |t| from a t-test on many traces: the same 4.5 line means
+the same false-positive rate, and **Calc TH** gives the corrected threshold
+for the number of samples (or windows) tested.
+
+**Any order, per sample — distance correlation (dcor).** A curve over the
+sample range (or the ticked patterns), like the t-test's. It finds what the
+1st-order t-test finds and also leaks that only change the spread or shape of
+the distribution (masking whose shares are handled at the same time,
+hardware). It does not see leakage that needs two samples combined; use the
+bivariate tests or the window test for that. Unlike the t-test it needs every
+trace's value at a sample at once, so the range is processed in blocks of up
+to 1 GB; raw 8-bit samples without a pipeline are binned, which is fast (1 M
+samples × 5000 traces in about 20 s).
+
+**Any order, multivariate — distance correlation over windows.** One test
+per window: all samples of the window together, as one point per trace in a
+many-dimensional space. It also sees leakage spread over several samples —
+masked shares handled at *different* times — without forming pairs. It says
+whether a window leaks, not where in it. Windows slide over the sample range
+(**Window** length and **step**, in raw samples), or each ticked pattern is a
+window with its own shifts. The result tab shows z per window; the status bar
+names the strongest window with its p-value.
+
+!!! warning "Keep windows short"
+    Leakage that only shows when samples are combined fades roughly as
+    1 / (window width) in this test: two shares in a window of 2 samples
+    gave z ≈ 18 on 3000 simulated traces, in a window of 20 samples z ≈ 3.
+    Use a resampled pipeline (about one point per clock cycle) and windows of
+    tens of points, or patterns around the operations. **Scale each sample to
+    unit variance** (on by default) keeps noisy samples from drowning quiet
+    ones.
+
+Window tests hold a window's values for all traces in memory (up to 1 GB, e.g.
+5000 traces × 50 000 samples); the distances between traces are computed with
+blocked matrix products, about 0.5 s for a 2000-sample window and 5000
+traces. Neither test has live progress or a chain step yet. The random-split
+sanity check works for both.
+
 ## Using patterns
 
 When the file has aligned [patterns](patterns.md), the dialog shows **Use
