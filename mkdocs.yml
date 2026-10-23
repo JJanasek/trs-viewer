@@ -33,6 +33,7 @@ nav:
   - Usage: usage.md
   - Features:
       - Trace viewing: features/viewing.md
+      - Several files as one set: features/combined.md
       - Processing pipeline: features/pipeline.md
       - Trace alignment: features/alignment.md
       - Pattern alignment: features/patterns.md

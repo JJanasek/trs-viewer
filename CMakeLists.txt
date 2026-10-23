@@ -92,6 +92,8 @@ set(SOURCES
     inc/figure.h
     src/figure_dialog.cpp
     inc/figure_dialog.h
+    src/combine_dialog.cpp
+    inc/combine_dialog.h
     inc/theme.h
     src/ttest.cpp
     src/ttest_run.cpp

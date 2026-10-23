@@ -18,6 +18,7 @@ analyses over the result — each in its own tab, several files at a time.
 | | |
 |---|---|
 | **[Viewing](features/viewing.md)** | Lazily memory-mapped trace browser, pan/zoom/measure, stacked lanes |
+| **[Several files as one](features/combined.md)** | A capture split into parts opened as one trace set, without copying |
 | **[Pipeline](features/pipeline.md)** | Filters, resampling, FFT/STFT and more, applied live to every analysis |
 | **[Alignment](features/alignment.md)** | Peak and cross-correlation alignment, including per-tile alignment |
 | **[Pattern alignment](features/patterns.md)** | Mark several regions, align each on its own (exact to the raw sample), test them side by side |

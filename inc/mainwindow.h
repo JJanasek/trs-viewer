@@ -167,6 +167,7 @@ public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;
 
+    // A .trs file, or a .trslist (several files as one set).
     void openFile(const QString& path);
     // Opens by extension: .npy/.npz as a trace matrix, anything else as TRS.
     void openAnyFile(const QString& path);
@@ -184,6 +185,7 @@ protected:
 
 private slots:
     void onOpenFile();
+    void onOpenCombined();
     void onImportTraceSubset();
     void onWarmPageCache();
     void onCloseDataset();
@@ -267,6 +269,10 @@ private:
     void onPatternEditor();
     void refreshPatternBands(Dataset& ds);
     void openNpyTraces(const QString& path);
+    // Shows an opened trace file in a new tab; recent_path (if not empty)
+    // goes to Recent files.
+    void showTraceSet(std::shared_ptr<TrsFile> f, const QString& display_name,
+                      const QString& recent_path);
     // Most-recently-opened files (QSettings "recentFiles"), newest first.
     static QStringList recentFiles();
     void addRecentFile(const QString& path);

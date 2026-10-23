@@ -6,6 +6,7 @@
 | Method | How |
 |---|---|
 | TRS file | **File → Open TRS File…** (Ctrl+O) or command-line argument |
+| Several TRS files as one set | **File → Open Several Files as One…**; reopen with the saved `.trslist` ([details](features/combined.md)) |
 | NPY (2-D trace matrix) | **File → Open NPY/NPZ as Traces…** |
 | NPZ archive | same — looks for `traces` array + optional `data` array |
 | Any of the above | Drag the file onto the window |

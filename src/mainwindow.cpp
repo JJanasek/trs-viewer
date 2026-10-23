@@ -5,6 +5,7 @@
 #include "ttest.h"
 #include "ttest_run.h"
 #include "ttest_bivariate.h"
+#include "combine_dialog.h"
 #include "pattern_align.h"
 #include "theme.h"
 #include "figure_dialog.h"
@@ -1111,19 +1112,25 @@ QWidget* MainWindow::buildStartPage() {
     tf.setBold(true);
     title->setFont(tf);
     auto* sub = new QLabel("Riscure .trs, or NumPy .npy / .npz. Large files open instantly "
-                           "without loading into RAM. You can also drop files onto this window.");
+                           "without loading into RAM. Captures split into several files open as "
+                           "one set. You can also drop files onto this window.");
     sub->setWordWrap(true);
 
     auto* btns = new QHBoxLayout;
     auto* b_open   = new QPushButton("Open TRS File…  (Ctrl+O)");
     auto* b_npy    = new QPushButton("Open NPY/NPZ…");
     auto* b_subset = new QPushButton("Import Subset…");
+    auto* b_comb   = new QPushButton("Open Several as One…");
+    b_comb->setToolTip("Several TRS files (e.g. a capture split into parts) read one after "
+                       "another as one trace set.");
     b_open->setDefault(true);
     b_open->setProperty("primary", true);
     connect(b_open,   &QPushButton::clicked, this, &MainWindow::onOpenFile);
     connect(b_npy,    &QPushButton::clicked, this, &MainWindow::onOpenNpyTraces);
     connect(b_subset, &QPushButton::clicked, this, &MainWindow::onImportTraceSubset);
+    connect(b_comb,   &QPushButton::clicked, this, &MainWindow::onOpenCombined);
     btns->addWidget(b_open);
+    btns->addWidget(b_comb);
     btns->addWidget(b_npy);
     btns->addWidget(b_subset);
     btns->addStretch();
@@ -1176,7 +1183,7 @@ QWidget* MainWindow::buildStartPage() {
 
 static bool isOpenableTraceFile(const QString& path) {
     const QString l = path.toLower();
-    return l.endsWith(".trs") || l.endsWith(".npy") || l.endsWith(".npz");
+    return l.endsWith(".trs") || l.endsWith(".trslist") || l.endsWith(".npy") || l.endsWith(".npz");
 }
 
 void MainWindow::dragEnterEvent(QDragEnterEvent* e) {
@@ -1211,6 +1218,13 @@ void MainWindow::setupMenuBar() {
     act_open->setShortcut(QKeySequence::Open);
     connect(act_open, &QAction::triggered, this, &MainWindow::onOpenFile);
     file_menu->addAction(act_open);
+    auto* act_open_comb = new QAction("Open Several Files as &One…", this);
+    act_open_comb->setToolTip(
+        "Read several TRS files one after another as one trace set — e.g. a capture "
+        "split into parts of 500 traces. Nothing is copied; the list can be saved "
+        "(.trslist) to reopen the set.");
+    connect(act_open_comb, &QAction::triggered, this, &MainWindow::onOpenCombined);
+    file_menu->addAction(act_open_comb);
     auto* act_open_npy = new QAction("Open &NPY/NPZ as Traces…", this);
     connect(act_open_npy, &QAction::triggered, this, &MainWindow::onOpenNpyTraces);
     file_menu->addAction(act_open_npy);
@@ -1668,7 +1682,8 @@ void MainWindow::updateRecentDir(const QString& key, const QString& file_path) {
 
 void MainWindow::onOpenFile() {
     QStringList paths = QFileDialog::getOpenFileNames(
-        this, "Open TRS file(s)", recentDir("trs"), "TRS files (*.trs);;All files (*)");
+        this, "Open TRS file(s)", recentDir("trs"),
+        "TRS files and trace lists (*.trs *.trslist);;All files (*)");
     if (paths.isEmpty()) return;
     updateRecentDir("trs", paths.last());
     // Each becomes its own tab (openFile() already handles that); loaded
@@ -1701,30 +1716,64 @@ void MainWindow::prefetchWithProgress(TrsFile* file, const QString& label) {
     prog.setValue(100);
 }
 
+// A .trs file, or the files a .trslist names, as one set.
+static bool openTraceSource(TrsFile& f, const QString& path, std::string& err) {
+    if (!path.endsWith(".trslist", Qt::CaseInsensitive)) return f.open(path.toStdString(), err);
+    std::vector<std::string> parts;
+    return readTraceList(path.toStdString(), parts, err)
+        && f.openCombined(parts, err, path.toStdString());
+}
+
+void MainWindow::onOpenCombined() {
+    const QStringList paths = QFileDialog::getOpenFileNames(
+        this, "Open as one dataset — choose the files", recentDir("trs"),
+        "TRS files (*.trs);;All files (*)");
+    if (paths.isEmpty()) return;
+    updateRecentDir("trs", paths.last());
+    CombineChoice c;
+    if (!showCombineDialog(this, paths, recentDir("trs"), c)) return;
+    auto f = std::make_shared<TrsFile>();
+    std::string err;
+    if (!f->openCombined(c.paths, err, c.list_path.toStdString())) {
+        QMessageBox::critical(this, "Error opening the files", QString::fromStdString(err));
+        return;
+    }
+    const QString name = !c.list_path.isEmpty() ? QFileInfo(c.list_path).fileName()
+        : QString("%1 + %2 more").arg(QFileInfo(QString::fromStdString(c.paths.front())).fileName())
+                                 .arg(c.paths.size() - 1);
+    showTraceSet(std::move(f), name, c.list_path);
+}
+
 void MainWindow::openFile(const QString& path) {
     auto f = std::make_shared<TrsFile>();
     std::string err;
-    if (!f->open(path.toStdString(), err)) {
+    if (!openTraceSource(*f, path, err)) {
         QMessageBox::critical(this, "Error opening TRS file",
                               QString::fromStdString(err));
         return;
     }
+    showTraceSet(std::move(f), QFileInfo(path).fileName(), path);
+}
+
+void MainWindow::showTraceSet(std::shared_ptr<TrsFile> f, const QString& display_name,
+                              const QString& recent_path) {
     // No prefetch here: open() is just a header parse + mmap, so this
     // returns as fast for a multi-GB file as a tiny one — pages fault in
     // lazily wherever the app actually reads them. See onWarmPageCache()
     // for the opt-in version of the up-front page-cache warm-up this used
     // to always do unconditionally.
 
+    const QString notes = QString::fromStdString(f->openNotes());
     Dataset ds;
     ds.file         = std::move(f);
-    ds.display_name = QFileInfo(path).fileName();
+    ds.display_name = display_name;
     ds.plot_widget  = createPlotWidgetForTab();
     datasets_.push_back(std::move(ds));
     active_idx_ = static_cast<int>(datasets_.size()) - 1;
 
     tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
     tab_bar_->setCurrentIndex(active_idx_);
-    addRecentFile(path);
+    if (!recent_path.isEmpty()) addRecentFile(recent_path);
 
     rebuildTransformList();
     plotWidget()->setTransforms(activeDs().pipeline);
@@ -1743,6 +1792,7 @@ void MainWindow::openFile(const QString& path) {
     updateFileInfo();
     onApplyTraces();
     updateViewLayout();
+    if (!notes.isEmpty()) QMessageBox::warning(this, "Opened with notes", notes);
 }
 
 static QString hexBytes(const uint8_t* p, size_t n, int group = 0) {
@@ -1782,6 +1832,17 @@ void MainWindow::updateFileInfo() {
     QString info = QString("Traces:  %1\nSamples: %2\nType:    %3\nData:    %4 B/trace")
         .arg(h.num_traces).arg(h.num_samples)
         .arg(type_str).arg(h.data_length);
+    // A combined set: how many files, and which traces each holds.
+    const auto parts = activeDs().file->parts();
+    QString files_tip;
+    if (!parts.empty()) {
+        info += QString("\nFiles:   %1 (one set)").arg(parts.size());
+        for (const auto& p : parts)
+            files_tip += QString("%1   traces %2–%3\n")
+                .arg(QString::fromStdString(p.path)).arg(p.first_trace)
+                .arg(p.first_trace + p.num_traces - 1);
+    }
+    lbl_file_->setToolTip(files_tip.trimmed());
     if (effective_samples != h.num_samples)
         info += QString("\nAfter pipeline: %1").arg(effective_samples);
     lbl_info_->setText(info);
@@ -1804,6 +1865,11 @@ void MainWindow::updateTraceDataDisplay() {
     if (raw.empty()) { lbl_trace_data_->setText("(empty)"); return; }
 
     QString text = QString("Trace %1 / %2\n").arg(ti).arg(h.num_traces - 1);
+    if (const int k = activeDs().file->partOf(ti); k >= 0) {
+        const auto p = activeDs().file->parts()[static_cast<size_t>(k)];
+        text += QString("File:  %1, trace %2\n")
+            .arg(QString::fromStdString(p.path).section('/', -1)).arg(ti - p.first_trace);
+    }
 
     // If we have named params, show them by name with decoded integer values
     if (!h.param_map.empty() && h.param_map.find("LEGACY_DATA") == h.param_map.end()) {
@@ -2732,13 +2798,13 @@ void MainWindow::onExportTrs() {
 void MainWindow::onImportTraceSubset() {
     QString src_path = QFileDialog::getOpenFileName(
         this, "Import Trace Subset — source TRS file",
-        recentDir("trs"), "TRS files (*.trs);;All files (*)");
+        recentDir("trs"), "TRS files and trace lists (*.trs *.trslist);;All files (*)");
     if (src_path.isEmpty()) return;
     updateRecentDir("trs", src_path);
 
     TrsFile src;
     std::string open_err;
-    if (!src.open(src_path.toStdString(), open_err)) {
+    if (!openTraceSource(src, src_path, open_err)) {
         QMessageBox::critical(this, "Error opening TRS file",
                               QString::fromStdString(open_err));
         return;

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -18,6 +19,9 @@ struct TrsTraceParam {
     uint16_t offset = 0;   // byte offset within per-trace data block
     uint16_t length = 0;   // byte length of the parameter value
     uint8_t  type   = 0;   // type ID (0x01 = uint8, etc.)
+    bool operator==(const TrsTraceParam& o) const {
+        return offset == o.offset && length == o.length && type == o.type;
+    }
 };
 
 struct TrsHeader {
@@ -47,7 +51,16 @@ public:
     TrsFile(const TrsFile&)            = delete;
     TrsFile& operator=(const TrsFile&) = delete;
 
+    // A file cut off mid-trace (e.g. a capture that died) opens with its
+    // complete traces only; openNotes() then says so.
     bool open(const std::string& path, std::string& error);
+    // Several TRS files read as one trace set: the traces of the first file,
+    // then of the second, and so on, each file memory-mapped as with open().
+    // They must agree on what combineMismatch() checks. The header is the
+    // first file's, with num_traces the total. path() is `list_path` if
+    // given (the .trslist they came from), else the first file's.
+    bool openCombined(const std::vector<std::string>& paths, std::string& error,
+                      const std::string& list_path = {});
     // Memory-maps a plain 2-D float32 (.npy) trace matrix directly — no full-file
     // read and no in-RAM copy, so files far larger than available RAM work fine.
     bool openNpy(const std::string& path, std::string& error);
@@ -59,10 +72,23 @@ public:
                        const uint8_t* data_bytes = nullptr, int16_t data_length = 0);
     void close();
 
-    bool isOpen() const { return mmap_ptr_ != nullptr || !mem_samples_.empty(); }
+    bool isOpen() const { return mmap_ptr_ != nullptr || !mem_samples_.empty() || !parts_.empty(); }
     const TrsHeader& header() const { return header_; }
     const std::string& path() const { return path_; }
     void setParamMap(const std::map<std::string, TrsTraceParam>& pm) { header_.param_map = pm; }
+    // Anything worth telling the user after opening (cut-off files, files
+    // with a different scale); empty if nothing.
+    const std::string& openNotes() const { return notes_; }
+
+    // The files of a combined set (empty for a single file).
+    struct Part {
+        std::string path;
+        int32_t     first_trace = 0;   // global index of its first trace
+        int32_t     num_traces  = 0;
+    };
+    std::vector<Part> parts() const;
+    // Index into parts() of the file holding global trace trace_idx (-1 if none).
+    int partOf(int32_t trace_idx) const;
 
     // Read `count` samples starting at `sample_offset` from trace `trace_idx`.
     // Converts to float32 regardless of on-disk format.
@@ -94,6 +120,9 @@ public:
 
 private:
     bool    parseHeader(const uint8_t* data, size_t size, std::string& error);
+    // Combined mode: the part holding global trace_idx and the trace's index
+    // in it; nullptr if out of range.
+    const TrsFile* locate(int32_t trace_idx, int32_t& local) const;
     int64_t traceByteOffset(int32_t trace_idx) const;
 
     void*       mmap_ptr_           = nullptr;
@@ -107,4 +136,26 @@ private:
     // In-memory mode (set by openFromArray)
     std::vector<float>   mem_samples_;   // n_traces × n_samples, row-major
     std::vector<uint8_t> mem_data_;      // n_traces × data_length, row-major
+
+    // Combined mode (set by openCombined): reads go to parts_[k], which
+    // holds global traces [part_first_[k], part_first_[k + 1]).
+    std::vector<std::unique_ptr<TrsFile>> parts_;
+    std::vector<int32_t>                  part_first_;
+
+    std::string notes_;
 };
+
+// Why a file with header `h` can't be read as one trace set together with a
+// file with header `first` (a short reason), or "" if it can: the samples
+// per trace, sample coding, data bytes per trace and named parameters must
+// match.
+std::string combineMismatch(const TrsHeader& first, const TrsHeader& h);
+
+// A trace list (.trslist): the files of a combined set, one path per line,
+// relative to the list's own folder or absolute; blank lines and lines
+// starting with '#' are ignored. writeTraceList() stores paths relative to
+// the list where it can, so the folder can be moved as a whole.
+bool readTraceList(const std::string& list_path, std::vector<std::string>& paths,
+                   std::string& error);
+bool writeTraceList(const std::string& list_path, const std::vector<std::string>& paths,
+                    std::string& error);

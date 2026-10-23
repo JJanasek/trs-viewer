@@ -272,3 +272,162 @@ TEST(TrsFile, WillNeedIsAHarmlessHint) {
     f.close();
     std::remove(path.c_str());
 }
+
+// ---------------------------------------------------------------------------
+// TRS files on disk, and several opened as one set (openCombined)
+// ---------------------------------------------------------------------------
+
+#include <filesystem>
+#include <fstream>
+
+namespace {
+
+// A minimal TRS file: int16 samples, sample s of trace t = base + t * 10 + s,
+// one data byte per trace (= base + t). `declared` traces in the header (-1:
+// as many as written); `extra` stray bytes after the last trace.
+std::string writeTrs(const std::string& name, int n_traces, int n_samples, int base,
+                     int declared = -1, int extra = 0, int data_len = 1) {
+    const std::string path = (std::filesystem::temp_directory_path() /
+                              ("trs_viewer_test_" + name)).string();
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    auto u8  = [&](int v) { const char c = static_cast<char>(v); f.write(&c, 1); };
+    auto le32 = [&](int32_t v) { for (int i = 0; i < 4; i++) u8((v >> (8 * i)) & 0xFF); };
+    u8(0x41); u8(4); le32(declared < 0 ? n_traces : declared);
+    u8(0x42); u8(4); le32(n_samples);
+    u8(0x43); u8(1); u8(0x02);                       // int16
+    u8(0x44); u8(2); u8(data_len); u8(0);
+    u8(0x5F); u8(0);
+    for (int t = 0; t < n_traces; t++) {
+        for (int d = 0; d < data_len; d++) u8((base + t) & 0xFF);
+        for (int s = 0; s < n_samples; s++) {
+            const int v = base + t * 10 + s;
+            u8(v & 0xFF); u8((v >> 8) & 0xFF);
+        }
+    }
+    for (int i = 0; i < extra; i++) u8(0x7F);
+    return path;
+}
+
+}  // namespace
+
+TEST(TrsFile, CutOffFileKeepsTheCompleteTraces) {
+    // Header says 10, but only 6 traces and half of the 7th were written.
+    const std::string p = writeTrs("cut.trs", 6, 8, 0, 10, 9);
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.open(p, err)) << err;
+    EXPECT_EQ(f.header().num_traces, 6);
+    EXPECT_NE(f.openNotes().find("Cut off after 6 of 10"), std::string::npos) << f.openNotes();
+    float v = 0;
+    EXPECT_EQ(f.readSamples(5, 3, 1, &v), 1);
+    EXPECT_FLOAT_EQ(v, 53.0f);
+    std::filesystem::remove(p);
+}
+
+TEST(TrsFile, CompleteFileHasNoNotes) {
+    const std::string p = writeTrs("ok.trs", 4, 8, 0);
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.open(p, err)) << err;
+    EXPECT_EQ(f.header().num_traces, 4);
+    EXPECT_TRUE(f.openNotes().empty());
+    std::filesystem::remove(p);
+}
+
+TEST(TrsFile, CombinedReadsAcrossFiles) {
+    const std::string a = writeTrs("a.trs", 3, 8, 0);
+    const std::string b = writeTrs("b.trs", 5, 8, 1000);
+    const std::string c = writeTrs("c.trs", 2, 8, 2000);
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.openCombined({a, b, c}, err)) << err;
+    EXPECT_TRUE(f.isOpen());
+    EXPECT_EQ(f.header().num_traces, 10);
+    EXPECT_EQ(f.header().num_samples, 8);
+    ASSERT_EQ(f.parts().size(), 3u);
+    EXPECT_EQ(f.parts()[1].first_trace, 3);
+    EXPECT_EQ(f.parts()[2].first_trace, 8);
+    // Global trace → (file, local trace): 2 → a/2, 3 → b/0, 7 → b/4, 9 → c/1.
+    const int expect_base[]  = {0, 0, 0, 1000, 1000, 1000, 1000, 1000, 2000, 2000};
+    const int expect_local[] = {0, 1, 2, 0, 1, 2, 3, 4, 0, 1};
+    for (int t = 0; t < 10; t++) {
+        std::vector<float> buf(8);
+        ASSERT_EQ(f.readSamples(t, 0, 8, buf.data()), 8) << t;
+        EXPECT_FLOAT_EQ(buf[2], static_cast<float>(expect_base[t] + expect_local[t] * 10 + 2)) << t;
+        const auto d = f.readData(t);
+        ASSERT_EQ(d.size(), 1u);
+        EXPECT_EQ(d[0], static_cast<uint8_t>((expect_base[t] + expect_local[t]) & 0xFF)) << t;
+    }
+    EXPECT_EQ(f.partOf(2), 0);
+    EXPECT_EQ(f.partOf(3), 1);
+    EXPECT_EQ(f.partOf(9), 2);
+    EXPECT_EQ(f.partOf(10), -1);
+    float v = 0;
+    EXPECT_EQ(f.readSamples(10, 0, 1, &v), 0);   // past the end
+    EXPECT_TRUE(f.readData(-1).empty());
+    f.willNeed(5, 0, 8);                          // harmless hint, any part
+    int64_t last = 0;
+    f.prefetch([&](int64_t done, int64_t total) { EXPECT_LE(done, total); last = done; return true; });
+    EXPECT_GT(last, 0);
+    for (const auto& p : {a, b, c}) std::filesystem::remove(p);
+}
+
+TEST(TrsFile, CombinedLeavesOutTheCutOffPartOfALastFile) {
+    const std::string a = writeTrs("ca.trs", 4, 8, 0);
+    const std::string b = writeTrs("cb.trs", 2, 8, 1000, 4, 5);   // capture died
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.openCombined({a, b}, err)) << err;
+    EXPECT_EQ(f.header().num_traces, 6);
+    EXPECT_NE(f.openNotes().find("trs_viewer_test_cb.trs"), std::string::npos);
+    float v = 0;
+    ASSERT_EQ(f.readSamples(5, 0, 1, &v), 1);
+    EXPECT_FLOAT_EQ(v, 1010.0f);
+    for (const auto& p : {a, b}) std::filesystem::remove(p);
+}
+
+TEST(TrsFile, CombinedRefusesMismatchedFiles) {
+    const std::string a = writeTrs("ma.trs", 2, 8, 0);
+    const std::string b = writeTrs("mb.trs", 2, 9, 0);
+    const std::string c = writeTrs("mc.trs", 2, 8, 0, -1, 0, 2);
+    TrsFile f;
+    std::string err;
+    EXPECT_FALSE(f.openCombined({a, b}, err));
+    EXPECT_NE(err.find("9 samples per trace"), std::string::npos) << err;
+    EXPECT_FALSE(f.isOpen());
+    EXPECT_FALSE(f.openCombined({a, c}, err));
+    EXPECT_NE(err.find("data bytes"), std::string::npos) << err;
+    for (const auto& p : {a, b, c}) std::filesystem::remove(p);
+}
+
+TEST(TrsFile, TraceListRoundTrip) {
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::temp_directory_path() / "trs_viewer_list_test";
+    fs::create_directories(dir / "sub");
+    const std::string a = (dir / "part_1.trs").string();
+    const std::string b = (dir / "sub" / "part_2.trs").string();
+    const std::string list = (dir / "all.trslist").string();
+    std::string err;
+    ASSERT_TRUE(writeTraceList(list, {a, b, "/elsewhere/x.trs"}, err)) << err;
+    {   // stored relative to the list where possible
+        std::ifstream in(list);
+        const std::string text((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_NE(text.find("\npart_1.trs\n"), std::string::npos) << text;
+        EXPECT_NE(text.find("\nsub/part_2.trs\n"), std::string::npos) << text;
+        EXPECT_NE(text.find("\n/elsewhere/x.trs\n"), std::string::npos) << text;
+    }
+    std::vector<std::string> back;
+    ASSERT_TRUE(readTraceList(list, back, err)) << err;
+    ASSERT_EQ(back.size(), 3u);
+    EXPECT_EQ(back[0], a);
+    EXPECT_EQ(back[1], b);
+    EXPECT_EQ(back[2], "/elsewhere/x.trs");
+    // Comments, blank lines and stray spaces / CR are ignored.
+    { std::ofstream out(list); out << "# c\n\n  part_1.trs \r\n"; }
+    ASSERT_TRUE(readTraceList(list, back, err)) << err;
+    ASSERT_EQ(back.size(), 1u);
+    EXPECT_EQ(back[0], a);
+    { std::ofstream out(list); out << "# only a comment\n"; }
+    EXPECT_FALSE(readTraceList(list, back, err));
+    fs::remove_all(dir);
+}

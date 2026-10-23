@@ -7,7 +7,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 
 // Riscure TRS header tag IDs (single-byte, value range 0x41–0x5F)
 namespace TrsTag {
@@ -43,6 +46,9 @@ void TrsFile::close() {
     bytes_per_trace_     = 0;
     mem_samples_.clear();
     mem_data_.clear();
+    parts_.clear();
+    part_first_.clear();
+    notes_.clear();
 }
 
 bool TrsFile::openFromArray(const float* samples, int32_t n_traces, int32_t n_samples,
@@ -112,8 +118,141 @@ bool TrsFile::open(const std::string& path, std::string& error) {
 
     if (ok) {
         madvise(mmap_ptr_, mmap_size_, MADV_RANDOM);
+        // A capture that stopped early can leave the header promising more
+        // traces than the file holds (or 0, if it was never updated): keep
+        // the complete ones.
+        const int64_t body = static_cast<int64_t>(mmap_size_) - trace_block_offset_;
+        const int64_t complete = std::min<int64_t>(INT32_MAX, std::max<int64_t>(0, body) / bytes_per_trace_);
+        if (header_.num_traces > complete || (header_.num_traces <= 0 && complete > 0)) {
+            notes_ = header_.num_traces > complete
+                ? "Cut off after " + std::to_string(complete) + " of " + std::to_string(header_.num_traces)
+                  + " traces; the complete ones are used."
+                : "No trace count in the header; its " + std::to_string(complete)
+                  + " complete traces are used.";
+            header_.num_traces = static_cast<int32_t>(complete);
+        }
     }
     return ok;
+}
+
+std::string combineMismatch(const TrsHeader& first, const TrsHeader& h) {
+    auto coding = [](const TrsHeader& x) {
+        switch (x.sample_type) {
+        case SampleType::INT8:    return std::string("int8");
+        case SampleType::INT16:   return std::string("int16");
+        case SampleType::INT32:   return std::string("int32");
+        case SampleType::FLOAT32: return std::string("float32");
+        }
+        return std::string("?");
+    };
+    if (h.num_samples != first.num_samples)
+        return std::to_string(h.num_samples) + " samples per trace (first file: "
+             + std::to_string(first.num_samples) + ")";
+    if (h.sample_type != first.sample_type)
+        return coding(h) + " samples (first file: " + coding(first) + ")";
+    if (h.data_length != first.data_length)
+        return std::to_string(h.data_length) + " data bytes per trace (first file: "
+             + std::to_string(first.data_length) + ")";
+    if (h.param_map != first.param_map)
+        return "different trace parameters than the first file";
+    return {};
+}
+
+bool TrsFile::openCombined(const std::vector<std::string>& paths, std::string& error,
+                           const std::string& list_path) {
+    close();
+    if (paths.empty()) { error = "No files to combine."; return false; }
+    std::vector<std::string> notes;
+    int64_t total = 0;
+    for (const std::string& p : paths) {
+        auto part = std::make_unique<TrsFile>();
+        std::string e;
+        const std::string name = std::filesystem::path(p).filename().string();
+        if (!part->open(p, e)) { close(); error = name + ": " + e; return false; }
+        if (!parts_.empty()) {
+            const std::string why = combineMismatch(parts_.front()->header(), part->header());
+            if (!why.empty()) { close(); error = name + ": " + why + "."; return false; }
+            const TrsHeader& f = parts_.front()->header();
+            if (part->header().scale_x != f.scale_x || part->header().scale_y != f.scale_y)
+                notes.push_back(name + ": a different time or value scale than the first file; "
+                                "the first file's is used.");
+        }
+        if (!part->openNotes().empty()) notes.push_back(name + ": " + part->openNotes());
+        if (part->header().num_traces <= 0) continue;   // nothing to read; not part of the set
+        part_first_.push_back(static_cast<int32_t>(total));
+        total += part->header().num_traces;
+        if (total > INT32_MAX) { close(); error = "Too many traces in total (at most 2^31)."; return false; }
+        parts_.push_back(std::move(part));
+    }
+    if (parts_.empty()) { close(); error = "None of the files holds a complete trace."; return false; }
+    header_            = parts_.front()->header();
+    header_.num_traces = static_cast<int32_t>(total);
+    path_              = list_path.empty() ? parts_.front()->path() : list_path;
+    for (size_t i = 0; i < notes.size(); i++) notes_ += (i ? "\n" : "") + notes[i];
+    return true;
+}
+
+std::vector<TrsFile::Part> TrsFile::parts() const {
+    std::vector<Part> out;
+    for (size_t k = 0; k < parts_.size(); k++)
+        out.push_back({parts_[k]->path(), part_first_[k], parts_[k]->header().num_traces});
+    return out;
+}
+
+int TrsFile::partOf(int32_t trace_idx) const {
+    if (parts_.empty() || trace_idx < 0 || trace_idx >= header_.num_traces) return -1;
+    return static_cast<int>(std::upper_bound(part_first_.begin(), part_first_.end(), trace_idx)
+                            - part_first_.begin()) - 1;
+}
+
+const TrsFile* TrsFile::locate(int32_t trace_idx, int32_t& local) const {
+    const int k = partOf(trace_idx);
+    if (k < 0) return nullptr;
+    local = trace_idx - part_first_[static_cast<size_t>(k)];
+    return parts_[static_cast<size_t>(k)].get();
+}
+
+bool readTraceList(const std::string& list_path, std::vector<std::string>& paths,
+                   std::string& error) {
+    namespace fs = std::filesystem;
+    std::ifstream in(list_path);
+    if (!in) { error = "Cannot read " + list_path; return false; }
+    const fs::path dir = fs::path(list_path).parent_path();
+    paths.clear();
+    std::string line;
+    while (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ' || line.back() == '\t'))
+            line.pop_back();
+        size_t b = 0;
+        while (b < line.size() && (line[b] == ' ' || line[b] == '\t')) b++;
+        line.erase(0, b);
+        if (line.empty() || line[0] == '#') continue;
+        fs::path p(line);
+        if (p.is_relative()) p = dir / p;
+        paths.push_back(p.lexically_normal().string());
+    }
+    if (paths.empty()) { error = "The list names no files: " + list_path; return false; }
+    return true;
+}
+
+bool writeTraceList(const std::string& list_path, const std::vector<std::string>& paths,
+                    std::string& error) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const fs::path dir = fs::absolute(fs::path(list_path), ec).parent_path();
+    std::ofstream out(list_path, std::ios::trunc);
+    if (!out) { error = "Cannot write " + list_path; return false; }
+    out << "# trs-viewer trace list: these files are opened as one trace set, in this order.\n"
+           "# Paths are relative to this file's folder (or absolute).\n";
+    for (const std::string& p : paths) {
+        const fs::path abs = fs::absolute(fs::path(p), ec);
+        const fs::path rel = abs.lexically_relative(dir);
+        // Relative unless that climbs out of the folder (e.g. another disk).
+        const bool use_rel = !rel.empty() && *rel.begin() != "..";
+        out << (use_rel ? rel : abs).string() << "\n";
+    }
+    if (!out) { error = "Cannot write " + list_path; return false; }
+    return true;
 }
 
 bool TrsFile::openNpy(const std::string& path, std::string& error) {
@@ -433,6 +572,11 @@ int64_t TrsFile::readSamples(int32_t trace_idx, int64_t sample_offset,
         std::memcpy(buf, src, static_cast<size_t>(count) * sizeof(float));
         return count;
     }
+    if (!parts_.empty()) {
+        int32_t local = 0;
+        const TrsFile* part = locate(trace_idx, local);
+        return part ? part->readSamples(local, sample_offset, count, buf) : 0;
+    }
 
     if (!mmap_ptr_ || trace_idx < 0 || trace_idx >= header_.num_traces)
         return 0;
@@ -491,6 +635,11 @@ std::vector<uint8_t> TrsFile::readData(int32_t trace_idx) const {
                            + static_cast<size_t>(trace_idx) * static_cast<size_t>(header_.data_length);
         return {src, src + header_.data_length};
     }
+    if (!parts_.empty()) {
+        int32_t local = 0;
+        const TrsFile* part = locate(trace_idx, local);
+        return part ? part->readData(local) : std::vector<uint8_t>{};
+    }
 
     if (!mmap_ptr_ || trace_idx < 0 || trace_idx >= header_.num_traces
         || header_.data_length <= 0)
@@ -505,6 +654,20 @@ std::vector<uint8_t> TrsFile::readData(int32_t trace_idx) const {
 }
 
 void TrsFile::prefetch(const std::function<bool(int64_t, int64_t)>& progress) const {
+    if (!parts_.empty()) {   // each file in turn, progress over all of them
+        int64_t total = 0, base = 0;
+        for (const auto& p : parts_) total += static_cast<int64_t>(p->mmap_size_);
+        bool go_on = true;
+        for (const auto& p : parts_) {
+            p->prefetch([&](int64_t done, int64_t) {
+                go_on = !progress || progress(base + done, total);
+                return go_on;
+            });
+            if (!go_on) return;
+            base += static_cast<int64_t>(p->mmap_size_);
+        }
+        return;
+    }
     if (!mmap_ptr_ || mmap_size_ == 0) return;   // nothing mapped, or in-memory mode
 
     constexpr size_t kChunkBytes = 64ULL << 20;  // 64 MB per step between progress callbacks
@@ -524,6 +687,11 @@ void TrsFile::prefetch(const std::function<bool(int64_t, int64_t)>& progress) co
 }
 
 void TrsFile::willNeed(int32_t trace_idx, int64_t sample_offset, int64_t count) const {
+    if (!parts_.empty()) {
+        int32_t local = 0;
+        if (const TrsFile* part = locate(trace_idx, local)) part->willNeed(local, sample_offset, count);
+        return;
+    }
     if (!mmap_ptr_ || trace_idx < 0 || trace_idx >= header_.num_traces || count <= 0) return;
     sample_offset = std::max<int64_t>(0, sample_offset);
     count = std::min<int64_t>(count, header_.num_samples - sample_offset);
