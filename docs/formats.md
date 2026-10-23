@@ -3,7 +3,7 @@
 ## TRS (Riscure Trace Set)
 
 
-Standard Riscure TRS v1 format. The file begins with a sequence of TLV header tags followed by the trace data. Each trace contains optional auxiliary data bytes followed by the sample block.
+Riscure TRS, versions 1 and 2. The file begins with a sequence of TLV header tags followed by the trace data. Each trace contains an optional title, optional auxiliary data bytes, then the sample block.
 
 Supported sample types:
 
@@ -17,6 +17,35 @@ Supported sample types:
 Traces are read on demand — the full file is never loaded into RAM.
 
 **Auxiliary data bytes** (per trace, optional): arbitrary bytes attached to each trace — typically plaintext, ciphertext, key material, or any other per-trace metadata. Their presence is not required; trs-viewer works fine without them. When present, they are used by the t-test for group assignment and fed as the `data` matrix to the CPA leakage model. If the header parameter map contains a `ttest` key, its `offset` field selects the group byte for the t-test automatically.
+
+## TRS v2 metadata
+
+TRS v2 files (e.g. written by Riscure's `trsfile` with `TRS_VERSION: 2`) can
+describe themselves with two parameter blocks. Both are read:
+
+- **Trace set parameters** (`TRACE_SET_PARAMETERS`, tag `0x76`): metadata of
+  the whole set — scope, sample rate, gain, keys, firmware, the capture
+  command. **File → File Details…** (or **Details…** in the side panel) lists
+  them with their types, next to the description, scales and the per-trace
+  fields; **Copy as Text** puts it all on the clipboard.
+- **Per-trace fields** (`TRACE_PARAMETER_DEFINITIONS`, tag `0x77`): named
+  fields in each trace's data bytes, each with a type and a number of
+  elements (a `double` is one element of 8 bytes). The *Trace Data* panel
+  shows them by name and type: numbers as numbers, byte arrays (messages,
+  signatures, keys) in hex. A field named `ttest` selects the t-test group
+  byte.
+
+Types: `byte` (`0x01`), `short` (`0x02`), `int` (`0x04`), `long` (`0x08`),
+`float` (`0x14`), `double` (`0x18`), `string` (`0x20`, UTF-8), `bool`
+(`0x31`).
+
+**Export TRS** keeps the description and both parameter blocks (the data
+bytes are copied unchanged, so the field definitions still fit), the time
+scale when the pipeline keeps sample positions, and the value scale when
+there is no pipeline.
+
+A file whose capture stopped early opens with its complete traces (and a
+note), even if its header announces more, or none.
 
 ## LEGACY_DATA (optional)
 

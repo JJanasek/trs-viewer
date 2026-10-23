@@ -188,6 +188,7 @@ private slots:
     void onOpenCombined();
     void onImportTraceSubset();
     void onWarmPageCache();
+    void onShowFileDetails();
     void onCloseDataset();
     void onSwitchDataset(int idx);
     void onApplyTraces();
@@ -479,6 +480,7 @@ private:
     // Side panel
     QLabel*      lbl_file_        = nullptr;
     QLabel*      lbl_info_        = nullptr;
+    QPushButton* btn_file_details_ = nullptr;
     QLabel*      lbl_trace_data_  = nullptr;
     QSpinBox*    spin_data_idx_   = nullptr;
     QSpinBox*    spin_first_      = nullptr;

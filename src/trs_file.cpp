@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cctype>
 #include <climits>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -25,8 +26,75 @@ namespace TrsTag {
     constexpr uint8_t LABEL_Y        = 0x4A;
     constexpr uint8_t SCALE_X              = 0x4B;
     constexpr uint8_t SCALE_Y              = 0x4C;
-    constexpr uint8_t TRACE_PARAMETER_MAP = 0x77;  // named per-trace parameter map
+    constexpr uint8_t TRS_VERSION          = 0x4F;
+    constexpr uint8_t TRACE_SET_PARAMETERS = 0x76;  // named metadata of the whole set
+    constexpr uint8_t TRACE_PARAMETER_MAP = 0x77;  // named per-trace parameter definitions
     constexpr uint8_t TRACE_BLOCK         = 0x5F;  // end-of-header sentinel
+}
+
+int trsParamElemSize(uint8_t type) {
+    const int n = type & 0x0F;
+    return n > 0 ? n : 1;
+}
+
+const char* trsParamTypeName(uint8_t type) {
+    switch (type) {
+    case TrsParamType::BYTE:   return "byte";
+    case TrsParamType::SHORT:  return "short";
+    case TrsParamType::INT:    return "int";
+    case TrsParamType::LONG:   return "long";
+    case TrsParamType::FLOAT:  return "float";
+    case TrsParamType::DOUBLE: return "double";
+    case TrsParamType::STRING: return "string";
+    case TrsParamType::BOOL:   return "bool";
+    }
+    return "?";
+}
+
+std::string formatTrsParam(uint8_t type, const uint8_t* v, size_t n_bytes) {
+    if (type == TrsParamType::STRING) {
+        std::string s(reinterpret_cast<const char*>(v), n_bytes);
+        while (!s.empty() && s.back() == '\0') s.pop_back();   // fixed-width, zero-padded
+        return s;
+    }
+    const size_t es = static_cast<size_t>(trsParamElemSize(type));
+    const size_t n  = n_bytes / es;
+    static const char* hex = "0123456789abcdef";
+    if (type == TrsParamType::BYTE && n != 1) {   // byte arrays (keys, messages): hex
+        std::string s;
+        for (size_t i = 0; i < n_bytes; i++) { s += hex[v[i] >> 4]; s += hex[v[i] & 15]; }
+        return s;
+    }
+    std::string out;
+    char buf[64];
+    for (size_t i = 0; i < n; i++) {
+        const uint8_t* e = v + i * es;
+        uint64_t u = 0;
+        for (size_t b = 0; b < std::min<size_t>(es, 8); b++) u |= static_cast<uint64_t>(e[b]) << (8 * b);
+        switch (type) {
+        case TrsParamType::BYTE:  std::snprintf(buf, sizeof buf, "%u", static_cast<unsigned>(e[0])); break;
+        case TrsParamType::BOOL:  std::snprintf(buf, sizeof buf, "%s", e[0] ? "true" : "false"); break;
+        case TrsParamType::SHORT: std::snprintf(buf, sizeof buf, "%d", static_cast<int16_t>(u)); break;
+        case TrsParamType::INT:   std::snprintf(buf, sizeof buf, "%d", static_cast<int32_t>(u)); break;
+        case TrsParamType::LONG:  std::snprintf(buf, sizeof buf, "%lld", static_cast<long long>(u)); break;
+        case TrsParamType::FLOAT: {
+            float f; const uint32_t w = static_cast<uint32_t>(u); std::memcpy(&f, &w, 4);
+            std::snprintf(buf, sizeof buf, "%.7g", static_cast<double>(f)); break;
+        }
+        case TrsParamType::DOUBLE: {
+            double d; std::memcpy(&d, &u, 8);
+            std::snprintf(buf, sizeof buf, "%.15g", d); break;
+        }
+        default: {   // unknown type: raw bytes
+            std::string s;
+            for (size_t b = 0; b < es; b++) { s += hex[e[b] >> 4]; s += hex[e[b] & 15]; }
+            std::snprintf(buf, sizeof buf, "%s", s.c_str());
+        }
+        }
+        if (i) out += ", ";
+        out += buf;
+    }
+    return out;
 }
 
 TrsFile::TrsFile()  = default;
@@ -509,10 +577,15 @@ bool TrsFile::parseHeader(const uint8_t* data, size_t size, std::string& error) 
         case TrsTag::SCALE_Y:
             if (len >= 4) header_.scale_y = lef32(v);
             break;
+        case TrsTag::TRS_VERSION:
+            if (len >= 1) header_.trs_version = v[0];
+            break;
         case TrsTag::TRACE_PARAMETER_MAP: {
             // Format: uint16 count, then entries:
-            //   uint16 name_len, name bytes, uint8 type, uint16 value_len, uint16 offset
+            //   uint16 name_len, name bytes, uint8 type, uint16 count, uint16 offset
+            // where count is the number of elements (a double is 1, not 8).
             if (len < 2) break;
+            header_.raw_param_defs.assign(v, v + len);
             size_t j = 0;
             uint16_t count = static_cast<uint16_t>(v[j] | (v[j+1] << 8)); j += 2;
             for (uint16_t e = 0; e < count && j + 7 <= len; e++) {
@@ -522,9 +595,33 @@ bool TrsFile::parseHeader(const uint8_t* data, size_t size, std::string& error) 
                 std::string name(reinterpret_cast<const char*>(v + j), nl); j += nl;
                 TrsTraceParam p;
                 p.type   = v[j];                                              j += 1;
-                p.length = static_cast<uint16_t>(v[j] | (v[j+1] << 8));      j += 2;
+                p.count  = static_cast<uint16_t>(v[j] | (v[j+1] << 8));      j += 2;
                 p.offset = static_cast<uint16_t>(v[j] | (v[j+1] << 8));      j += 2;
+                p.length = static_cast<uint16_t>(std::min(0xFFFF, p.count * trsParamElemSize(p.type)));
                 header_.param_map[name] = p;
+            }
+            break;
+        }
+        case TrsTag::TRACE_SET_PARAMETERS: {
+            // Format: uint16 count, then entries:
+            //   uint16 name_len, name bytes, uint8 type, uint16 count, value
+            // (count elements; a string's count is its length in bytes).
+            if (len < 2) break;
+            header_.raw_set_params.assign(v, v + len);
+            size_t j = 0;
+            const uint16_t count = static_cast<uint16_t>(v[j] | (v[j+1] << 8)); j += 2;
+            for (uint16_t e = 0; e < count; e++) {
+                if (j + 2 > len) break;
+                const uint16_t nl = static_cast<uint16_t>(v[j] | (v[j+1] << 8)); j += 2;
+                if (j + nl + 3 > len) break;
+                TrsSetParam sp;
+                sp.name.assign(reinterpret_cast<const char*>(v + j), nl); j += nl;
+                sp.type  = v[j];                                              j += 1;
+                sp.count = static_cast<uint16_t>(v[j] | (v[j+1] << 8));      j += 2;
+                const size_t nb = static_cast<size_t>(sp.count) * static_cast<size_t>(trsParamElemSize(sp.type));
+                if (j + nb > len) break;
+                sp.value.assign(v + j, v + j + nb); j += nb;
+                header_.set_params.push_back(std::move(sp));
             }
             break;
         }

@@ -76,6 +76,8 @@
 #include <QHeaderView>
 #include <QStatusBar>
 #include <QTableWidget>
+#include <QTextBrowser>
+#include <QClipboard>
 #include <QVBoxLayout>
 
 #include <unsupported/Eigen/FFT>
@@ -394,6 +396,11 @@ MainWindow::MainWindow(QWidget* parent)
     lbl_info_->setWordWrap(true);
     fl->addWidget(lbl_file_);
     fl->addWidget(lbl_info_);
+    btn_file_details_ = new QPushButton("Details…");
+    btn_file_details_->setToolTip("Everything the file's header says: description, scales, the "
+                                  "metadata of the whole set and the per-trace fields.");
+    connect(btn_file_details_, &QPushButton::clicked, this, &MainWindow::onShowFileDetails);
+    fl->addWidget(btn_file_details_);
 
     // Trace selector
     QGroupBox*   grp_trace = new QGroupBox("Traces");
@@ -1295,6 +1302,11 @@ void MainWindow::setupMenuBar() {
         "predictable pass, than have it show up as stutter later. Cancellable.");
     connect(act_warm_cache, &QAction::triggered, this, &MainWindow::onWarmPageCache);
     file_menu->addAction(act_warm_cache);
+    auto* act_details = new QAction("File &Details…", this);
+    act_details->setToolTip("Everything the file's header says: description, scales, the "
+                            "metadata of the whole set and the per-trace fields.");
+    connect(act_details, &QAction::triggered, this, &MainWindow::onShowFileDetails);
+    file_menu->addAction(act_details);
     auto* act_close = new QAction("&Close Dataset", this);
     act_close->setShortcut(QKeySequence("Ctrl+W"));
     connect(act_close, &QAction::triggered, this, &MainWindow::onCloseDataset);
@@ -1693,6 +1705,99 @@ void MainWindow::onOpenFile() {
     for (const QString& path : paths) openFile(path);
 }
 
+// The file's whole header in a window: basics, description, the trace-set
+// parameters (TRS v2 metadata such as scope settings and keys) and the
+// per-trace fields. Long values wrap; Copy puts it all on the clipboard as text.
+void MainWindow::onShowFileDetails() {
+    if (!hasActiveDs() || activeDs().is_result || !activeDs().file) {
+        QMessageBox::information(this, "File Details", "No file loaded.");
+        return;
+    }
+    const TrsFile& f = *activeDs().file;
+    const TrsHeader& h = f.header();
+    const QLocale loc;
+    auto esc = [](const std::string& s) { return QString::fromStdString(s).toHtmlEscaped(); };
+    QString html, text;
+    auto section = [&](const QString& title) {
+        html += QString("<h3>%1</h3><table cellspacing=0 cellpadding=3>").arg(title.toHtmlEscaped());
+        text += "\n" + title + "\n";
+    };
+    auto row = [&](const QString& k, const QString& type, const QString& v) {
+        html += QString("<tr><td valign=top><b>%1</b></td><td valign=top style='color:gray'>%2</td>"
+                        "<td valign=top>%3</td></tr>")
+                    .arg(k.toHtmlEscaped(), type.toHtmlEscaped(), v.toHtmlEscaped());
+        text += QString("  %1%2: %3\n").arg(k, type.isEmpty() ? QString() : " (" + type + ")", v);
+    };
+    const char* coding = "?";
+    switch (h.sample_type) {
+    case SampleType::INT8:    coding = "int8";    break;
+    case SampleType::INT16:   coding = "int16";   break;
+    case SampleType::INT32:   coding = "int32";   break;
+    case SampleType::FLOAT32: coding = "float32"; break;
+    }
+
+    section("File");
+    row("Path", "", QString::fromStdString(f.path()));
+    for (const auto& p : f.parts())
+        row("  part", "", QString("%1   traces %2–%3").arg(QString::fromStdString(p.path))
+                              .arg(p.first_trace).arg(p.first_trace + p.num_traces - 1));
+    row("TRS version", "", QString::number(h.trs_version));
+    row("Traces", "", loc.toString(h.num_traces));
+    row("Samples per trace", "", loc.toString(h.num_samples));
+    row("Sample coding", "", coding);
+    row("Data bytes per trace", "", QString::number(h.data_length));
+    row("Title bytes per trace", "", QString::number(h.title_space));
+    if (!h.label_x.empty() || h.scale_x != 1.0f)
+        row("X scale", "", QString("%1 %2 per sample").arg(static_cast<double>(h.scale_x), 0, 'g', 7).arg(esc(h.label_x)));
+    if (!h.label_y.empty() || h.scale_y != 1.0f)
+        row("Y scale", "", QString("%1 %2 per unit").arg(static_cast<double>(h.scale_y), 0, 'g', 7).arg(esc(h.label_y)));
+    if (!h.global_title.empty()) row("Title", "", QString::fromStdString(h.global_title));
+    if (!h.description.empty()) row("Description", "", QString::fromStdString(h.description));
+    if (!f.openNotes().empty()) row("Notes", "", QString::fromStdString(f.openNotes()));
+    html += "</table>";
+
+    if (!h.set_params.empty()) {
+        section(QString("Trace set parameters (%1)").arg(h.set_params.size()));
+        for (const TrsSetParam& sp : h.set_params) {
+            const QString type = sp.type == TrsParamType::STRING || sp.count == 1
+                ? QString(trsParamTypeName(sp.type))
+                : QString("%1[%2]").arg(trsParamTypeName(sp.type)).arg(sp.count);
+            row(QString::fromStdString(sp.name), type,
+                QString::fromStdString(formatTrsParam(sp.type, sp.value.data(), sp.value.size())));
+        }
+        html += "</table>";
+    }
+    if (!h.param_map.empty()) {
+        std::vector<std::pair<std::string, TrsTraceParam>> params(h.param_map.begin(), h.param_map.end());
+        std::stable_sort(params.begin(), params.end(),
+                         [](const auto& a, const auto& b) { return a.second.offset < b.second.offset; });
+        section(QString("Per-trace fields (%1) — values in the Trace Data panel").arg(params.size()));
+        for (const auto& [name, p] : params)
+            row(QString::fromStdString(name),
+                p.count == 1 ? QString(trsParamTypeName(p.type))
+                             : QString("%1[%2]").arg(trsParamTypeName(p.type)).arg(p.count),
+                QString("bytes %1–%2").arg(p.offset).arg(p.offset + p.length - 1));
+        html += "</table>";
+    }
+
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle("File Details — " + activeDs().display_name);
+    dlg->resize(760, 640);
+    auto* vl = new QVBoxLayout(dlg);
+    auto* tb = new QTextBrowser;
+    tb->setHtml(html);
+    vl->addWidget(tb);
+    auto* bb = new QDialogButtonBox(QDialogButtonBox::Close);
+    auto* btn_copy = bb->addButton("Copy as Text", QDialogButtonBox::ActionRole);
+    connect(btn_copy, &QPushButton::clicked, dlg, [text]() {
+        QGuiApplication::clipboard()->setText(text.trimmed());
+    });
+    connect(bb, &QDialogButtonBox::rejected, dlg, &QDialog::close);
+    vl->addWidget(bb);
+    dlg->show();
+}
+
 void MainWindow::onWarmPageCache() {
     if (!hasActiveDs() || activeDs().is_result || !activeDs().file) {
         QMessageBox::information(this, "Warm Page Cache", "No file loaded.");
@@ -1805,6 +1910,8 @@ static QString hexBytes(const uint8_t* p, size_t n, int group = 0) {
 }
 
 void MainWindow::updateFileInfo() {
+    if (btn_file_details_)
+        btn_file_details_->setEnabled(hasActiveDs() && !activeDs().is_result && activeDs().file);
     if (!hasActiveDs()) { lbl_file_->setText("No file"); lbl_info_->clear();
                       lbl_trace_data_->setText("–"); return; }
     if (activeDs().is_result) {
@@ -1843,6 +1950,8 @@ void MainWindow::updateFileInfo() {
                 .arg(p.first_trace + p.num_traces - 1);
     }
     lbl_file_->setToolTip(files_tip.trimmed());
+    if (!h.set_params.empty())
+        info += QString("\nMeta:    %1 set parameters").arg(h.set_params.size());
     if (effective_samples != h.num_samples)
         info += QString("\nAfter pipeline: %1").arg(effective_samples);
     lbl_info_->setText(info);
@@ -1871,23 +1980,26 @@ void MainWindow::updateTraceDataDisplay() {
             .arg(QString::fromStdString(p.path).section('/', -1)).arg(ti - p.first_trace);
     }
 
-    // If we have named params, show them by name with decoded integer values
+    // Named parameters, in the order they are stored, each decoded by its
+    // type: numbers as numbers, byte arrays (messages, keys) as hex, 16 bytes
+    // per line.
     if (!h.param_map.empty() && h.param_map.find("LEGACY_DATA") == h.param_map.end()) {
-        for (const auto& kv : h.param_map) {
-            const TrsTraceParam& p = kv.second;
+        std::vector<std::pair<std::string, TrsTraceParam>> params(h.param_map.begin(), h.param_map.end());
+        std::stable_sort(params.begin(), params.end(),
+                         [](const auto& a, const auto& b) { return a.second.offset < b.second.offset; });
+        int width = 0;
+        for (const auto& kv : params) width = std::max(width, static_cast<int>(kv.first.size()));
+        for (const auto& [name, p] : params) {
             if (p.offset + p.length > static_cast<int>(raw.size())) continue;
             const uint8_t* b = raw.data() + p.offset;
-            int64_t val = 0;
-            // Always interpret as little-endian signed integer for display
-            for (int i = p.length - 1; i >= 0; i--)
-                val = (val << 8) | b[i];
-            // sign-extend if needed (type 2=i16, 4=i32, 8=i64)
-            if (p.type != 1 && p.length <= 8) {
-                int bits = p.length * 8;
-                int64_t sign_bit = int64_t(1) << (bits - 1);
-                if (val & sign_bit) val |= ~((sign_bit << 1) - 1);
+            const QString label = QString("%1: ").arg(QString::fromStdString(name), -width);
+            if (p.type == TrsParamType::BYTE && p.count > 16) {
+                text += label + QString("(%1 bytes)\n").arg(p.length);
+                for (int off = 0; off < p.length; off += 16)
+                    text += "  " + hexBytes(b + off, static_cast<size_t>(std::min(16, p.length - off)), 4) + "\n";
+            } else {
+                text += label + QString::fromStdString(formatTrsParam(p.type, b, p.length)) + "\n";
             }
-            text += QString("%1: %2\n").arg(QString::fromStdString(kv.first), -16).arg(val);
         }
         text = text.trimmed();
     } else if (h.param_map.find("LEGACY_DATA") != h.param_map.end()) {
@@ -2474,6 +2586,21 @@ static bool exportTracesToTrs(
     case SampleType::FLOAT32: coding_byte = 0x14; break;
     }
 
+    // A tag of any length (lengths over 127 take the long form: 0x80 | n
+    // followed by n little-endian length bytes).
+    auto write_tlv = [&](uint8_t tag, const void* v, size_t len) {
+        std::fputc(tag, fp);
+        if (len < 0x80) {
+            std::fputc(static_cast<int>(len), fp);
+        } else {
+            std::fputc(0x84, fp);
+            write_le32(static_cast<int32_t>(len));
+        }
+        if (len) std::fwrite(v, 1, len, fp);
+    };
+    auto write_str = [&](uint8_t tag, const std::string& s) { if (!s.empty()) write_tlv(tag, s.data(), s.size()); };
+    auto write_f32 = [&](uint8_t tag, float f) { write_tlv(tag, &f, 4); };
+
     // TRS header TLVs -------------------------------------------------------
     write_tlv_hdr(0x41, 4); write_le32(n_traces);                         // NUMBER_TRACES
     write_tlv_hdr(0x42, 4); write_le32(static_cast<int32_t>(out_samples)); // NUMBER_SAMPLES
@@ -2481,6 +2608,27 @@ static bool exportTracesToTrs(
     if (h.data_length > 0) {
         write_tlv_hdr(0x44, 2); write_le16(h.data_length); // DATA_LENGTH
     }
+    // What the source says about itself. The data bytes are copied as they
+    // are, so the per-trace field definitions still fit them; the time axis
+    // only if the pipeline keeps sample positions, the value axis only if
+    // there is no pipeline at all.
+    if (!h.raw_param_defs.empty() || !h.raw_set_params.empty()) {
+        const uint8_t v2 = 2;
+        write_tlv(0x4F, &v2, 1);                                           // TRS_VERSION
+    }
+    write_str(0x47, h.description);                                       // DESCRIPTION
+    if (keepsSamplePositions(pipeline)) {
+        write_str(0x49, h.label_x);                                       // LABEL_X
+        if (h.scale_x != 1.0f) write_f32(0x4B, h.scale_x);                // SCALE_X
+    }
+    if (pipeline.empty()) {
+        write_str(0x4A, h.label_y);                                       // LABEL_Y
+        if (h.scale_y != 1.0f) write_f32(0x4C, h.scale_y);                // SCALE_Y
+    }
+    if (!h.raw_set_params.empty())                                        // TRACE_SET_PARAMETERS
+        write_tlv(0x76, h.raw_set_params.data(), h.raw_set_params.size());
+    if (!h.raw_param_defs.empty() && h.data_length > 0)                   // TRACE_PARAMETER_DEFINITIONS
+        write_tlv(0x77, h.raw_param_defs.data(), h.raw_param_defs.size());
     std::fputc(0x5F, fp); std::fputc(0x00, fp);      // TRACE_BLOCK
 
     // Trace data -------------------------------------------------------------

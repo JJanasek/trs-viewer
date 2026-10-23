@@ -14,14 +14,43 @@ enum class SampleType {
     FLOAT32,
 };
 
-// Describes one named per-trace parameter stored in the trace data section.
+// Parameter types of TRS v2 headers (as Riscure's trsfile writes them): the
+// low nibble is the size of one element in bytes.
+namespace TrsParamType {
+    constexpr uint8_t BYTE   = 0x01;   // int8 (shown as unsigned / hex)
+    constexpr uint8_t SHORT  = 0x02;
+    constexpr uint8_t INT    = 0x04;
+    constexpr uint8_t LONG   = 0x08;
+    constexpr uint8_t FLOAT  = 0x14;
+    constexpr uint8_t DOUBLE = 0x18;
+    constexpr uint8_t STRING = 0x20;   // UTF-8, one element per byte
+    constexpr uint8_t BOOL   = 0x31;
+}
+int         trsParamElemSize(uint8_t type);    // bytes per element (1 if unknown)
+const char* trsParamTypeName(uint8_t type);    // "byte", "double", … ("?" if unknown)
+// A parameter value as text: numbers (comma-separated for arrays), byte
+// arrays as hex, strings as text, bools as true/false.
+std::string formatTrsParam(uint8_t type, const uint8_t* value, size_t n_bytes);
+
+// Describes one named per-trace parameter stored in the trace data section
+// (TRACE_PARAMETER_DEFINITIONS, tag 0x77).
 struct TrsTraceParam {
     uint16_t offset = 0;   // byte offset within per-trace data block
-    uint16_t length = 0;   // byte length of the parameter value
-    uint8_t  type   = 0;   // type ID (0x01 = uint8, etc.)
+    uint16_t length = 0;   // byte length of the parameter value (count × element size)
+    uint8_t  type   = 0;   // TrsParamType
+    uint16_t count  = 1;   // number of elements
     bool operator==(const TrsTraceParam& o) const {
-        return offset == o.offset && length == o.length && type == o.type;
+        return offset == o.offset && length == o.length && type == o.type && count == o.count;
     }
+};
+
+// One trace-set parameter (TRACE_SET_PARAMETERS, tag 0x76): metadata for the
+// whole set, e.g. the scope settings, sample rate, keys or firmware version.
+struct TrsSetParam {
+    std::string          name;
+    uint8_t              type  = 0;   // TrsParamType
+    uint16_t             count = 0;   // number of elements
+    std::vector<uint8_t> value;       // count × element size bytes, little-endian
 };
 
 struct TrsHeader {
@@ -37,8 +66,13 @@ struct TrsHeader {
     std::string description;
     std::string label_x;
     std::string label_y;
-    // Named per-trace parameters defined by TRACE_PARAMETER_MAP (tag 0x77)
+    // Named per-trace parameters defined by TRACE_PARAMETER_DEFINITIONS (tag 0x77)
     std::map<std::string, TrsTraceParam> param_map;
+    int trs_version = 1;                       // TRS_VERSION (tag 0x4F), 1 if absent
+    std::vector<TrsSetParam> set_params;       // TRACE_SET_PARAMETERS (tag 0x76), in file order
+    // The two parameter tags' values as stored, so a copy of the set (Export
+    // TRS) can carry them over unchanged.
+    std::vector<uint8_t> raw_param_defs, raw_set_params;
 };
 
 // Memory-mapped, lazy-access reader for Riscure TRS trace set files.

@@ -431,3 +431,130 @@ TEST(TrsFile, TraceListRoundTrip) {
     EXPECT_FALSE(readTraceList(list, back, err));
     fs::remove_all(dir);
 }
+
+// ---------------------------------------------------------------------------
+// TRS v2 metadata: trace-set parameters (0x76) and per-trace field
+// definitions (0x77), as Riscure's trsfile writes them
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct Bytes {
+    std::vector<uint8_t> b;
+    Bytes& u8(int v) { b.push_back(static_cast<uint8_t>(v)); return *this; }
+    Bytes& u16(int v) { u8(v & 0xFF); return u8((v >> 8) & 0xFF); }
+    Bytes& u32(uint32_t v) { for (int i = 0; i < 4; i++) u8(static_cast<int>((v >> (8 * i)) & 0xFF)); return *this; }
+    Bytes& raw(const void* p, size_t n) { auto* c = static_cast<const uint8_t*>(p); b.insert(b.end(), c, c + n); return *this; }
+    Bytes& str(const std::string& s) { u16(static_cast<int>(s.size())); return raw(s.data(), s.size()); }
+    Bytes& tag(int t, const Bytes& v) {
+        u8(t);
+        if (v.b.size() < 0x80) u8(static_cast<int>(v.b.size()));
+        else { u8(0x82); u16(static_cast<int>(v.b.size())); }
+        return raw(v.b.data(), v.b.size());
+    }
+};
+
+// One trace: ttest byte, a 4-byte message, a double and a float.
+std::string writeTrsV2(const std::string& name, const std::string& long_note) {
+    Bytes defs;
+    defs.u16(4);
+    defs.str("ttest").u8(0x01).u16(1).u16(0);
+    defs.str("msg").u8(0x01).u16(4).u16(1);
+    defs.str("t_unix").u8(0x18).u16(1).u16(5);
+    defs.str("sign_ms").u8(0x14).u16(1).u16(13);
+    Bytes set;
+    const double rate = 1.25e9;
+    const uint8_t key[3] = {0xde, 0xad, 0x01};
+    set.u16(4);
+    set.str("scope").u8(0x20).u16(4).raw("pico", 4);
+    set.str("sample_rate_Sps").u8(0x18).u16(1).raw(&rate, 8);
+    set.str("public_key").u8(0x01).u16(3).raw(key, 3);
+    set.str("note").u8(0x20).u16(static_cast<int>(long_note.size())).raw(long_note.data(), long_note.size());
+    Bytes h;
+    h.tag(0x4F, Bytes().u8(2));
+    h.tag(0x42, Bytes().u32(4));
+    h.tag(0x44, Bytes().u16(17));
+    h.tag(0x43, Bytes().u8(0x01));
+    h.tag(0x77, defs);
+    h.tag(0x76, set);
+    h.tag(0x41, Bytes().u32(2));
+    h.tag(0x45, Bytes().u8(3));       // 3 title bytes per trace
+    h.u8(0x5F).u8(0);
+    for (int t = 0; t < 2; t++) {
+        const double tu = 1792754646.5 + t;
+        const float ms = 3256.95f + static_cast<float>(t);
+        h.raw("T00", 3);
+        h.u8(t).u8(0xa0 + t).u8(0xb0).u8(0xc0).u8(0xd0).raw(&tu, 8).raw(&ms, 4);
+        for (int s = 0; s < 4; s++) h.u8(t * 10 + s);
+    }
+    const std::string path = (std::filesystem::temp_directory_path() / ("trs_viewer_test_" + name)).string();
+    std::ofstream(path, std::ios::binary).write(reinterpret_cast<const char*>(h.b.data()),
+                                                static_cast<std::streamsize>(h.b.size()));
+    return path;
+}
+
+}  // namespace
+
+TEST(TrsFile, ReadsTrsV2Metadata) {
+    const std::string note(300, 'x');   // > 127 bytes: the long tag length form
+    const std::string p = writeTrsV2("v2.trs", note);
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.open(p, err)) << err;
+    const TrsHeader& h = f.header();
+    EXPECT_EQ(h.trs_version, 2);
+    EXPECT_EQ(h.num_traces, 2);
+    EXPECT_EQ(h.title_space, 3);
+    EXPECT_TRUE(f.openNotes().empty()) << f.openNotes();
+
+    // Whole-set parameters, in file order.
+    ASSERT_EQ(h.set_params.size(), 4u);
+    EXPECT_EQ(h.set_params[0].name, "scope");
+    EXPECT_EQ(formatTrsParam(h.set_params[0].type, h.set_params[0].value.data(), h.set_params[0].value.size()), "pico");
+    EXPECT_EQ(formatTrsParam(h.set_params[1].type, h.set_params[1].value.data(), h.set_params[1].value.size()), "1250000000");
+    EXPECT_EQ(formatTrsParam(h.set_params[2].type, h.set_params[2].value.data(), h.set_params[2].value.size()), "dead01");
+    EXPECT_EQ(h.set_params[3].value.size(), note.size());
+    EXPECT_FALSE(h.raw_set_params.empty());
+    EXPECT_FALSE(h.raw_param_defs.empty());
+
+    // Per-trace fields: the definitions give element counts, not bytes.
+    ASSERT_EQ(h.param_map.size(), 4u);
+    EXPECT_EQ(h.param_map.at("t_unix").count, 1);
+    EXPECT_EQ(h.param_map.at("t_unix").length, 8);
+    EXPECT_EQ(h.param_map.at("sign_ms").length, 4);
+    EXPECT_EQ(h.param_map.at("msg").length, 4);
+    const auto d = f.readData(1);
+    ASSERT_EQ(d.size(), 17u);
+    auto field = [&](const char* n) {
+        const TrsTraceParam& q = h.param_map.at(n);
+        return formatTrsParam(q.type, d.data() + q.offset, q.length);
+    };
+    EXPECT_EQ(field("ttest"), "1");
+    EXPECT_EQ(field("msg"), "a1b0c0d0");
+    EXPECT_EQ(field("t_unix"), "1792754647.5");
+    EXPECT_EQ(field("sign_ms"), "3257.95");
+    // The 3 title bytes are skipped: samples of trace 1 are 10, 11, …
+    float v[4];
+    ASSERT_EQ(f.readSamples(1, 0, 4, v), 4);
+    EXPECT_FLOAT_EQ(v[0], 10.0f);
+    EXPECT_FLOAT_EQ(v[3], 13.0f);
+    std::filesystem::remove(p);
+}
+
+TEST(TrsFile, FormatsParameterValues) {
+    const int16_t sh[2] = {-3, 7};
+    const int32_t in = -42;
+    const int64_t lo = 1234567890123LL;
+    const float fl = 0.5f;
+    const uint8_t b1 = 200, bo = 1;
+    const char str[6] = {'a', 'b', 'c', 0, 0, 0};
+    EXPECT_EQ(formatTrsParam(TrsParamType::SHORT, reinterpret_cast<const uint8_t*>(sh), 4), "-3, 7");
+    EXPECT_EQ(formatTrsParam(TrsParamType::INT, reinterpret_cast<const uint8_t*>(&in), 4), "-42");
+    EXPECT_EQ(formatTrsParam(TrsParamType::LONG, reinterpret_cast<const uint8_t*>(&lo), 8), "1234567890123");
+    EXPECT_EQ(formatTrsParam(TrsParamType::FLOAT, reinterpret_cast<const uint8_t*>(&fl), 4), "0.5");
+    EXPECT_EQ(formatTrsParam(TrsParamType::BYTE, &b1, 1), "200");          // one byte: a number
+    EXPECT_EQ(formatTrsParam(TrsParamType::BOOL, &bo, 1), "true");
+    EXPECT_EQ(formatTrsParam(TrsParamType::STRING, reinterpret_cast<const uint8_t*>(str), 6), "abc");
+    EXPECT_EQ(trsParamElemSize(TrsParamType::DOUBLE), 8);
+    EXPECT_STREQ(trsParamTypeName(TrsParamType::FLOAT), "float");
+}
