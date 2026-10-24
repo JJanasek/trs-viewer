@@ -271,6 +271,17 @@ private:
     void onPatternEditor();
     void refreshPatternBands(Dataset& ds);
     void openNpyTraces(const QString& path);
+    // A CPA run as configured in onRunCpa()'s dialog.
+    struct CpaRun {
+        std::shared_ptr<TrsFile> file;
+        std::vector<std::shared_ptr<ITransform>> pipeline;
+        int32_t first = 0, count = 0;      // traces
+        int64_t s_first = 0, s_count = 0;  // raw samples (0 = to the end)
+        int32_t M = 256;
+        std::vector<int32_t> shifts;       // per trace of the run; empty = none
+        int32_t outside_alignment = 0;     // traces left out: not covered by the alignment
+    };
+    void runCpa(const CpaRun& run);
     // Shows an opened trace file in a new tab; recent_path (if not empty)
     // goes to Recent files.
     void showTraceSet(std::shared_ptr<TrsFile> f, const QString& display_name,

@@ -12862,9 +12862,13 @@ void MainWindow::onRunCpa() {
     const int n_samples = h.num_samples;
 
     // ---- Step 1: Configuration dialog ----
-    QDialog cfg(this);
-    cfg.setWindowTitle("CPA — Configuration");
-    auto* vl_cfg = new QVBoxLayout(&cfg);
+    // Non-modal, like the FFT's: "Draw on plot" has to reach the main plot
+    // while the dialog stays open. Run captures everything and closes it.
+    auto* cfg = new QDialog(this);
+    cfg->setAttribute(Qt::WA_DeleteOnClose);
+    cfg->setWindowTitle("CPA — Configuration");
+    auto* vl_cfg = new QVBoxLayout(cfg);
+    const std::shared_ptr<TrsFile> cfg_file = activeDs().file;
 
     auto* grp_traces = new QGroupBox("Traces");
     auto* fl_traces  = new QFormLayout(grp_traces);
@@ -12882,6 +12886,37 @@ void MainWindow::onRunCpa() {
     fl_samples->addRow("First sample:", sp_s_first);
     fl_samples->addRow("Count (0=all):", sp_s_count);
 
+    // "Draw on plot": drag the sample range on the main plot (raw samples,
+    // the same units as the spin boxes), as in the FFT dialog.
+    auto* btn_draw = new QPushButton("Draw on plot →");
+    btn_draw->setToolTip("Switch the main plot to crop-select mode and drag the region to "
+                         "run CPA over — releasing the mouse sets First sample and Count.");
+    fl_samples->addRow(btn_draw);
+    connect(btn_draw, &QPushButton::clicked, cfg, [=]() {
+        plotWidget()->clearCropRanges();
+        plotWidget()->setCropAutoConfirm(true);
+        plotWidget()->setMode(InteractionMode::CropSelect);
+        btn_draw->setText("Drawing… (drag on plot)");
+        btn_draw->setEnabled(false);
+    });
+    auto* crop_guard = new QObject(cfg);
+    connect(plotWidget(), &PlotWidget::cropRangesChanged, crop_guard, [=]() {
+        const auto& ranges = plotWidget()->cropRanges();
+        if (ranges.empty()) return;
+        auto [a, b] = ranges.back();
+        sp_s_first->setValue(static_cast<int>(a));
+        sp_s_count->setValue(static_cast<int>(std::max<int64_t>(1, b - a)));
+        plotWidget()->setCropAutoConfirm(false);
+        plotWidget()->setMode(InteractionMode::Pan);
+        btn_draw->setText("Draw on plot →");
+        btn_draw->setEnabled(true);
+    });
+    connect(cfg, &QDialog::finished, cfg, [=](int) {
+        plotWidget()->setCropAutoConfirm(false);
+        if (plotWidget()->mode() == InteractionMode::CropSelect)
+            plotWidget()->setMode(InteractionMode::Pan);
+    });
+
     auto* grp_hyp = new QGroupBox("Hypotheses");
     auto* fl_hyp  = new QFormLayout(grp_hyp);
     auto* sp_m = new QSpinBox;
@@ -12889,18 +12924,20 @@ void MainWindow::onRunCpa() {
     sp_m->setValue(256);
     sp_m->setToolTip("Number of model evaluations (0 to M-1). 256 for a full AES key byte.");
     fl_hyp->addRow("M:", sp_m);
-    DialogMemory mem("cpa");
-    mem.bind(sp_m, "hypotheses");
+    auto* mem = new DialogMemory("cpa");
+    mem->bind(sp_m, "hypotheses");
+    connect(cfg, &QObject::destroyed, cfg, [mem]() { delete mem; });
 
     // Alignment shifts option — populated by the last "Apply to Main View"
-    // run. Tiled alignment isn't supported here yet (align_shifts.size()
-    // would be num_traces*n_tiles, fed straight into the compute loop below
-    // as a trace count) — treated the same as "no alignment" so the
-    // checkbox stays off and disabled, with its own explanatory tooltip.
+    // run. Tiled alignment isn't supported here yet, so it counts as "no
+    // alignment" (checkbox off and disabled, with its own tooltip).
     const bool has_alignment  = (activeDs().align_n_samples > 0) && (activeDs().align_tile_size <= 0);
     const bool tiled_alignment = (activeDs().align_n_samples > 0) && (activeDs().align_tile_size > 0);
     const int  n_align_discarded = static_cast<int>(std::count(
         activeDs().align_shifts.begin(), activeDs().align_shifts.end(), kAlignDiscardShift));
+    const int32_t align_first = activeDs().align_first_trace;
+    const std::vector<int32_t> align_shifts = activeDs().align_shifts;
+    const int64_t align_s_first = activeDs().align_first_sample, align_s_count = activeDs().align_n_samples;
     auto* grp_align  = new QGroupBox("Alignment");
     auto* fl_align   = new QFormLayout(grp_align);
     auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
@@ -12909,38 +12946,32 @@ void MainWindow::onRunCpa() {
     chk_shifts->setToolTip(tiled_alignment
         ? "The last alignment run used tiling — CPA doesn't support tiled alignment yet."
         : has_alignment
-              ? QString("Use shifts from the last alignment run (%1 traces, first_sample=%2, n_samples=%3)."
-                         "%4")
-                    .arg(activeDs().align_shifts.size()).arg(activeDs().align_first_sample).arg(activeDs().align_n_samples)
+              ? QString("Use shifts from the last alignment run (%1 traces from %2, samples %3–%4). "
+                        "Ticking it fills in the aligned range; you can then narrow the traces and "
+                        "samples to any part of it. Traces outside the alignment are left out.%5")
+                    .arg(align_shifts.size()).arg(align_first)
+                    .arg(align_s_first).arg(align_s_first + align_s_count - 1)
                     .arg(n_align_discarded > 0
                              ? QString(" %1 of those are marked discarded and will be skipped.").arg(n_align_discarded)
                              : QString())
               : "No alignment has been applied to the main view yet.");
     fl_align->addRow(chk_shifts);
 
-    // When alignment is toggled, lock/unlock spinboxes and fill in the stored values.
-    // Save originals so we can restore when unchecked.
-    auto applyAlignmentToSpinboxes = [&](bool on) {
-        sp_first ->setEnabled(!on);
-        sp_count ->setEnabled(!on);
-        sp_s_first->setEnabled(!on);
-        sp_s_count->setEnabled(!on);
-        if (on) {
-            sp_first ->setValue(activeDs().align_first_trace);
-            sp_count ->setValue(static_cast<int>(activeDs().align_shifts.size()));
-            sp_s_first->setValue(static_cast<int>(activeDs().align_first_sample));
-            sp_s_count->setValue(static_cast<int>(activeDs().align_n_samples));
-        }
+    // Ticking fills in the aligned range as a starting point; the ranges
+    // stay editable, since each trace's shift is looked up by its own index.
+    auto applyAlignmentToSpinboxes = [=](bool on) {
+        if (!on) return;
+        sp_first ->setValue(align_first);
+        sp_count ->setValue(static_cast<int>(align_shifts.size()));
+        sp_s_first->setValue(static_cast<int>(align_s_first));
+        sp_s_count->setValue(static_cast<int>(align_s_count));
     };
-    connect(chk_shifts, &QCheckBox::toggled, [applyAlignmentToSpinboxes](bool on) {
-        applyAlignmentToSpinboxes(on);
-    });
+    connect(chk_shifts, &QCheckBox::toggled, cfg, applyAlignmentToSpinboxes);
     if (has_alignment) applyAlignmentToSpinboxes(true);  // apply immediately if pre-checked
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     cfg_bb->button(QDialogButtonBox::Ok)->setText("Run CPA");
-    connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
-    connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
+    connect(cfg_bb, &QDialogButtonBox::rejected, cfg, &QDialog::reject);
     // CPA is the one analysis that still blocks. Its leakage model is
     // evaluated through the embedded CPython interpreter, and that code
     // holds no GIL of its own — it is only safe because it runs on the
@@ -12959,24 +12990,59 @@ void MainWindow::onRunCpa() {
     vl_cfg->addWidget(grp_align);
     vl_cfg->addWidget(lbl_blocking);
     vl_cfg->addWidget(cfg_bb);
-    mem.restore();
-    if (cfg.exec() != QDialog::Accepted) return;
-    mem.save();
+    mem->restore();
 
-    const int32_t first_trace     = static_cast<int32_t>(sp_first->value());
-    const int32_t num_traces      = static_cast<int32_t>(sp_count->value());
-    const int64_t first_sample    = static_cast<int64_t>(sp_s_first->value());
-    const int64_t num_samples_req = static_cast<int64_t>(sp_s_count->value());
-    const int32_t n_hypotheses    = static_cast<int32_t>(sp_m->value());
-    // When using stored alignment: override trace range and sample window
-    const bool use_alignment = chk_shifts->isChecked();
-    const std::vector<int32_t> use_shifts = use_alignment ? activeDs().align_shifts : std::vector<int32_t>{};
-    const int32_t eff_first_trace  = use_alignment ? activeDs().align_first_trace  : first_trace;
-    const int32_t eff_num_traces   = use_alignment
-                                     ? static_cast<int32_t>(activeDs().align_shifts.size())
-                                     : num_traces;
-    const int64_t eff_first_sample = use_alignment ? activeDs().align_first_sample : first_sample;
-    const int64_t eff_n_samples    = use_alignment ? activeDs().align_n_samples    : num_samples_req;
+    connect(cfg_bb, &QDialogButtonBox::accepted, cfg, [=]() {
+        // The dialog is non-modal: make sure it still belongs to the open tab.
+        if (!hasActiveDs() || activeDs().is_result || activeDs().file != cfg_file) {
+            QMessageBox::information(cfg, "CPA", "Switch back to the file this dialog was opened for "
+                                                 "to run it.");
+            return;
+        }
+        mem->save();
+        CpaRun run;
+        run.file    = cfg_file;
+        for (const auto& t : activeDs().pipeline) run.pipeline.push_back(t->clone());
+        run.first   = static_cast<int32_t>(sp_first->value());
+        run.count   = static_cast<int32_t>(std::min(sp_count->value(), n_total - sp_first->value()));
+        run.s_first = sp_s_first->value();
+        run.s_count = sp_s_count->value();
+        run.M       = static_cast<int32_t>(sp_m->value());
+        // Shifts for exactly these traces, by absolute index; traces the
+        // alignment doesn't cover are left out (as discarded ones are).
+        if (chk_shifts->isChecked()) {
+            run.shifts.resize(static_cast<size_t>(run.count));
+            for (int32_t i = 0; i < run.count; i++) {
+                const int64_t a = static_cast<int64_t>(run.first) + i - align_first;
+                const bool in = a >= 0 && a < static_cast<int64_t>(align_shifts.size());
+                run.shifts[static_cast<size_t>(i)] = in ? align_shifts[static_cast<size_t>(a)] : kAlignDiscardShift;
+                if (!in) run.outside_alignment++;
+            }
+        }
+        cfg->accept();
+        runCpa(run);
+    });
+    cfg->show();
+}
+
+// The CPA run itself, from the settings captured in onRunCpa(): the leakage
+// model editor, the correlation (in the foreground — see onRunCpa) and the
+// result window.
+void MainWindow::runCpa(const CpaRun& run) {
+    const int32_t first_trace      = run.first;
+    const int32_t num_traces       = run.count;
+    const int32_t eff_first_trace  = run.first;
+    const int32_t eff_num_traces   = run.count;
+    const int64_t eff_first_sample = run.s_first;
+    const int64_t eff_n_samples    = run.s_count;
+    const int32_t n_hypotheses     = run.M;
+    const std::vector<int32_t>& use_shifts = run.shifts;
+    // Result columns are raw samples from First sample on, if the pipeline
+    // keeps sample positions; otherwise pipeline output indices.
+    const int64_t col0 = keepsSamplePositions(run.pipeline) ? run.s_first : 0;
+    if (run.outside_alignment > 0)
+        statusBar()->showMessage(QString("CPA: %1 traces outside the alignment are left out.")
+                                     .arg(run.outside_alignment), 10000);
 
     // ---- Step 2: Initialise Python (once) ----
     {
@@ -12989,7 +13055,7 @@ void MainWindow::onRunCpa() {
     }
 
     // ---- Step 3: Leakage model editor dialog ----
-    LeakageModelDialog model_dlg(activeDs().file.get(), first_trace,
+    LeakageModelDialog model_dlg(run.file.get(), first_trace,
                                  std::min(5, num_traces), this);
     if (model_dlg.exec() != QDialog::Accepted) return;
 
@@ -13039,10 +13105,10 @@ void MainWindow::onRunCpa() {
         return true;
     };
 
-    bool ok = computeCpa(activeDs().file.get(), eff_first_trace, eff_num_traces,
+    bool ok = computeCpa(run.file.get(), eff_first_trace, eff_num_traces,
                          eff_first_sample, eff_n_samples,
                          n_hypotheses, use_shifts,
-                         activeDs().pipeline, leakage_fn, result, progCb, err);
+                         run.pipeline, leakage_fn, result, progCb, err);
     prog.setValue(prog.maximum());
 
     if (!ok) {
@@ -13072,8 +13138,8 @@ void MainWindow::onRunCpa() {
 
     auto* dlg = new QDialog(this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
-    dlg->setWindowTitle(QString("CPA  n=%1  M=%2  samples=%3  best=h%4 (r=%5)")
-        .arg(eff_num_traces).arg(n_hypotheses).arg(NS)
+    dlg->setWindowTitle(QString("CPA  n=%1  M=%2  samples %3–%4  best=h%5 (r=%6)")
+        .arg(result_ptr->n_traces).arg(n_hypotheses).arg(col0).arg(col0 + NS - 1)
         .arg(ranked[0].hyp).arg(ranked[0].peak_r, 0, 'f', 4));
     dlg->resize(1100, 720);
 
@@ -13083,10 +13149,10 @@ void MainWindow::onRunCpa() {
 
     // Hover label
     auto* lbl_hover = new QLabel("Hover over heatmap to inspect");
-    connect(hm, &HeatmapWidget::hoverInfo, dlg, [lbl_hover](int row, int col, float val) {
+    connect(hm, &HeatmapWidget::hoverInfo, dlg, [lbl_hover, col0](int row, int col, float val) {
         if (row >= 0 && col >= 0)
             lbl_hover->setText(QString("hyp=%1  sample=%2  corr=%3")
-                .arg(row).arg(col).arg(val, 0, 'g', 5));
+                .arg(row).arg(col0 + col).arg(val, 0, 'g', 5));
         else
             lbl_hover->setText("Hover over heatmap to inspect");
     });
@@ -13128,7 +13194,7 @@ void MainWindow::onRunCpa() {
             QFont f = r_item->font(); f.setBold(true); r_item->setFont(f);
         }
         tbl->setItem(r, col++, r_item);
-        auto* s_item = new QTableWidgetItem(QString::number(p.peak_sample));
+        auto* s_item = new QTableWidgetItem(QString::number(col0 + p.peak_sample));
         s_item->setTextAlignment(Qt::AlignCenter);
         tbl->setItem(r, col++, s_item);
     }

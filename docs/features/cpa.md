@@ -5,9 +5,19 @@
 CPA correlates a user-defined leakage model with every sample column of the trace matrix and ranks the results across M hypotheses. The correlation engine uses an online accumulator — the full trace matrix is never held in RAM, making it practical for large trace sets.
 
 **Configuration:**
-- Trace range and sample range
+- Trace range and sample range. **Draw on plot →** switches the main plot to
+  select mode: drag the region to analyse and it fills in *First sample* and
+  *Count* (the dialog stays open meanwhile).
 - **M (hypotheses)** — number of key guesses to test (1–65536); for AES key byte attacks use 256, for direct data correlation set M to the data field length
-- **Alignment** — apply stored alignment shifts
+- **Alignment** — apply stored alignment shifts. Ticking it fills in the
+  aligned traces and samples as a starting point; both ranges stay editable,
+  so you can run on any part of the aligned set (each trace uses its own
+  shift). Traces the alignment doesn't cover, or marks as discarded, are left
+  out.
+
+The result's sample numbers (hover, *Top candidates*) are raw sample
+positions when the pipeline keeps them; with a resampling pipeline they are
+indices of the pipeline's output from *First sample* on.
 
 **Leakage model editor:**
 - Python code editor with syntax highlighting and boilerplate (AES S-box + Hamming weight)
