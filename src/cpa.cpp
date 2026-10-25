@@ -160,7 +160,12 @@ bool computeCpa(
             for (int32_t ci = 0; ci < cur_m; ci++) {
                 std::string lerr;
                 if (!leakage_fn(data_flat, DL, N, h_start + ci, tmp, lerr)) {
-                    error = lerr;
+                    // Say which guess failed: a model that indexes the data
+                    // with key_guess runs past the trace data at some M.
+                    error = "The leakage model failed for key_guess = " + std::to_string(h_start + ci)
+                          + " (M = " + std::to_string(M) + ", guesses 0.." + std::to_string(M - 1)
+                          + "; each trace has " + std::to_string(DL)
+                          + " data bytes, plaintexts.shape[1]):\n\n" + lerr;
                     return false;
                 }
                 float* row = L_chunk.data() + static_cast<size_t>(ci) * N;
