@@ -259,6 +259,34 @@ private:
     // another copy. -1 = nothing overlaid.
     int baseline_trace_marker_ = -1;
 
+    // An FFT Spectrum result, kept by its tab for the tools on its toolbar.
+    struct FftResultInfo {
+        std::shared_ptr<std::vector<float>> spectrum;    // the curve shown
+        std::vector<float> spec_min, spec_max;           // envelope; empty = none
+        std::vector<float> mean_trace;                   // average of the processed traces
+        bool    of_mean = true;      // spectrum of mean_trace (else the average of spectra)
+        int64_t n_traces = 0;        // traces that went in
+        // How the traces were read, so a single one can be read again.
+        std::shared_ptr<TrsFile> file;
+        std::vector<std::shared_ptr<ITransform>> pipeline;
+        std::vector<int32_t> shifts;                     // empty = unaligned
+        int32_t shifts_first = 0;
+        int64_t read_lo = 0, read_hi = 0;
+        int32_t first = 0, count = 0;
+        int64_t s_first = 0, raw_ns = 0;
+        int64_t win_n = 0, fft_in_n = 0;                 // samples, and FFT length (padded)
+        int     window_mode = 1, out_mode = 1;           // as in the dialog's combos
+        QString window_name;
+        double  fs_hz = 0.0;                             // 0 = unknown
+        double  x_per_bin = 1.0;                         // axis units per bin
+        QString x_label, x_unit;                         // x_unit empty: bins
+    };
+    void showFftResult(std::shared_ptr<FftResultInfo> info);
+    // Remove frequency bands picked on the spectrum (drawn or typed) and show
+    // the inverse FFT of the average trace, or of one trace, without them;
+    // or add them to the pipeline as a Spectral Excise step.
+    void showRemoveFrequenciesDialog(PlotWidget* pw, std::shared_ptr<const FftResultInfo> info);
+
     // Shared tail of onAddTransform() — see its definition.
     void addTransformToPipeline(std::shared_ptr<ITransform> tx);
     void saveSnapshot();

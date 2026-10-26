@@ -13792,6 +13792,49 @@ static int64_t nextPow2(int64_t n) {
     return p;
 }
 
+// Coefficients of the FFT dialog's window functions: 0 none, 1 Hann,
+// 2 Hamming, 3 Blackman.
+static std::vector<float> fftWindow(int mode, int64_t n) {
+    std::vector<float> w(static_cast<size_t>(n), 1.0f);
+    const double N1 = static_cast<double>(std::max<int64_t>(1, n - 1));
+    for (int64_t i = 0; i < n; ++i) {
+        const double phi = 2.0 * M_PI * static_cast<double>(i) / N1;
+        double v = 1.0;
+        if (mode == 1)      v = 0.5 * (1.0 - std::cos(phi));
+        else if (mode == 2) v = 0.54 - 0.46 * std::cos(phi);
+        else if (mode == 3) v = 0.42 - 0.5 * std::cos(phi) + 0.08 * std::cos(2.0 * phi);
+        w[static_cast<size_t>(i)] = static_cast<float>(v);
+    }
+    return w;
+}
+
+// The one-sided spectrum of x[0..n) as the FFT tab shows it: windowed, then
+// zero-padded to fft_in_n (padding after windowing never changes what the
+// window tapered), as amplitude (out_mode 0), dB (1) or phase (2). `fft` must
+// only ever see one length — Eigen's plan cache breaks on a size change.
+static void spectrumOf(const float* x, int64_t n, const std::vector<float>& window,
+                       int64_t fft_in_n, int out_mode, Eigen::FFT<float>& fft,
+                       std::vector<float>& out)
+{
+    std::vector<float> in(static_cast<size_t>(fft_in_n), 0.0f);
+    const int64_t m = std::min<int64_t>({n, fft_in_n, static_cast<int64_t>(window.size())});
+    for (int64_t s = 0; s < m; ++s) in[static_cast<size_t>(s)] = x[s] * window[static_cast<size_t>(s)];
+    std::vector<std::complex<float>> f;
+    fft.SetFlag(Eigen::FFT<float>::HalfSpectrum);
+    fft.fwd(f, in);
+    const int64_t bins = fft_in_n / 2 + 1;
+    out.assign(static_cast<size_t>(bins), 0.0f);
+    const float norm = 1.0f / static_cast<float>(std::max<int64_t>(1, n));
+    for (int64_t k = 0; k < bins && k < static_cast<int64_t>(f.size()); ++k) {
+        const std::complex<float> c = f[static_cast<size_t>(k)];
+        if (out_mode == 2) { out[static_cast<size_t>(k)] = std::arg(c); continue; }
+        float mag = std::abs(c) * norm;
+        if (k > 0 && k < bins - 1) mag *= 2.0f;   // one-sided: all but DC and Nyquist
+        out[static_cast<size_t>(k)] = out_mode == 1 ? (mag > 0.0f ? 20.0f * std::log10(mag) : -200.0f)
+                                                    : mag;
+    }
+}
+
 void MainWindow::onRunFFT() {
     if (!hasActiveDs() || activeDs().is_result) {
         QMessageBox::information(this, "FFT", "No file loaded.");
@@ -13863,6 +13906,40 @@ void MainWindow::onRunFFT() {
             plotWidget()->setMode(InteractionMode::Pan);
     });
 
+    // What the spectrum is of. The average trace keeps only what repeats in
+    // every trace at the same place — the operation itself and lines locked
+    // to the trigger — and takes one FFT instead of one per trace. The
+    // average of the traces' spectra also shows what doesn't line up from
+    // trace to trace, such as a free-running radio carrier or converter.
+    auto* cmb_source = new QComboBox;
+    cmb_source->addItem("The average trace (one FFT)");
+    cmb_source->addItem("Each trace, spectra averaged");
+    cmb_source->setToolTip(
+        "The average trace: average the traces first, then one FFT. Fast, and "
+        "noise that differs from trace to trace averages out, so what is left "
+        "is what every trace has in common.\n\n"
+        "Each trace: one FFT per trace and the average of the spectra. Slower, "
+        "but it also shows lines that are not locked to the trigger, which "
+        "average out of the average trace.");
+    fl->addRow("Spectrum of:", cmb_source);
+
+    // Alignment: the stored shifts (one tile's, when tiled), as in Average
+    // Trace. Only the average trace needs them: a magnitude spectrum doesn't
+    // depend on where in the window a feature sits.
+    const bool has_alignment = activeDs().align_n_samples > 0;
+    const bool ds_tiled = has_alignment && activeDs().align_tile_size > 0;
+    const int32_t n_tiles = ds_tiled ? static_cast<int32_t>(h.num_samples / activeDs().align_tile_size) : 1;
+    auto* chk_shifts = new QCheckBox("Apply last alignment shifts");
+    chk_shifts->setChecked(has_alignment);
+    fl->addRow("", chk_shifts);
+    QSpinBox* sp_tile = nullptr;
+    if (ds_tiled) {
+        sp_tile = new QSpinBox;
+        sp_tile->setRange(0, std::max(0, n_tiles - 1));
+        sp_tile->setValue(std::clamp(activeDs().align_baked_tile, 0, std::max(0, n_tiles - 1)));
+        fl->addRow("Tile:", sp_tile);
+    }
+
     auto* cmb_window = new QComboBox;
     cmb_window->addItem("None (rectangular)");
     cmb_window->addItem("Hann");
@@ -13875,6 +13952,7 @@ void MainWindow::onRunFFT() {
     cmb_output->addItem("Magnitude");
     cmb_output->addItem("Magnitude (dB)");
     cmb_output->addItem("Phase (rad)");
+    cmb_output->setCurrentIndex(1);  // default: dB — lines and floor both readable
     fl->addRow("Output:", cmb_output);
 
     // Sample rate override — the frequency axis is normally derived from the
@@ -13932,12 +14010,33 @@ void MainWindow::onRunFFT() {
     chk_envelope->setChecked(false);
     fl->addRow("", chk_envelope);
 
+    auto syncSource = [=]() {
+        const bool of_mean = cmb_source->currentIndex() == 0;
+        chk_shifts->setEnabled(of_mean && has_alignment);
+        if (sp_tile) sp_tile->setEnabled(of_mean && has_alignment);
+        chk_shifts->setToolTip(!has_alignment ? QString("No alignment has been applied yet.")
+                               : of_mean ? QString("Average the traces as aligned, so a jittered "
+                                                   "feature stays sharp instead of smearing out.")
+                                         : QString("Only used for the average trace: a magnitude "
+                                                   "spectrum doesn't depend on where in the window "
+                                                   "a feature sits."));
+        chk_envelope->setEnabled(!of_mean);
+        chk_envelope->setToolTip(of_mean ? QString("The average trace has one spectrum, so there "
+                                                   "is no per-trace minimum or maximum.")
+                                         : QString());
+    };
+    connect(cmb_source, QOverload<int>::of(&QComboBox::currentIndexChanged), cfg, syncSource);
+
     auto mem = std::make_shared<DialogMemory>("fft");
+    mem->bind(cmb_source, "source");
     mem->bind(cmb_window, "window_fn");
-    mem->bind(cmb_output, "output");
+    // Key renamed when dB became the default, so a "Magnitude" stored by
+    // earlier versions doesn't keep overriding it.
+    mem->bind(cmb_output, "output_v2");
     mem->bind(chk_pad, "zero_pad");
     mem->bind(chk_envelope, "envelope");
     mem->restore();
+    syncSource();
 
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     cfg_bb->button(QDialogButtonBox::Ok)->setText("Run FFT");
@@ -13945,23 +14044,26 @@ void MainWindow::onRunFFT() {
     connect(cfg_bb, &QDialogButtonBox::rejected, cfg, &QDialog::reject);
     connect(cfg_bb, &QDialogButtonBox::accepted, cfg, [=]() {
         mem->save();
-        const int32_t first        = sp_first->value();
-        const int32_t count        = sp_count->value();
-        const int64_t eff_first_sample = sp_s_first->value();
-        const int64_t eff_n_samples    = sp_s_count->value();
-        const int      win_mode    = cmb_window->currentIndex();
-        const int      out_mode    = cmb_output->currentIndex();
-        const bool     show_env    = chk_envelope->isChecked();
-        const bool     pad_pow2    = chk_pad->isChecked();
+        auto info = std::make_shared<FftResultInfo>();
+        info->file        = activeDs().file;
+        for (const auto& t : activeDs().pipeline) info->pipeline.push_back(t->clone());
+        info->first       = sp_first->value();
+        info->count       = std::min(sp_count->value(), n_total - info->first);
+        info->s_first     = sp_s_first->value();
+        info->of_mean     = cmb_source->currentIndex() == 0;
+        info->window_mode = cmb_window->currentIndex();
+        info->window_name = cmb_window->currentText();
+        info->out_mode    = cmb_output->currentIndex();
+        const int64_t eff_n_samples = sp_s_count->value();
+        const bool show_env = !info->of_mean && chk_envelope->isChecked();
+        const bool pad_pow2 = chk_pad->isChecked();
 
-        const int64_t raw_ns = (eff_n_samples == 0)
-            ? (h.num_samples - eff_first_sample)
-            : std::min<int64_t>(eff_n_samples, h.num_samples - eff_first_sample);
-
-        int64_t effective_samples = raw_ns;
-        for (const auto& t : activeDs().pipeline)
+        info->raw_ns = (eff_n_samples == 0)
+            ? (h.num_samples - info->s_first)
+            : std::min<int64_t>(eff_n_samples, h.num_samples - info->s_first);
+        int64_t effective_samples = info->raw_ns;
+        for (const auto& t : info->pipeline)
             effective_samples = t->transformedCount(effective_samples);
-
         if (effective_samples < 2) {
             QMessageBox::critical(cfg, "FFT", "Too few samples after pipeline.");
             return;
@@ -13970,110 +14072,10 @@ void MainWindow::onRunFFT() {
         // win_n: the real (unpadded) number of samples the window/data
         // actually covers. fft_in_n: what's actually handed to the FFT —
         // the next power-of-two >= win_n when pad_pow2 is set, otherwise
-        // identical to win_n (today's exact behavior). Padding only ever
-        // extends the tail with zeros *after* windowing (see the per-trace
-        // loop below), so it never changes what the window itself looks like.
-        const int64_t win_n     = effective_samples;
-        const int64_t fft_in_n  = pad_pow2 ? nextPow2(win_n) : win_n;
-        const int64_t fft_out_n = fft_in_n / 2 + 1;
-
-        // Build window coefficients (sized to win_n, not fft_in_n).
-        std::vector<float> window(static_cast<size_t>(win_n));
-        {
-            const double N1 = static_cast<double>(win_n - 1);
-            for (int64_t i = 0; i < win_n; ++i) {
-                double w = 1.0;
-                const double phi = 2.0 * M_PI * i / N1;
-                if (win_mode == 1)      w = 0.5 * (1.0 - std::cos(phi));           // Hann
-                else if (win_mode == 2) w = 0.54 - 0.46 * std::cos(phi);           // Hamming
-                else if (win_mode == 3) w = 0.42 - 0.5*std::cos(phi) + 0.08*std::cos(2.0*phi); // Blackman
-                window[i] = static_cast<float>(w);
-            }
-        }
-
-        // Accumulators for average, min, max.
-        std::vector<double> acc_sum(static_cast<size_t>(fft_out_n), 0.0);
-        std::vector<float>  acc_min(static_cast<size_t>(fft_out_n),  std::numeric_limits<float>::max());
-        std::vector<float>  acc_max(static_cast<size_t>(fft_out_n), -std::numeric_limits<float>::max());
-        int64_t n_ok = 0;
-
-        QProgressDialog prog("Computing FFT…", "Cancel", 0, count, cfg);
-        prog.setWindowModality(Qt::WindowModal);
-        prog.setMinimumDuration(400);
-
-        std::vector<float> trace_buf(static_cast<size_t>(std::max(raw_ns, effective_samples)));
-        Eigen::FFT<float>  fft_engine;
-        fft_engine.SetFlag(Eigen::FFT<float>::HalfSpectrum);  // only positive freqs
-        std::vector<std::complex<float>> freq_buf;
-
-        for (int32_t ti = 0; ti < count; ++ti) {
-            if (prog.wasCanceled()) return;
-            prog.setValue(ti);
-            QApplication::processEvents();
-
-            int32_t src_idx = first + ti;
-            std::fill(trace_buf.begin(), trace_buf.end(), 0.0f);
-            if (eff_first_sample < h.num_samples && eff_first_sample + raw_ns > 0) {
-                int64_t src_start = std::max<int64_t>(0, eff_first_sample);
-                int64_t src_end   = std::min<int64_t>(h.num_samples, eff_first_sample + raw_ns);
-                int64_t dst_off   = src_start - eff_first_sample;
-                int64_t got = activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
-                                                      trace_buf.data() + dst_off);
-                if (got <= 0) continue;
-            }
-
-            for (const auto& t : activeDs().pipeline) t->reset();
-            int64_t n_out = raw_ns;
-            for (const auto& t : activeDs().pipeline)
-                n_out = t->apply(trace_buf.data(), n_out, 0);
-
-            if (n_out < 2) continue;
-
-            // Apply window (in-place).
-            for (int64_t s = 0; s < n_out; ++s)
-                trace_buf[s] *= window[s];
-
-            // FFT — zero-padded to fft_in_n (== n_out when pad_pow2 is off,
-            // so this degenerates to exactly today's behavior in that case).
-            // The padding happens here, strictly after windowing, so it
-            // never changes what the window itself tapered.
-            std::vector<float> in_vec(static_cast<size_t>(fft_in_n), 0.0f);
-            std::copy(trace_buf.begin(), trace_buf.begin() + n_out, in_vec.begin());
-            fft_engine.fwd(freq_buf, in_vec);
-
-            // Accumulate magnitude / phase.
-            const float norm = 1.0f / static_cast<float>(n_out);
-            for (int64_t k = 0; k < fft_out_n; ++k) {
-                float val;
-                if (out_mode == 2) {
-                    val = std::arg(freq_buf[k]);
-                } else {
-                    float mag = std::abs(freq_buf[k]) * norm;
-                    // Double all bins except DC and Nyquist to get one-sided amplitude.
-                    if (k > 0 && k < fft_out_n - 1) mag *= 2.0f;
-                    if (out_mode == 1) {
-                        val = (mag > 0.0f) ? 20.0f * std::log10(mag) : -200.0f;
-                    } else {
-                        val = mag;
-                    }
-                }
-                acc_sum[k] += static_cast<double>(val);
-                if (val < acc_min[k]) acc_min[k] = val;
-                if (val > acc_max[k]) acc_max[k] = val;
-            }
-            ++n_ok;
-        }
-        prog.setValue(count);
-
-        if (n_ok == 0) {
-            QMessageBox::critical(cfg, "FFT", "No traces could be processed.");
-            return;
-        }
-
-        // Build average spectrum.
-        auto avg_ptr = std::make_shared<std::vector<float>>(static_cast<size_t>(fft_out_n));
-        for (int64_t k = 0; k < fft_out_n; ++k)
-            (*avg_ptr)[k] = static_cast<float>(acc_sum[k] / static_cast<double>(n_ok));
+        // identical to win_n.
+        info->win_n    = effective_samples;
+        info->fft_in_n = pad_pow2 ? nextPow2(info->win_n) : info->win_n;
+        const int64_t fft_out_n = info->fft_in_n / 2 + 1;
 
         // Sample rate: the override spinbox (if set > 0) wins over the
         // file's own scale_x metadata — see the comment where sp_rate is
@@ -14084,120 +14086,483 @@ void MainWindow::onRunFFT() {
             int ui = cmb_rate_unit->currentIndex();
             rate_override_hz = sp_rate->value() * kRateUnitMul[(ui >= 0 && ui < 4) ? ui : 0];
         }
-
-        // Build x-axis label and frequency scale (for display only, via
-        // setAxisLabels()/setXScale()). scale_x is seconds/sample in TRS
-        // files; if meaningful (or overridden above), show a real frequency
-        // axis instead of raw bin indices.
-        const bool has_freq_axis = file_has_freq_axis || rate_override_hz > 0.0;
-        // Same resolution the axis uses, hoisted out so the line detector
-        // below can report frequencies in Hz too. 0 = unknown.
-        const double fs_hz = (rate_override_hz > 0.0)
+        info->fs_hz = (rate_override_hz > 0.0)
             ? rate_override_hz
             : (file_has_freq_axis ? 1.0 / static_cast<double>(h.scale_x) : 0.0);
-        QString x_label;
-        double  x_scale = 1.0;   // passed to setXScale() below — Hz per bin, in whatever unit x_label names
-        if (has_freq_axis) {
-            const double fs      = (rate_override_hz > 0.0)
-                                        ? rate_override_hz
-                                        : (1.0 / static_cast<double>(h.scale_x));  // sample rate, Hz
-            const double df      = fs / static_cast<double>(fft_in_n); // Hz per bin
-            const double nyquist = fs / 2.0;                           // frequency at the last bin
+        if (info->fs_hz > 0.0) {
+            const double df      = info->fs_hz / static_cast<double>(info->fft_in_n); // Hz per bin
+            const double nyquist = info->fs_hz / 2.0;
             // Pick one consistent unit for the *whole* axis from the top of
             // its range (Nyquist) instead of letting PlotWidget's generic
-            // per-tick k/M/G formatter (see plot_widget.cpp) pick a
-            // different prefix for every tick — a mix of "12.3k" and "450"
-            // on the same axis reads as inconsistent units even though it's
-            // all technically correct SI-prefixed Hz.
-            double  unit_scale = 1.0;
-            QString unit_name  = "Hz";
-            if      (nyquist >= 1e9) { unit_scale = 1e9; unit_name = "GHz"; }
-            else if (nyquist >= 1e6) { unit_scale = 1e6; unit_name = "MHz"; }
-            else if (nyquist >= 1e3) { unit_scale = 1e3; unit_name = "kHz"; }
-            x_scale = df / unit_scale;
-            x_label = QString("Frequency (%1)").arg(unit_name);
+            // per-tick k/M/G formatter pick a different prefix for every
+            // tick — a mix of "12.3k" and "450" on one axis reads as
+            // inconsistent units.
+            double unit_scale = 1.0;
+            info->x_unit = "Hz";
+            if      (nyquist >= 1e9) { unit_scale = 1e9; info->x_unit = "GHz"; }
+            else if (nyquist >= 1e6) { unit_scale = 1e6; info->x_unit = "MHz"; }
+            else if (nyquist >= 1e3) { unit_scale = 1e3; info->x_unit = "kHz"; }
+            info->x_per_bin = df / unit_scale;
+            info->x_label   = QString("Frequency (%1)").arg(info->x_unit);
         } else {
-            x_label = "Frequency Bin";
+            info->x_label = "Frequency Bin";
         }
-        QString y_label;
-        if (out_mode == 0) y_label = "Amplitude";
-        else if (out_mode == 1) y_label = "Magnitude (dB)";
-        else y_label = "Phase (rad)";
 
-        // --- Result tab: in the main window like every other result, so the
-        // plot tools, Tile Tabs (next to a t-test, say) and figure export all
-        // work on it. ---
-        const QString title = QString("FFT Spectrum — %1 traces, %2, N=%3%4")
-                                  .arg(n_ok)
-                                  .arg(cmb_window->currentText())
-                                  .arg(fft_in_n)
-                                  .arg(pad_pow2 ? QString(" (padded from %1)").arg(win_n) : QString());
+        if (info->of_mean) {
+            // Average in the background like Average Trace, then one FFT —
+            // still on the worker, since a whole long trace is a big FFT.
+            const ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
+            const bool use_shifts = has_alignment && chk_shifts->isChecked();
+            if (use_shifts) {
+                info->shifts       = resolved.shifts;
+                info->shifts_first = activeDs().align_first_trace;
+            }
+            info->read_lo = ds_tiled && use_shifts ? resolved.first_sample : 0;
+            info->read_hi = ds_tiled && use_shifts ? resolved.first_sample + resolved.n_samples : h.num_samples;
+            struct Out { QString warn, err; };
+            auto out = std::make_shared<Out>();
+            jobs_->submit(QString("FFT of the average — %1 traces of %2").arg(info->count).arg(activeDs().display_name),
+                [=](JobContext& ctx) {
+                    MeanTraceResult r;
+                    if (!computeMeanTraces(info->file.get(), info->pipeline, info->first, info->count,
+                                           info->s_first, info->raw_ns, -1, info->shifts, info->shifts_first,
+                                           info->read_lo, info->read_hi,
+                                           [&ctx](int64_t done, int64_t total) {
+                                               ctx.setProgress(done, total);
+                                               return !ctx.cancelled();
+                                           },
+                                           r, out->warn, out->err))
+                        return false;
+                    if (r.n[0] == 0 || static_cast<int64_t>(r.mean[0].size()) < 2) {
+                        out->err = "No traces could be read.";
+                        return false;
+                    }
+                    info->mean_trace = std::move(r.mean[0]);
+                    info->n_traces   = r.n[0];
+                    Eigen::FFT<float> fft;
+                    auto spec = std::make_shared<std::vector<float>>();
+                    spectrumOf(info->mean_trace.data(), static_cast<int64_t>(info->mean_trace.size()),
+                               fftWindow(info->window_mode, info->win_n), info->fft_in_n,
+                               info->out_mode, fft, *spec);
+                    info->spectrum = spec;
+                    return true;
+                },
+                [=](bool ok) {
+                    if (!ok) {
+                        if (!out->err.isEmpty() && out->err != "Cancelled.")
+                            QMessageBox::critical(this, "FFT failed", out->err);
+                        return;
+                    }
+                    if (!out->warn.isEmpty()) QMessageBox::warning(this, "FFT", out->warn);
+                    showFftResult(info);
+                });
+            cfg->accept();   // the result tab opens when the job is done
+            return;
+        }
+
+        // Each trace: one FFT per trace, averaged — and the average trace
+        // alongside, for the inverse-FFT tool.
+        const std::vector<float> window = fftWindow(info->window_mode, info->win_n);
+        std::vector<double> acc_sum(static_cast<size_t>(fft_out_n), 0.0);
+        std::vector<float>  acc_min(static_cast<size_t>(fft_out_n),  std::numeric_limits<float>::max());
+        std::vector<float>  acc_max(static_cast<size_t>(fft_out_n), -std::numeric_limits<float>::max());
+        std::vector<double> mean_sum(static_cast<size_t>(info->win_n), 0.0);
+        int64_t n_ok = 0;
+
+        QProgressDialog prog("Computing FFT…", "Cancel", 0, info->count, cfg);
+        prog.setWindowModality(Qt::WindowModal);
+        prog.setMinimumDuration(400);
+
+        std::vector<float> trace_buf;
+        Eigen::FFT<float>  fft_engine;
+        std::vector<float> spec;
+        for (int32_t ti = 0; ti < info->count; ++ti) {
+            if (prog.wasCanceled()) return;
+            prog.setValue(ti);
+            QApplication::processEvents();
+
+            int64_t n_out = 0;
+            if (loadProcessedTrace(info->file.get(), info->pipeline, info->first + ti, info->s_first,
+                                   info->raw_ns, {}, 0, 0, h.num_samples, trace_buf, n_out)
+                    != TraceLoad::Ok || n_out < 2)
+                continue;
+
+            for (int64_t s = 0; s < n_out && s < info->win_n; ++s)
+                mean_sum[static_cast<size_t>(s)] += trace_buf[static_cast<size_t>(s)];
+            spectrumOf(trace_buf.data(), n_out, window, info->fft_in_n, info->out_mode, fft_engine, spec);
+            for (int64_t k = 0; k < fft_out_n; ++k) {
+                const float val = spec[static_cast<size_t>(k)];
+                acc_sum[static_cast<size_t>(k)] += static_cast<double>(val);
+                acc_min[static_cast<size_t>(k)] = std::min(acc_min[static_cast<size_t>(k)], val);
+                acc_max[static_cast<size_t>(k)] = std::max(acc_max[static_cast<size_t>(k)], val);
+            }
+            ++n_ok;
+        }
+        prog.setValue(info->count);
+
+        if (n_ok == 0) {
+            QMessageBox::critical(cfg, "FFT", "No traces could be processed.");
+            return;
+        }
+
+        info->n_traces = n_ok;
+        info->spectrum = std::make_shared<std::vector<float>>(static_cast<size_t>(fft_out_n));
+        for (int64_t k = 0; k < fft_out_n; ++k)
+            (*info->spectrum)[static_cast<size_t>(k)] =
+                static_cast<float>(acc_sum[static_cast<size_t>(k)] / static_cast<double>(n_ok));
+        info->mean_trace.resize(static_cast<size_t>(info->win_n));
+        for (int64_t s = 0; s < info->win_n; ++s)
+            info->mean_trace[static_cast<size_t>(s)] =
+                static_cast<float>(mean_sum[static_cast<size_t>(s)] / static_cast<double>(n_ok));
         if (show_env && n_ok > 1) {
-            // Envelope first, so the average is drawn on top of it.
-            addResultTab(acc_min, title, themeTraceColor(0), "Min");
-            plotWidget()->addTrace(std::make_shared<std::vector<float>>(acc_max), themeTraceColor(0), "Max");
-            plotWidget()->addTrace(avg_ptr, themeTraceColor(1), "Average");
-        } else {
-            addResultTab(*avg_ptr, title, themeTraceColor(1), "Average");
-            plotWidget()->setTraceFilled(0, true);
+            info->spec_min = std::move(acc_min);
+            info->spec_max = std::move(acc_max);
         }
-        PlotWidget* pw = plotWidget();
-
-        // Set x-axis scale so ticks show frequency (in x_label's unit)
-        // instead of bin indices.
-        if (has_freq_axis) pw->setXScale(x_scale, 0.0);
-        pw->setAxisLabels(x_label, y_label);
-        pw->resetView();
-
-        auto* btn_exp_npy = new QPushButton("Export .npy…");
-        connect(btn_exp_npy, &QPushButton::clicked, pw, [this, avg_ptr]() {
-            QString path = QFileDialog::getSaveFileName(this, "Export FFT spectrum as NumPy",
-                                                        MainWindow::recentDir("npy"), "NumPy files (*.npy)");
-            if (path.isEmpty()) return;
-            MainWindow::updateRecentDir("npy", path);
-            QString e;
-            if (!saveNpy(path, avg_ptr->data(), static_cast<int64_t>(avg_ptr->size()), e))
-                QMessageBox::critical(this, "Export failed", e);
-            else
-                QMessageBox::information(this, "Export complete", "Saved: " + path);
-        });
-
-        auto* btn_exp_pdf = new QPushButton("Export Figure…");
-        connect(btn_exp_pdf, &QPushButton::clicked, pw, [this, pw]() { showFigureExportDialog(pw, this); });
-
-        // Phase output has no magnitude floor to stand a line against, so
-        // detection is only offered for the magnitude modes.
-        auto* btn_lines = new QPushButton("Detect spectral lines…");
-        btn_lines->setToolTip(
-            out_mode == 2
-                ? QString("Not available on a phase spectrum — re-run with a "
-                          "magnitude output.")
-                : QString("Find narrowband interference (radio carriers, "
-                          "switching-converter harmonics, reference clocks) "
-                          "standing above the local noise floor, and optionally "
-                          "excise it."));
-        btn_lines->setEnabled(out_mode != 2);
-        // The line dialog draws on this tab's plot, so it belongs to it and
-        // closes with the tab.
-        connect(btn_lines, &QPushButton::clicked, pw, [=]() {
-            showSpectralLineDialog(pw, pw, avg_ptr, /*spec_is_db=*/out_mode == 1,
-                                    fft_in_n, fs_hz);
-        });
-
-        auto* extra = new QWidget;
-        auto* hl = new QHBoxLayout(extra);
-        hl->setContentsMargins(4, 2, 4, 2);
-        hl->addWidget(btn_lines);
-        hl->addWidget(btn_exp_npy);
-        hl->addWidget(btn_exp_pdf);
-        hl->addStretch();
-        activeDs().extra_toolbar = extra;
-        updateViewLayout();
-
+        showFftResult(info);
         cfg->accept();   // close the config dialog now that the run succeeded
     });
 
     cfg->show();
+}
+
+// The FFT Spectrum result tab, in the main window like every other result, so
+// the plot tools, Tile Tabs (next to a t-test, say) and figure export all
+// work on it.
+void MainWindow::showFftResult(std::shared_ptr<FftResultInfo> info) {
+    const QString title = QString("FFT Spectrum — %1 %2 traces, %3, N=%4%5")
+                              .arg(info->of_mean ? "average of" : "")
+                              .arg(info->n_traces)
+                              .arg(info->window_name)
+                              .arg(info->fft_in_n)
+                              .arg(info->fft_in_n != info->win_n
+                                       ? QString(" (padded from %1)").arg(info->win_n) : QString())
+                              .simplified();
+    if (!info->spec_min.empty()) {
+        // Envelope first, so the average is drawn on top of it.
+        addResultTab(info->spec_min, title, themeTraceColor(0), "Min");
+        plotWidget()->addTrace(std::make_shared<std::vector<float>>(info->spec_max), themeTraceColor(0), "Max");
+        plotWidget()->addTrace(info->spectrum, themeTraceColor(1), "Average");
+    } else {
+        addResultTab(*info->spectrum, title, themeTraceColor(1),
+                     info->of_mean ? "Spectrum of the average" : "Average");
+        plotWidget()->setTraceFilled(0, true);
+    }
+    PlotWidget* pw = plotWidget();
+    // Ticks in frequency (x_label's unit) instead of bin indices.
+    if (info->fs_hz > 0.0) pw->setXScale(info->x_per_bin, 0.0);
+    pw->setAxisLabels(info->x_label, info->out_mode == 0 ? "Amplitude"
+                                     : info->out_mode == 1 ? "Magnitude (dB)" : "Phase (rad)");
+    pw->resetView();
+
+    auto spec = info->spectrum;
+    auto* btn_exp_npy = new QPushButton("Export .npy…");
+    connect(btn_exp_npy, &QPushButton::clicked, pw, [this, spec]() {
+        QString path = QFileDialog::getSaveFileName(this, "Export FFT spectrum as NumPy",
+                                                    MainWindow::recentDir("npy"), "NumPy files (*.npy)");
+        if (path.isEmpty()) return;
+        MainWindow::updateRecentDir("npy", path);
+        QString e;
+        if (!saveNpy(path, spec->data(), static_cast<int64_t>(spec->size()), e))
+            QMessageBox::critical(this, "Export failed", e);
+        else
+            QMessageBox::information(this, "Export complete", "Saved: " + path);
+    });
+
+    auto* btn_exp_pdf = new QPushButton("Export Figure…");
+    connect(btn_exp_pdf, &QPushButton::clicked, pw, [this, pw]() { showFigureExportDialog(pw, this); });
+
+    // Phase output has no magnitude floor to stand a line against, so
+    // detection is only offered for the magnitude modes.
+    auto* btn_lines = new QPushButton("Detect spectral lines…");
+    btn_lines->setToolTip(
+        info->out_mode == 2
+            ? QString("Not available on a phase spectrum — re-run with a "
+                      "magnitude output.")
+            : QString("Find narrowband interference (radio carriers, "
+                      "switching-converter harmonics, reference clocks) "
+                      "standing above the local noise floor, and optionally "
+                      "excise it."));
+    btn_lines->setEnabled(info->out_mode != 2);
+    // The line dialog draws on this tab's plot, so it belongs to it and
+    // closes with the tab.
+    connect(btn_lines, &QPushButton::clicked, pw, [=]() {
+        showSpectralLineDialog(pw, pw, spec, /*spec_is_db=*/info->out_mode == 1,
+                                info->fft_in_n, info->fs_hz);
+    });
+
+    auto* btn_remove = new QPushButton("Remove frequencies…");
+    btn_remove->setToolTip("Pick bands on this spectrum — drag across them or type them — and see "
+                           "the inverse FFT without them, or remove them from every trace.");
+    connect(btn_remove, &QPushButton::clicked, pw, [=]() { showRemoveFrequenciesDialog(pw, info); });
+
+    auto* extra = new QWidget;
+    auto* hl = new QHBoxLayout(extra);
+    hl->setContentsMargins(4, 2, 4, 2);
+    hl->addWidget(btn_lines);
+    hl->addWidget(btn_remove);
+    hl->addWidget(btn_exp_npy);
+    hl->addWidget(btn_exp_pdf);
+    hl->addStretch();
+    activeDs().extra_toolbar = extra;
+    updateViewLayout();
+}
+
+void MainWindow::showRemoveFrequenciesDialog(PlotWidget* pw, std::shared_ptr<const FftResultInfo> info) {
+    const int64_t n_bins = info->spectrum ? static_cast<int64_t>(info->spectrum->size()) : 0;
+    if (n_bins < 8 || info->mean_trace.size() < 8) {
+        QMessageBox::information(pw, "Remove frequencies", "Spectrum too short to work on.");
+        return;
+    }
+    // Bands are kept as fractions of Nyquist, like the Spectral Excise step
+    // that does the removal; the last bin is Nyquist.
+    const double last_bin = static_cast<double>(n_bins - 1);
+    const double nyq_disp = last_bin * info->x_per_bin;   // Nyquist in axis units
+    const QString unit = info->x_unit.isEmpty() ? QString("bins") : info->x_unit;
+    auto toDisp = [=](double norm) { return norm * nyq_disp; };
+
+    auto* d = new QDialog(pw);
+    d->setAttribute(Qt::WA_DeleteOnClose);
+    d->setWindowTitle("Remove frequencies");
+    d->resize(560, 600);
+    auto* vl = new QVBoxLayout(d);
+
+    auto* blurb = new QLabel(
+        "Drag across a line on the spectrum, or type it below, to remove it; "
+        "<b>Show inverse FFT</b> then draws the signal without it. A removed "
+        "band is filled with the level of the spectrum either side of it (as "
+        "the <i>Spectral Excise</i> step does), so the noise floor stays and "
+        "nothing rings. <b>Add to pipeline</b> removes the bands from every trace.");
+    blurb->setWordWrap(true);
+    vl->addWidget(blurb);
+
+    auto bands = std::make_shared<std::vector<SpectralBand>>();
+
+    auto* btn_draw = new QPushButton("Draw on spectrum →");
+    btn_draw->setCheckable(true);
+    btn_draw->setToolTip("Each drag across the spectrum adds a band. Zoom in first to pick a "
+                         "narrow line. Click again to stop.");
+    vl->addWidget(btn_draw);
+
+    // Typed entry, in the axis's own unit.
+    auto* add_row = new QHBoxLayout;
+    auto* sp_c = new QDoubleSpinBox;
+    sp_c->setDecimals(6);
+    sp_c->setRange(0.0, nyq_disp);
+    sp_c->setSuffix(" " + unit);
+    auto* sp_w = new QDoubleSpinBox;
+    sp_w->setDecimals(6);
+    sp_w->setRange(info->x_per_bin, nyq_disp);
+    sp_w->setValue(3.0 * info->x_per_bin);
+    sp_w->setSuffix(" " + unit);
+    sp_w->setToolTip("Full width of the band. A line between two bins spreads over a few of them.");
+    auto* btn_add = new QPushButton("Add");
+    add_row->addWidget(new QLabel("Centre:"));
+    add_row->addWidget(sp_c, 1);
+    add_row->addWidget(new QLabel("Width:"));
+    add_row->addWidget(sp_w, 1);
+    add_row->addWidget(btn_add);
+    vl->addLayout(add_row);
+
+    auto* tbl = new QTableWidget(0, 2);
+    tbl->setHorizontalHeaderLabels({QString("From (%1)").arg(unit), QString("To (%1)").arg(unit)});
+    tbl->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+    tbl->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tbl->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    vl->addWidget(tbl, 1);
+    auto* tbl_btns = new QHBoxLayout;
+    auto* btn_del   = new QPushButton("Remove selected");
+    auto* btn_clear = new QPushButton("Clear");
+    tbl_btns->addWidget(btn_del);
+    tbl_btns->addWidget(btn_clear);
+    tbl_btns->addStretch();
+    vl->addLayout(tbl_btns);
+
+    // Which signal to show without the bands.
+    auto* grp_sig = new QGroupBox("Inverse FFT of");
+    auto* gl = new QGridLayout(grp_sig);
+    auto* rb_mean  = new QRadioButton(QString("The average trace (%1 traces%2)")
+                                          .arg(info->n_traces)
+                                          .arg(info->shifts.empty() ? "" : ", aligned"));
+    auto* rb_trace = new QRadioButton("Trace");
+    auto* sp_trace = new QSpinBox;
+    sp_trace->setRange(info->first, info->first + std::max(0, info->count - 1));
+    rb_mean->setChecked(true);
+    sp_trace->setEnabled(false);
+    gl->addWidget(rb_mean, 0, 0, 1, 2);
+    gl->addWidget(rb_trace, 1, 0);
+    gl->addWidget(sp_trace, 1, 1);
+    gl->setColumnStretch(2, 1);
+    connect(rb_trace, &QRadioButton::toggled, sp_trace, &QWidget::setEnabled);
+    vl->addWidget(grp_sig);
+
+    auto* status = new QLabel;
+    status->setWordWrap(true);
+    vl->addWidget(status);
+
+    auto* hl = new QHBoxLayout;
+    auto* btn_show  = new QPushButton("Show inverse FFT");
+    auto* btn_pipe  = new QPushButton("Add to pipeline…");
+    auto* btn_close = new QPushButton("Close");
+    btn_show->setProperty("primary", true);
+    btn_pipe->setToolTip("Add a Spectral Excise step with these bands to the trace file's "
+                         "pipeline, so the main view and every analysis use the traces "
+                         "without them.");
+    hl->addWidget(btn_show);
+    hl->addWidget(btn_pipe);
+    hl->addStretch();
+    hl->addWidget(btn_close);
+    vl->addLayout(hl);
+
+    auto refresh = [=]() {
+        tbl->setRowCount(static_cast<int>(bands->size()));
+        std::vector<std::pair<int64_t, int64_t>> marks;
+        for (int i = 0; i < static_cast<int>(bands->size()); ++i) {
+            const SpectralBand& b = (*bands)[static_cast<size_t>(i)];
+            tbl->setItem(i, 0, new QTableWidgetItem(QString::number(toDisp(std::max(0.0, b.lo())), 'g', 8)));
+            tbl->setItem(i, 1, new QTableWidgetItem(QString::number(toDisp(std::min(1.0, b.hi())), 'g', 8)));
+            marks.emplace_back(static_cast<int64_t>(std::floor(b.lo() * last_bin)),
+                               static_cast<int64_t>(std::ceil(b.hi() * last_bin)) + 1);
+        }
+        pw->setMatchMarkers(marks);
+    };
+    // A band over spectrum bins [lo, hi], inclusive.
+    auto addBins = [=](double lo, double hi) {
+        lo = std::clamp(lo, 0.0, last_bin);
+        hi = std::clamp(hi, lo, last_bin);
+        bands->push_back(SpectralBand{(lo + hi) / 2.0 / last_bin, (hi - lo) / 2.0 / last_bin});
+        refresh();
+    };
+
+    connect(btn_add, &QPushButton::clicked, d, [=]() {
+        const double c = sp_c->value() / info->x_per_bin, half = sp_w->value() / info->x_per_bin / 2.0;
+        addBins(c - half, c + half);
+    });
+    connect(btn_del, &QPushButton::clicked, d, [=]() {
+        std::vector<int> rows;
+        for (const auto& r : tbl->selectionModel()->selectedRows()) rows.push_back(r.row());
+        std::sort(rows.rbegin(), rows.rend());
+        for (int r : rows)
+            if (r < static_cast<int>(bands->size())) bands->erase(bands->begin() + r);
+        refresh();
+    });
+    connect(btn_clear, &QPushButton::clicked, d, [=]() { bands->clear(); refresh(); });
+
+    // Drawing: every drag on the spectrum adds a band; the crop range it
+    // makes is only the carrier and is cleared straight away.
+    auto stopDrawing = [=]() {
+        pw->setCropAutoConfirm(false);
+        if (pw->mode() == InteractionMode::CropSelect) pw->setMode(InteractionMode::Pan);
+        btn_draw->setText("Draw on spectrum →");
+    };
+    connect(btn_draw, &QPushButton::toggled, d, [=](bool on) {
+        if (!on) { stopDrawing(); return; }
+        const int i = datasetIndexForWidget(pw);
+        if (i >= 0) tab_bar_->setCurrentIndex(i);
+        pw->clearCropRanges();
+        pw->setCropAutoConfirm(true);
+        pw->setMode(InteractionMode::CropSelect);
+        btn_draw->setText("Drawing… (drag across a line; click to stop)");
+    });
+    auto* crop_guard = new QObject(d);
+    connect(pw, &PlotWidget::cropRangesChanged, crop_guard, [=]() {
+        if (!btn_draw->isChecked()) return;
+        const auto ranges = pw->cropRanges();
+        if (ranges.empty()) return;
+        const auto [a, b] = ranges.back();
+        pw->clearCropRanges();
+        addBins(static_cast<double>(a), static_cast<double>(b - 1));
+    });
+
+    connect(btn_show, &QPushButton::clicked, d, [=]() {
+        // The signal, read the way the spectrum's traces were read.
+        auto before = std::make_shared<std::vector<float>>();
+        QString what;
+        if (rb_trace->isChecked()) {
+            std::vector<std::shared_ptr<ITransform>> pl;
+            for (const auto& t : info->pipeline) pl.push_back(t->clone());
+            std::vector<float> buf;
+            int64_t n_out = 0;
+            const int32_t ti = sp_trace->value();
+            const TraceLoad got = loadProcessedTrace(info->file.get(), pl, ti, info->s_first, info->raw_ns,
+                                                     info->shifts, info->shifts_first, info->read_lo,
+                                                     info->read_hi > 0 ? info->read_hi
+                                                                       : info->file->header().num_samples,
+                                                     buf, n_out);
+            if (got != TraceLoad::Ok || n_out < 8) {
+                status->setText(got == TraceLoad::Discarded
+                                    ? QString("Trace %1 is outside the alignment or was discarded by it.").arg(ti)
+                                    : QString("Trace %1 could not be read.").arg(ti));
+                return;
+            }
+            before->assign(buf.begin(), buf.begin() + n_out);
+            what = QString("trace %1").arg(ti);
+        } else {
+            *before = info->mean_trace;
+            what = QString("average of %1 traces").arg(info->n_traces);
+        }
+        const std::vector<SpectralBand> bs = *bands;
+        auto after = std::make_shared<std::vector<float>>(*before);
+        // Two FFTs of the whole signal: on a worker, as a long trace can take a while.
+        jobs_->submit(QString("Inverse FFT — %1").arg(what),
+            [after, bs](JobContext& ctx) {
+                ctx.setProgress(0, 1);
+                SpectralExciseTransform ex(bs, SpectralExciseTransform::PhaseMode::Preserve);
+                after->resize(static_cast<size_t>(
+                    ex.apply(after->data(), static_cast<int64_t>(after->size()), 0)));
+                ctx.setProgress(1, 1);
+                return true;
+            },
+            [=](bool ok) {
+                if (!ok) return;
+                const int nb = static_cast<int>(bs.size());
+                addResultTab(*before, QString("Inverse FFT — %1, %2 band%3 removed")
+                                          .arg(what).arg(nb).arg(nb == 1 ? "" : "s"),
+                             currentTheme().muted, "Before");
+                plotWidget()->addTrace(after, themeTraceColor(0),
+                                       nb ? QString("Without the %1 band%2").arg(nb).arg(nb == 1 ? "" : "s")
+                                          : QString("Inverse FFT"));
+                plotWidget()->setAxisLabels("Sample Index", "Value");
+                if (keepsSamplePositions(info->pipeline))
+                    plotWidget()->setAxisMeta(fileSampleInterval(info->file->header()), info->s_first);
+                plotWidget()->resetView();
+            });
+        status->setText(QString("Inverse FFT of the %1 opens in a new tab.").arg(what));
+    });
+
+    connect(btn_pipe, &QPushButton::clicked, d, [=]() {
+        if (bands->empty()) {
+            status->setText("No bands yet — draw or type one first.");
+            return;
+        }
+        int src = -1;
+        for (size_t i = 0; i < datasets_.size(); ++i)
+            if (!datasets_[i].is_result && datasets_[i].file == info->file) { src = static_cast<int>(i); break; }
+        if (src < 0) {
+            QMessageBox::information(d, "Remove frequencies",
+                                     "The trace file this spectrum came from is no longer open.");
+            return;
+        }
+        btn_draw->setChecked(false);
+        tab_bar_->setCurrentIndex(src);
+        // The excision dialog shows the bands to check or adjust first. They
+        // are fractions of Nyquist of the processed traces, so the step goes
+        // at the end of the pipeline, which is where it is added.
+        if (auto tx = createSpectralExciseTransform(*bands)) {
+            const QString nm = QString::fromStdString(tx->name());
+            addTransformToPipeline(tx);
+            statusBar()->showMessage(QString("Added %1 to the pipeline.").arg(nm), 5000);
+        }
+    });
+
+    connect(btn_close, &QPushButton::clicked, d, &QDialog::close);
+    // The amber band markers mean nothing without the table.
+    connect(d, &QDialog::finished, d, [=](int) {
+        stopDrawing();
+        pw->clearMatchMarkers();
+    });
+
+    refresh();
+    d->show();
 }
 
 // ---------------------------------------------------------------------------
