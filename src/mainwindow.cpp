@@ -52,6 +52,7 @@
 #include <QFrame>
 #include <QGroupBox>
 #include <QHBoxLayout>
+#include <QEventLoop>
 #include <QInputDialog>
 #include <QLineEdit>
 #include <QLabel>
@@ -6195,6 +6196,20 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     fl->addRow("First sample:", sp_s_first);
     fl->addRow("Sample count (0=all):", sp_s_count);
 
+    // "Draw on plot": drag the sample range on the main plot (raw samples,
+    // the same units as the spin boxes). The dialog is modal, so the button
+    // ends exec() with kDrawRange and the loop around exec() below does the
+    // drawing; pressed again while drawing, it cancels.
+    constexpr int kDrawRange = 2;
+    bool drawing = false;
+    auto* btn_draw = new QPushButton("Draw on plot →");
+    btn_draw->setToolTip("Drag the region to test on the main plot — releasing the mouse "
+                         "sets First sample and Count.");
+    fl->addRow(btn_draw);
+    connect(btn_draw, &QPushButton::clicked, &cfg, [&]() {
+        if (!drawing) cfg.done(kDrawRange);
+    });
+
     // Alignment group
     const bool has_alignment = (activeDs().align_n_samples > 0);
     const bool ds_tiled = has_alignment && (activeDs().align_tile_size > 0);
@@ -6298,6 +6313,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         auto syncPatternMode = [=](bool on) {
             sp_s_first->setEnabled(!on);
             sp_s_count->setEnabled(!on);
+            btn_draw->setEnabled(!on);
             grp_align->setEnabled(!on);
         };
         connect(grp_pat, &QGroupBox::toggled, &cfg, syncPatternMode);
@@ -6651,6 +6667,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         const bool pat_mode = grp_pat && grp_pat->isEnabled() && grp_pat->isChecked();
         sp_s_first->setEnabled(!bi && !pat_mode);
         sp_s_count->setEnabled(!bi && !pat_mode);
+        btn_draw->setEnabled(!bi && !pat_mode);
         grp_align->setEnabled(!pat_mode);
         grp_live->setEnabled(!bi && !dc && !pat_mode);
         if (chk_add_chain) {
@@ -6671,7 +6688,46 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
     mem.restore();
     syncBivariate(cmb_order->currentIndex());
-    if (cfg.exec() != QDialog::Accepted) return;
+    for (;;) {
+        const int res = cfg.exec();
+        if (res == QDialog::Accepted) break;
+        if (res != kDrawRange) return;
+        // Drawing: the main plot needs the mouse, so the dialog stays up
+        // non-modal until a range is dragged, the button is pressed again,
+        // or Run/Cancel is pressed, then goes back to being modal.
+        const int ds_idx = active_idx_;
+        PlotWidget* pw = plotWidget();
+        drawing = true;
+        btn_draw->setText("Drawing… (drag on plot; click here to cancel)");
+        cfg.show();
+        pw->clearCropRanges();
+        pw->setCropAutoConfirm(true);
+        pw->setMode(InteractionMode::CropSelect);
+        QEventLoop loop;
+        int finished = -1;   // Run or Cancel pressed while drawing
+        connect(pw, &PlotWidget::cropRangesChanged, &loop, [&]() {
+            const auto& ranges = pw->cropRanges();
+            if (ranges.empty()) return;
+            const auto [a, b] = ranges.back();
+            sp_s_first->setValue(static_cast<int>(a));
+            sp_s_count->setValue(static_cast<int>(std::max<int64_t>(1, b - a)));
+            loop.quit();
+        });
+        connect(btn_draw, &QPushButton::clicked, &loop, &QEventLoop::quit);
+        connect(&cfg, &QDialog::finished, &loop, [&](int r) { finished = r; loop.quit(); });
+        loop.exec();
+        drawing = false;
+        btn_draw->setText("Draw on plot →");
+        pw->setCropAutoConfirm(false);
+        if (pw->mode() == InteractionMode::CropSelect) pw->setMode(InteractionMode::Pan);
+        // The run reads the dialog's file through activeDs(), so undo a tab
+        // switch made while drawing.
+        if (active_idx_ != ds_idx && ds_idx < static_cast<int>(datasets_.size()))
+            tab_bar_->setCurrentIndex(ds_idx);
+        if (finished == QDialog::Accepted) break;
+        if (finished >= 0) return;
+        cfg.hide();   // exec() makes it modal again only when it shows it
+    }
     mem.save();
 
     int32_t first    = static_cast<int32_t>(sp_first->value());

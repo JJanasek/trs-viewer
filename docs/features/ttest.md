@@ -4,6 +4,8 @@
 
 Computes the per-sample Welch t-statistic between two trace groups. No special header fields are required — group assignment is configured in the dialog by choosing which data byte to use as the group label (0 = group 0, non-zero = group 1). If the file's parameter map contains a `ttest` entry, its `offset` field is used automatically and the byte selector is hidden.
 
+**First sample** and **Sample count** pick the part of the traces to test. Press **Draw on plot →** and drag across the region on the main plot to set both. While you drag, the dialog stays open but no longer blocks the main window; pressing the button again cancels, and **Run t-test** runs straight away with the drawn range. With an alignment applied, the plot shows aligned traces and the drawn range is in the same samples the test uses.
+
 ## Order, jitter window and sanity check
 
 The **Test** group in the dialog:
