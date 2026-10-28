@@ -1,3 +1,4 @@
+#include "crash_handler.h"
 #include "mainwindow.h"
 
 #include <QApplication>
@@ -104,6 +105,10 @@ static void useIsolatedFontconfigCache() {
 #endif  // __linux__
 
 int main(int argc, char* argv[]) {
+    // Crash log and breadcrumbs first, so even a crash during startup is
+    // reported (see crash_handler.h).
+    installCrashHandler();
+    installQtMessageCrumbs();
 #if defined(__linux__)
     useIsolatedFontconfigCache();
 #endif
@@ -124,6 +129,7 @@ int main(int argc, char* argv[]) {
     app.setApplicationName("TRS Viewer");
     app.setApplicationVersion("1.0");
     app.setWindowIcon(QIcon(":/docs/logo.svg"));
+    installQuitOnTermSignals();   // SIGTERM/SIGINT/SIGHUP quit like File › Quit
 
     QCommandLineParser parser;
     parser.setApplicationDescription("Memory-efficient viewer for Riscure TRS power trace files.");

@@ -83,6 +83,8 @@ message(STATUS "NumPy include:   ${Python3_NumPy_INCLUDE_DIRS}")
 set(SOURCES
     resources.qrc
     src/main.cpp
+    src/crash_handler.cpp
+    inc/crash_handler.h
     src/mainwindow.cpp
     src/trs_file.cpp
     src/processing.cpp
@@ -149,6 +151,11 @@ target_compile_options(trs-viewer PRIVATE
     -Wno-unused-parameter
     -march=native
 )
+
+# Function names in the crash log's backtrace (src/crash_handler.cpp).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_options(trs-viewer PRIVATE -rdynamic)
+endif()
 
 # ---------------------------------------------------------------------------
 # Optional test suite (non-GUI; requires GoogleTest fetched at configure time)

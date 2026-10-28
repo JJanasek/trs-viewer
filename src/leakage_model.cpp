@@ -18,7 +18,9 @@ static bool doImportNumpy() {
 bool LeakageModel::globalInit(std::string& error) {
     if (py_initialized_) return true;
     if (!Py_IsInitialized()) {
-        Py_Initialize();
+        // 0: leave the signal handlers alone. Python's own SIGINT handler
+        // would take Ctrl+C away from the app (crash_handler.h) for good.
+        Py_InitializeEx(0);
     }
     if (!doImportNumpy()) {
         error = "Failed to initialise NumPy C API (numpy not installed?)";
@@ -124,8 +126,8 @@ bool LeakageModel::evaluate(
 
     // Build 2D uint8 numpy array for plaintexts: (n_traces, data_len)
     npy_intp pts_dims[2] = { n_traces, std::max(data_len, 1) };
-    PyObject* pts_arr = PyArray_SimpleNew(2, pts_dims, NPY_UINT8);
-    if (!pts_arr) { error = "Failed to allocate NumPy pts array"; return false; }
+    PyObject* pts_arr = PyArray_ZEROS(2, pts_dims, NPY_UINT8, 0);   // zeros if there is no data
+    if (!pts_arr) { PyErr_Clear(); error = "Failed to allocate NumPy pts array"; return false; }
     if (!data_flat.empty() && data_len > 0)
         memcpy(PyArray_DATA(reinterpret_cast<PyArrayObject*>(pts_arr)),
                data_flat.data(), static_cast<size_t>(n_traces) * data_len);
@@ -133,10 +135,19 @@ bool LeakageModel::evaluate(
     // Empty ciphertexts array: (n_traces, 0)
     npy_intp cts_dims[2] = { n_traces, 0 };
     PyObject* cts_arr = PyArray_SimpleNew(2, cts_dims, NPY_UINT8);
-    if (!cts_arr) { Py_DECREF(pts_arr); error = "Failed to allocate NumPy cts array"; return false; }
+    if (!cts_arr) { Py_DECREF(pts_arr); PyErr_Clear(); error = "Failed to allocate NumPy cts array"; return false; }
 
     PyObject* py_kg  = PyLong_FromLong(key_guess);
+    if (!py_kg) {
+        Py_DECREF(pts_arr); Py_DECREF(cts_arr);
+        error = pyErrStr();
+        return false;
+    }
+    // fn is borrowed from the namespace, which the model's own code could
+    // rebind while it runs: hold a reference for the call.
+    Py_INCREF(fn);
     PyObject* result = PyObject_CallFunctionObjArgs(fn, pts_arr, cts_arr, py_kg, nullptr);
+    Py_DECREF(fn);
     Py_DECREF(pts_arr); Py_DECREF(cts_arr); Py_DECREF(py_kg);
 
     if (!result) { error = pyErrStr(); return false; }

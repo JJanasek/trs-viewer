@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "crash_handler.h"
 #include "spectral.h"
 #include <zlib.h>
 #include "heatmap_widget.h"
@@ -366,6 +367,9 @@ MainWindow::MainWindow(QWidget* parent)
     addDockWidget(Qt::BottomDockWidgetArea, jobs_dock_);
     jobs_dock_->hide();   // shown only while something is actually running
     connect(jobs_, &JobManager::jobsChanged, this, &MainWindow::refreshJobsDock);
+    connect(jobs_, &JobManager::jobFailed, this, [this](const QString& title, const QString& why) {
+        QMessageBox::critical(this, "Analysis failed", QString("%1\n\n%2").arg(title, why));
+    });
 
     theme_idx_ = std::clamp(QSettings("trs-viewer", "trs-viewer").value("ui/theme", 2).toInt(), 0, 2);
     applyAppTheme(themeChoiceIsDark(static_cast<ThemeChoice>(theme_idx_)));
@@ -805,6 +809,12 @@ MainWindow::MainWindow(QWidget* parent)
         btn_mode_box_zoom_->setChecked(!box_zoom);
         if (box_zoom) lbl_measure_->setText("–");
     });
+
+    // Breadcrumbs for the crash log (crash_handler.h): every menu action.
+    for (QAction* a : findChildren<QAction*>())
+        connect(a, &QAction::triggered, this, [a]() {
+            crumb("menu: %s", qPrintable(a->text().remove('&')));
+        });
 }
 
 MainWindow::~MainWindow() = default;
@@ -839,6 +849,7 @@ void MainWindow::onCloseDataset() {
 // Shared by File > Close Dataset and the tab bar's close button.
 void MainWindow::closeDatasetAt(int idx) {
     if (idx < 0 || idx >= static_cast<int>(datasets_.size())) return;
+    crumb("close tab %d: %s", idx, qPrintable(datasets_[static_cast<size_t>(idx)].display_name));
 
     // Detach the dying widgets first. The PlotWidget holds raw TrsFile*
     // pointers into ds.file, which is released by the erase below, while
@@ -1858,6 +1869,7 @@ void MainWindow::onOpenCombined() {
 }
 
 void MainWindow::openFile(const QString& path) {
+    crumb("open %s", qPrintable(path));
     auto f = std::make_shared<TrsFile>();
     std::string err;
     if (!openTraceSource(*f, path, err)) {

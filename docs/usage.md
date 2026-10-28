@@ -103,4 +103,32 @@ Result windows (t-test, SNR, FFT, loaded NPY) carry their own smaller toolbar: *
 | Heatmap → NPY | "Export .npy…" in heatmap dialog |
 | T-test vector → NPY | "Export .npy…" in t-test dialog |
 
+## When it crashes
+
+If trs-viewer crashes, it writes a report to
+`~/.local/state/trs-viewer/crash-<pid>.log` (and to the terminal it was
+started from) before it ends. The report has:
+
+- the signal, and the process that sent it if it came from outside. For
+  example, `kwin_killer_helper` means the window manager closed a window that
+  had stopped responding.
+- the backtrace;
+- the last events: menu actions, files opened and tabs closed, analyses
+  started and finished, and Qt warnings.
+
+The system still records the core dump. For every thread's stack:
+
+```bash
+coredumpctl list trs-viewer
+coredumpctl info <pid>        # stack of every thread
+coredumpctl gdb <pid>         # debugger on the core dump
+```
+
+Please attach the crash log when reporting a crash. When the process ends,
+the system frees all its memory, so a crash can't leave memory allocated.
+
+Ctrl+C in the terminal, or `kill <pid>`, quits like File › Quit: running
+analyses are cancelled and the settings saved. A second one ends the program
+at once.
+
 ---

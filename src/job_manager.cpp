@@ -1,9 +1,13 @@
 #include "job_manager.h"
 
+#include "crash_handler.h"
+
 #include <QMetaObject>
 #include <QRunnable>
 
 #include <algorithm>
+#include <new>
+#include <stdexcept>
 #include <thread>
 
 #ifdef _OPENMP
@@ -30,11 +34,17 @@ public:
         // functions needing to know they're sharing the machine.
         omp_set_num_threads(std::max(1, ctx_->threadBudget()));
 #endif
+        // Never let an exception cross the thread boundary; say what it was.
         bool ok = false;
         try {
             ok = work_(*ctx_);
+        } catch (const std::bad_alloc&) {
+            ctx_->failure = "Out of memory. Try fewer traces, a narrower sample range, or a "
+                            "Window Resample step in the pipeline.";
+        } catch (const std::exception& e) {
+            ctx_->failure = QString("Unexpected error: %1").arg(e.what());
         } catch (...) {
-            ok = false;   // never let an exception cross the thread boundary
+            ctx_->failure = "Unexpected error.";
         }
         finish_(ok);
     }
@@ -80,15 +90,19 @@ int JobManager::submit(const QString& title,
 
     const int id = next_id_++;
     jobs_.push_back(Job{id, title, ctx});
+    crumb("job %d started: %s", id, qPrintable(title));
 
     // Hops back to the GUI thread: `this` is the context object, so the
     // lambda is dropped rather than run if the manager is gone by then.
-    auto finish = [this, id, ctx, on_done = std::move(on_done)](bool ok) {
-        QMetaObject::invokeMethod(this, [this, id, ok, on_done]() {
+    auto finish = [this, id, ctx, title, on_done = std::move(on_done)](bool ok) {
+        QMetaObject::invokeMethod(this, [this, id, ok, ctx, title, on_done]() {
+            crumb("job %d %s%s%s", id, ok ? "done" : ctx->cancelled() ? "cancelled" : "failed",
+                  ctx->failure.isEmpty() ? "" : ": ", qPrintable(ctx->failure));
             auto it = std::find_if(jobs_.begin(), jobs_.end(),
                                     [id](const Job& j) { return j.id == id; });
             if (it != jobs_.end()) jobs_.erase(it);
             if (on_done) on_done(ok);
+            if (!ctx->failure.isEmpty()) emit jobFailed(title, ctx->failure);
             emit jobsChanged();
         }, Qt::QueuedConnection);
     };

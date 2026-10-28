@@ -53,6 +53,9 @@ public:
     std::atomic<int64_t> done{0};
     std::atomic<int64_t> total{0};
     int                  threads = 1;
+    // Set when work() threw, e.g. ran out of memory; read on the GUI thread
+    // once the job has finished.
+    QString              failure;
 };
 
 class JobManager : public QObject {
@@ -90,6 +93,9 @@ signals:
     // Emitted when a job starts or finishes, and periodically while any job
     // is running so progress displays can refresh.
     void jobsChanged();
+    // A job's work() threw (out of memory, say). Its on_done(false) has run
+    // too, but its own error text is empty, so this is the only report.
+    void jobFailed(const QString& title, const QString& why);
 
 private:
     struct Job {
