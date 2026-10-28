@@ -332,6 +332,53 @@ static double fileSampleInterval(const TrsHeader& h) {
 static double fileValueScale(const TrsHeader& h) {
     return (!h.label_y.empty() || h.scale_y != 1.0f) && h.scale_y > 0 ? static_cast<double>(h.scale_y) : 0.0;
 }
+// Memory free right now: MemAvailable from /proc/meminfo — what can be
+// allocated without pushing other programs into swap. 0 if unknown.
+static int64_t memoryAvailableBytes() {
+    QFile f("/proc/meminfo");
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return 0;
+    while (!f.atEnd()) {
+        const QByteArray line = f.readLine();
+        if (line.startsWith("MemAvailable:"))
+            return line.mid(13).trimmed().split(' ').value(0).toLongLong() * 1024;
+    }
+    return 0;
+}
+
+static QString gigabytes(int64_t bytes) {
+    return QString("%1 GB").arg(static_cast<double>(bytes) / (1024.0 * 1024 * 1024), 0, 'f', 1);
+}
+
+// Before a run that needs about `bytes`, compared with the memory free now:
+// silent below half of it, a question up to 90 %, and a refusal above —
+// running out takes the whole app down, with the work in every other tab.
+// `what` names the run ("The t-test"); `advice` says how to need less.
+static bool confirmMemory(QWidget* parent, int64_t bytes, const QString& what,
+                          const QString& advice = QString(
+                              "A narrower sample range, fewer traces, or a Window Resample "
+                              "step in the pipeline needs less."))
+{
+    const int64_t avail = memoryAvailableBytes();
+    if (avail <= 0) {   // unknown: ask above a fixed size, as before
+        if (bytes <= 2LL * 1024 * 1024 * 1024) return true;
+        return QMessageBox::warning(parent, "Memory",
+                   QString("%1 will need about %2.\n\n%3\n\nContinue?")
+                       .arg(what, gigabytes(bytes), advice),
+                   QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes;
+    }
+    if (bytes <= avail / 2) return true;
+    if (bytes > avail / 10 * 9) {
+        QMessageBox::warning(parent, "Not enough memory",
+            QString("%1 would need about %2, but only %3 is free.\n\n%4")
+                .arg(what, gigabytes(bytes), gigabytes(avail), advice));
+        return false;
+    }
+    return QMessageBox::warning(parent, "Memory",
+               QString("%1 will need about %2 of the %3 free.\n\n%4\n\nContinue?")
+                   .arg(what, gigabytes(bytes), gigabytes(avail), advice),
+               QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes;
+}
+
 // A private copy of a pipeline, for work that runs through processEvents()
 // (a progress dialog) or on a worker: the dataset's own list can change, or
 // go with its tab, while the work is still using it.
@@ -4979,6 +5026,13 @@ void MainWindow::openNpyTraces(const QString& path) {
     std::vector<NamedCol> named_cols;
 
     if (path.endsWith(".npz", Qt::CaseInsensitive)) {
+        // Loaded whole: the archive's entries, the traces taken from them and
+        // the in-memory trace set made from those — about three times the
+        // file (more if it is compressed).
+        if (!confirmMemory(this, 3 * QFileInfo(path).size(), "Opening this archive",
+                           "Export fewer traces or a narrower range into the archive, or "
+                           "save it as .npy, which is read without loading it whole."))
+            return;
         std::map<std::string, std::vector<uint8_t>> entries;
         if (!loadNpz(path, entries, err)) {
             QMessageBox::critical(this, "Load failed", err); return;
@@ -5245,14 +5299,10 @@ static bool exportTracesToNpy(
 
     // Allocate full matrix (may be large)
     const size_t total = static_cast<size_t>(n_out) * static_cast<size_t>(out_samples);
-    double mem_mb = total * sizeof(float) / (1024.0 * 1024.0);
-    if (mem_mb > 2048.0) {
-        if (QMessageBox::warning(msg_parent, "Memory warning",
-                QString("Output matrix will require ~%1 GB.\nContinue?").arg(mem_mb/1024.0, 0,'f',1),
-                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes) {
-            err_out = "Export cancelled.";
-            return false;
-        }
+    // The matrix, and its .npy bytes built from it before writing.
+    if (!confirmMemory(msg_parent, static_cast<int64_t>(2 * total * sizeof(float)), "The export")) {
+        err_out = "Export cancelled.";
+        return false;
     }
 
     std::vector<float> matrix(total);
@@ -5546,6 +5596,15 @@ void MainWindow::onExportNpz() {
         }
     }
 
+    {
+        // The archive is built in memory: the traces, their .npy bytes and
+        // the archive holding them.
+        int64_t eff = window_len > 0 ? window_len : h.num_samples;
+        for (const auto& t : activeDs().pipeline) eff = t->transformedCount(eff);
+        if (!confirmMemory(this, 3 * static_cast<int64_t>(count) * eff * 4, "The export"))
+            return;
+    }
+
     QString path = QFileDialog::getSaveFileName(
         this, "Export traces as NPZ", recentDir("npy"), "NumPy archives (*.npz)");
     if (path.isEmpty()) return;
@@ -5597,14 +5656,9 @@ static bool confirmTTestMemory(QWidget* parent,
     int64_t effective = raw_ns;
     for (const auto& t : pipeline) effective = t->transformedCount(effective);
     const int64_t bytes = estimateTTestBytes(raw_ns, effective, order, n_threads);
-    if (bytes <= 2LL * 1024 * 1024 * 1024) return true;
-    return QMessageBox::warning(parent, "Memory warning",
-        QString("The t-test will need ~%1 GB of memory (%2 samples per trace).\n"
-                "A smaller sample range or a resampling stage in the pipeline "
-                "needs less.\nContinue?")
-            .arg(double(bytes) / (1024.0*1024*1024), 0, 'f', 1)
-            .arg(QLocale().toString(static_cast<qlonglong>(effective))),
-        QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes;
+    return confirmMemory(parent, bytes,
+                         QString("The t-test (%1 samples per trace)")
+                             .arg(QLocale().toString(static_cast<qlonglong>(effective))));
 }
 
 // ---------------------------------------------------------------------------
@@ -6163,6 +6217,18 @@ void MainWindow::onRunAverage() {
     std::vector<std::shared_ptr<ITransform>> job_pipeline;
     for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
     const QString fname = activeDs().display_name;
+    {
+        // Reading as the t-test does, the per-group sums, and the curves shown.
+        const int64_t raw_ns = s_count == 0 ? h.num_samples - s_first
+                                            : std::min<int64_t>(s_count, h.num_samples - s_first);
+        int64_t eff = raw_ns;
+        for (const auto& t : job_pipeline) eff = t->transformedCount(eff);
+        const int64_t per_group = eff * (2 * 8 + 6 * 4);
+        if (!confirmMemory(this, estimateTTestBytes(raw_ns, eff, 1, jobs_->plannedThreadBudget())
+                                     + (groups ? 2 : 1) * per_group,
+                           "The average"))
+            return;
+    }
     struct AvgOut { MeanTraceResult r; QString warn, err; };
     auto out = std::make_shared<AvgOut>();
 
@@ -7037,11 +7103,9 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
             }
             bytes = estimateBivariateBytes(rows, cols, jobs_->plannedThreadBudget());
         }
-        if (bytes > 2LL * 1024 * 1024 * 1024
-            && QMessageBox::warning(this, "Memory warning",
-                   QString("The bivariate t-test will need ~%1 GB of memory.\nContinue?")
-                       .arg(double(bytes) / (1024.0 * 1024 * 1024), 0, 'f', 1),
-                   QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
+        if (!confirmMemory(this, bytes, "The bivariate t-test",
+                           "Shorter windows, fewer offsets or a Window Resample step in "
+                           "the pipeline need less."))
             return;
 
         const int32_t tile_idx = sp_tile ? sp_tile->value() : 0;
@@ -8482,13 +8546,8 @@ void MainWindow::onRunXCorr() {
             int64_t M = (ns + stride - 1) / stride;
             mem_mb = static_cast<double>(M) * M * 4.0 / (1024.0 * 1024.0);
         }
-        if (mem_mb > 2048.0) {
-            if (QMessageBox::warning(this, "Memory warning",
-                    QString("The largest output matrix will require ~%1 GB.\nContinue?")
-                        .arg(mem_mb / 1024.0, 0, 'f', 1),
-                    QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
-                return;
-        }
+        if (!confirmMemory(this, static_cast<int64_t>(mem_mb * 1024.0 * 1024.0), "The cross-correlation"))
+            return;
     }
 
     // ---- Progress dialog ----
@@ -10018,6 +10077,20 @@ void MainWindow::onRunSpectralLeakage() {
     std::vector<std::shared_ptr<ITransform>> job_pipeline;
     for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
 
+    {
+        // Every window's spectrum per trace: the t-test sums (32 bytes per
+        // cell), the trace's STFT and its copy, and the t-plane shown. With
+        // a large overlap this is many times the trace length.
+        int64_t eff = raw_ns;
+        for (const auto& t : job_pipeline) eff = t->transformedCount(eff);
+        const int64_t n_windows = eff >= wlen ? (eff - wlen) / hop + 1 : 0;
+        const int64_t cells = n_windows * (wlen / 2 + 1);
+        if (!confirmMemory(this, cells * (32 + 4 + 4 + 4) + raw_ns * 4, "Leakage vs Frequency",
+                           "Less overlap, a narrower sample range or a Window Resample step in "
+                           "the pipeline needs less."))
+            return;
+    }
+
     auto out = std::make_shared<SpectralLeakageOut>();
     const QString title = QString("Leakage vs Frequency — %1 (%2 traces)")
                               .arg(activeDs().display_name).arg(count);
@@ -10649,14 +10722,9 @@ bool MainWindow::buildAlignedTraces(PlotWidget* pw, const std::vector<int32_t>& 
         int64_t bytes_per_trace = std::max(out_len, effective_len)
                                  * static_cast<int64_t>(sizeof(float));
         int64_t total_bytes = bytes_per_trace * n_to_build;
-        if (total_bytes > 2LL * 1024 * 1024 * 1024) {
-            if (QMessageBox::warning(msg_parent, "Memory warning",
-                    QString("Building %1 aligned trace(s) will require ~%2 GB.\nContinue?")
-                        .arg(n_to_build)
-                        .arg(double(total_bytes) / (1024.0 * 1024.0 * 1024.0), 0, 'f', 1),
-                    QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
-                return false;
-        }
+        if (!confirmMemory(msg_parent, total_bytes,
+                           QString("Building %1 aligned trace(s)").arg(n_to_build)))
+            return false;
     }
 
     int shown = 0;
@@ -13698,13 +13766,10 @@ void MainWindow::onRunSNR() {
     // Memory warning: n_classes * 2 * effective_samples * sizeof(double)
     int64_t mem_bytes = static_cast<int64_t>(n_classes) * 2LL
                       * effective_samples * static_cast<int64_t>(sizeof(double));
-    if (mem_bytes > 2LL * 1024 * 1024 * 1024) {
-        if (QMessageBox::warning(this, "Memory warning",
-                QString("Accumulator will require ~%1 GB.\nContinue?")
-                    .arg(double(mem_bytes) / (1024.0*1024*1024), 0, 'f', 1),
-                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
-            return;
-    }
+    if (!confirmMemory(this, mem_bytes, "The SNR",
+                       "Fewer classes (Hamming weight instead of byte value), a narrower "
+                       "sample range or a Window Resample step in the pipeline need less."))
+        return;
 
     // Captured now, on the GUI thread: the file by shared_ptr so closing this
     // tab can't unmap it mid-run, and the pipeline as clones so later edits
@@ -13901,6 +13966,10 @@ void MainWindow::onRunStaticSNR() {
     int64_t effective_samples = raw_ns;
     for (const auto& t : activeDs().pipeline)
         effective_samples = t->transformedCount(effective_samples);
+
+    // Two sums per sample, the trace being read, and the curve shown.
+    if (!confirmMemory(this, effective_samples * (2 * 8 + 3 * 4) + raw_ns * 4, "The static SNR"))
+        return;
 
     std::shared_ptr<TrsFile> job_file = activeDs().file;
     std::vector<std::shared_ptr<ITransform>> job_pipeline;
@@ -14312,6 +14381,19 @@ void MainWindow::onRunFFT() {
             info->x_label = "Frequency Bin";
         }
 
+        {
+            // The FFT (input, output, plan scratch), the average trace kept for
+            // Remove frequencies, the spectrum and the plot's copy of it; plus
+            // the reading: as the t-test's for the average, or per trace.
+            const int64_t bins = fft_out_n;
+            int64_t bytes = info->fft_in_n * 4 + bins * 8 * 3 + info->win_n * 4 * 2 + bins * 4 * 2;
+            if (info->of_mean)
+                bytes += estimateTTestBytes(info->raw_ns, info->win_n, 1, jobs_->plannedThreadBudget());
+            else
+                bytes += info->win_n * (4 + 8 + 4) + bins * (8 + 4 * 4) + info->raw_ns * 4;
+            if (!confirmMemory(cfg, bytes, "The FFT")) return;
+        }
+
         if (info->of_mean) {
             // Average in the background like Average Trace, then one FFT —
             // still on the worker, since a whole long trace is a big FFT.
@@ -14704,6 +14786,8 @@ void MainWindow::showRemoveFrequenciesDialog(PlotWidget* pw, std::shared_ptr<con
             *before = info->mean_trace;
             what = QString("average of %1 traces").arg(info->n_traces);
         }
+        // The signal before and after, the FFT scratch, and the tab's copy.
+        if (!confirmMemory(d, static_cast<int64_t>(before->size()) * 4 * 5, "The inverse FFT")) return;
         const std::vector<SpectralBand> bs = *bands;
         auto after = std::make_shared<std::vector<float>>(*before);
         // Two FFTs of the whole signal: on a worker, as a long trace can take a while.
@@ -15108,14 +15192,10 @@ void MainWindow::onExportDataset() {
         eff_ns = t->transformedCount(eff_ns);
 
     // Memory estimate
-    int64_t mem_est = static_cast<int64_t>(count) * eff_ns * sizeof(float);
-    if (mem_est > 4LL * 1024 * 1024 * 1024) {
-        if (QMessageBox::warning(this, "Memory warning",
-                QString("Trace matrix will require ~%1 GB.\nContinue?")
-                    .arg(double(mem_est)/(1024.0*1024*1024), 0,'f',1),
-                QMessageBox::Yes | QMessageBox::No) != QMessageBox::Yes)
-            return;
-    }
+    // The trace matrix, its .npy bytes and the archive holding them.
+    const int64_t mem_est = 3 * static_cast<int64_t>(count) * eff_ns * static_cast<int64_t>(sizeof(float));
+    if (!confirmMemory(this, mem_est, "The export"))
+        return;
 
     // ── Pick output path ──────────────────────────────────────────────────
     QString out_path = QFileDialog::getSaveFileName(
