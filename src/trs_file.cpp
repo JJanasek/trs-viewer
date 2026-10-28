@@ -699,16 +699,24 @@ int64_t TrsFile::readSamples(int32_t trace_idx, int64_t sample_offset,
         for (int64_t i = 0; i < count; i++) buf[i] = static_cast<float>(src[i]);
         break;
     }
-    case SampleType::INT16: {
-        const auto* src = reinterpret_cast<const int16_t*>(ptr);
-        for (int64_t i = 0; i < count; i++) buf[i] = static_cast<float>(src[i]);
+    // Samples sit wherever the header and data bytes leave them, so a 16- or
+    // 32-bit one is often at an odd address: read through memcpy, which
+    // compiles to the same unaligned load without the undefined behaviour
+    // (a vectorised loop may assume alignment for a typed pointer).
+    case SampleType::INT16:
+        for (int64_t i = 0; i < count; i++) {
+            int16_t v;
+            std::memcpy(&v, ptr + i * 2, 2);
+            buf[i] = static_cast<float>(v);
+        }
         break;
-    }
-    case SampleType::INT32: {
-        const auto* src = reinterpret_cast<const int32_t*>(ptr);
-        for (int64_t i = 0; i < count; i++) buf[i] = static_cast<float>(src[i]);
+    case SampleType::INT32:
+        for (int64_t i = 0; i < count; i++) {
+            int32_t v;
+            std::memcpy(&v, ptr + i * 4, 4);
+            buf[i] = static_cast<float>(v);
+        }
         break;
-    }
     case SampleType::FLOAT32:
         std::memcpy(buf, ptr, static_cast<size_t>(count) * sizeof(float));
         break;

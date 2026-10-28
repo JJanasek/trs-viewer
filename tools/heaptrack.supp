@@ -1,0 +1,4 @@
+# heaptrack leak suppressions (tools/run_heaptrack.sh), same reasons as
+# tools/lsan.supp: memory the Python interpreter keeps after Py_FinalizeEx().
+leak:libpython3
+leak:_multiarray_umath

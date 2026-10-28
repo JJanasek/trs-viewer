@@ -23,6 +23,10 @@ public:
 
     // Must be called once at application start (initialises Python + NumPy).
     static bool globalInit(std::string& error);
+    // Once at exit, after every LeakageModel is gone (main(), after the main
+    // window): runs Python's exit handlers, flushes its output and frees the
+    // interpreter. Python can't be started again afterwards.
+    static void globalShutdown();
     static bool isInitialized() { return py_initialized_; }
 
     // Compile (exec) user code into an isolated Python namespace.

@@ -1,5 +1,6 @@
 #include "crash_handler.h"
 #include "mainwindow.h"
+#include "leakage_model.h"
 
 #include <QApplication>
 #include <QByteArray>
@@ -138,12 +139,18 @@ int main(int argc, char* argv[]) {
     parser.addPositionalArgument("file", "TRS file to open on startup", "[file]");
     parser.process(app);
 
-    MainWindow win;
-    win.show();
+    int rc = 0;
+    {
+        MainWindow win;
+        win.show();
 
-    const QStringList& args = parser.positionalArguments();
-    if (!args.isEmpty())
-        win.openFile(args.first());
+        const QStringList& args = parser.positionalArguments();
+        if (!args.isEmpty())
+            win.openFile(args.first());
 
-    return app.exec();
+        rc = app.exec();
+    }
+    // The window (and every leakage model it holds) is gone: stop Python.
+    LeakageModel::globalShutdown();
+    return rc;
 }

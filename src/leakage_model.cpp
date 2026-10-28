@@ -30,10 +30,16 @@ bool LeakageModel::globalInit(std::string& error) {
     return true;
 }
 
+void LeakageModel::globalShutdown() {
+    if (!py_initialized_ || !Py_IsInitialized()) return;
+    Py_FinalizeEx();
+    py_initialized_ = false;
+}
+
 LeakageModel::LeakageModel() = default;
 
 LeakageModel::~LeakageModel() {
-    if (ns_dict_) {
+    if (ns_dict_ && Py_IsInitialized()) {
         Py_DECREF(reinterpret_cast<PyObject*>(ns_dict_));
         ns_dict_ = nullptr;
     }

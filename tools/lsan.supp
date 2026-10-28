@@ -1,0 +1,9 @@
+# LeakSanitizer suppressions (tools/run_asan.sh). Each entry says why.
+
+# The Python interpreter behind CPA's leakage models is shut down with
+# Py_FinalizeEx() at exit (LeakageModel::globalShutdown), but CPython and
+# NumPy keep some module, type and interned-string memory for the life of the
+# process by design. Our own reference counting (src/leakage_model.cpp) is
+# balanced by hand; anything allocated inside the interpreter is its business.
+leak:libpython3
+leak:_multiarray_umath

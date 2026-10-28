@@ -104,6 +104,9 @@ struct TraceEntry {
 // ---------------------------------------------------------------------------
 class PlotWidget : public QWidget {
     Q_OBJECT
+    // The GUI soak test (tests/gui_soak.cpp) drives the private slots and
+    // inspects the state directly.
+    friend struct GuiTestAccess;
 public:
     explicit PlotWidget(QWidget* parent = nullptr);
 

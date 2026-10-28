@@ -6,6 +6,20 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 
+# Sanitizers for hunting memory errors and leaks, applied to the app and to
+# every test target (see tools/run_asan.sh):
+#   cmake -B build-asan -DTRS_SANITIZE=address,undefined -DBUILD_TESTS=ON
+set(TRS_SANITIZE "" CACHE STRING
+    "-fsanitize= list for the app and the tests, e.g. address,undefined (empty: off)")
+if(TRS_SANITIZE)
+    message(STATUS "Sanitizers: ${TRS_SANITIZE}")
+    add_compile_options(-fsanitize=${TRS_SANITIZE} -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=${TRS_SANITIZE})
+    set(TRS_OPT_FLAGS -O1)               # readable stacks; -O2 hides frames
+else()
+    set(TRS_OPT_FLAGS -O2 -march=native)
+endif()
+
 # Try Qt6 first, fall back to Qt5
 # Qt: prefer 6, fall back to 5.
 #
@@ -131,9 +145,12 @@ set(SOURCES
     inc/snr.h
 )
 
-add_executable(trs-viewer ${SOURCES})
-
-target_link_libraries(trs-viewer PRIVATE
+# Everything but main() is one object library, linked into the app and into
+# the GUI soak test (tests/gui_soak.cpp), so it is compiled once.
+set(APP_SOURCES ${SOURCES})
+list(REMOVE_ITEM APP_SOURCES src/main.cpp)
+add_library(trs-viewer-objs OBJECT ${APP_SOURCES})
+target_link_libraries(trs-viewer-objs PUBLIC
     ${QT_LIBS}
     OpenMP::OpenMP_CXX
     Eigen3::Eigen
@@ -141,16 +158,17 @@ target_link_libraries(trs-viewer PRIVATE
     Python3::NumPy
     ZLIB::ZLIB
 )
-target_include_directories(trs-viewer PRIVATE src inc ${Python3_NumPy_INCLUDE_DIRS})
-
-target_compile_options(trs-viewer PRIVATE
-    -O2
+target_include_directories(trs-viewer-objs PUBLIC src inc ${Python3_NumPy_INCLUDE_DIRS})
+target_compile_options(trs-viewer-objs PUBLIC
+    ${TRS_OPT_FLAGS}
     -g
     -Wall
     -Wextra
     -Wno-unused-parameter
-    -march=native
 )
+
+add_executable(trs-viewer src/main.cpp)
+target_link_libraries(trs-viewer PRIVATE trs-viewer-objs)
 
 # Function names in the crash log's backtrace (src/crash_handler.cpp).
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

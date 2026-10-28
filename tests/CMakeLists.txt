@@ -1,7 +1,7 @@
 # ---------------------------------------------------------------------------
-# Test suite for trs-viewer non-GUI components
+# Test suite for trs-viewer (core units, the heatmap widget, and the GUI soak test)
 # Run with:  cmake -DBUILD_TESTS=ON ..  then  ctest --output-on-failure
-# Memory leaks: cmake -DBUILD_TESTS=ON -DENABLE_SANITIZERS=ON ..
+# Memory errors and leaks: tools/run_asan.sh (configures -DTRS_SANITIZE=address,undefined)
 # ---------------------------------------------------------------------------
 
 cmake_minimum_required(VERSION 3.16)
@@ -20,11 +20,8 @@ set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(googletest)
 include(GoogleTest)
 
-# ---------------------------------------------------------------------------
-# Optional AddressSanitizer + LeakSanitizer
-# Set ENABLE_SANITIZERS=ON for memory-error / leak detection.
-# ---------------------------------------------------------------------------
-option(ENABLE_SANITIZERS "Build tests with AddressSanitizer + LeakSanitizer" OFF)
+# Sanitizers: configure with -DTRS_SANITIZE=address,undefined (top-level
+# CMakeLists.txt), which covers the app and every target here.
 
 # ---------------------------------------------------------------------------
 # Non-GUI core object library shared by all test executables.
@@ -66,12 +63,6 @@ target_compile_options(trs-core-test PRIVATE
     -O1 -Wall -Wextra -Wno-unused-parameter
 )
 
-if(ENABLE_SANITIZERS)
-    message(STATUS "Tests: AddressSanitizer + LeakSanitizer enabled")
-    target_compile_options(trs-core-test PUBLIC -fsanitize=address,leak -fno-omit-frame-pointer -g)
-    target_link_options(   trs-core-test PUBLIC -fsanitize=address,leak)
-endif()
-
 # ---------------------------------------------------------------------------
 # Helper: register a test executable and auto-discover its tests via ctest
 # ---------------------------------------------------------------------------
@@ -79,10 +70,6 @@ function(add_trs_test name)
     add_executable(${name} ${name}.cpp)
     target_link_libraries(${name} PRIVATE trs-core-test GTest::gtest_main)
     target_include_directories(${name} PRIVATE ${CMAKE_SOURCE_DIR}/inc)
-    if(ENABLE_SANITIZERS)
-        target_compile_options(${name} PRIVATE -fsanitize=address,leak -fno-omit-frame-pointer -g)
-        target_link_options(   ${name} PRIVATE -fsanitize=address,leak)
-    endif()
     gtest_discover_tests(${name})
 endfunction()
 
@@ -127,8 +114,19 @@ add_executable(test_heatmap test_heatmap.cpp
 set_target_properties(test_heatmap PROPERTIES AUTOMOC ON)
 target_link_libraries(test_heatmap PRIVATE GTest::gtest ${QT_LIBS})
 target_include_directories(test_heatmap PRIVATE ${CMAKE_SOURCE_DIR}/inc)
-if(ENABLE_SANITIZERS)
-    target_compile_options(test_heatmap PRIVATE -fsanitize=address,leak -fno-omit-frame-pointer -g)
-    target_link_options(   test_heatmap PRIVATE -fsanitize=address,leak)
-endif()
 gtest_discover_tests(test_heatmap)
+
+# The whole app driven offscreen through its menus and dialogs, one scenario
+# per test (tests/gui_soak.cpp): the only test that runs MainWindow, the plots
+# and the jobs together. Each scenario loops, and fails if memory keeps
+# growing after the first loop. tools/run_asan.sh, run_valgrind.sh and
+# run_heaptrack.sh run it under the memory tools.
+add_executable(gui_soak gui_soak.cpp)
+target_link_libraries(gui_soak PRIVATE trs-viewer-objs)
+set(GUI_SOAK_SCENARIOS ttest average fft cpa snapshots combined quit_dialogs)
+foreach(sc ${GUI_SOAK_SCENARIOS})
+    add_test(NAME gui_soak.${sc} COMMAND gui_soak --scenario ${sc} --loops 3)
+    set_tests_properties(gui_soak.${sc} PROPERTIES
+        ENVIRONMENT "QT_QPA_PLATFORM=offscreen;TRS_NO_CRASH_HANDLER=1"
+        TIMEOUT 600)
+endforeach()

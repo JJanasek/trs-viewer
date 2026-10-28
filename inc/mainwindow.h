@@ -163,6 +163,9 @@ bool runTiledAlignment(
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
+    // The GUI soak test (tests/gui_soak.cpp) drives the private slots and
+    // inspects the state directly.
+    friend struct GuiTestAccess;
 public:
     explicit MainWindow(QWidget* parent = nullptr);
     ~MainWindow() override;

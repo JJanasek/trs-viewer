@@ -121,7 +121,7 @@ bool computeCpa(
                          + static_cast<size_t>(NS) * sizeof(double);
     int32_t chunk_m = static_cast<int32_t>(
         std::max<size_t>(1, MEM_LIMIT_BYTES / bytes_per_hyp));
-    chunk_m = std::min(chunk_m, M);
+    chunk_m = std::max(1, std::min(chunk_m, M));   // M = 0 still makes one (empty) chunk
 
     // Number of passes over the traces (= ceil(M / chunk_m))
     const int32_t n_chunks    = (M + chunk_m - 1) / chunk_m;
