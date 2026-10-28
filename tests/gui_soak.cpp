@@ -20,6 +20,9 @@
 #include "plot_widget.h"
 #include "job_manager.h"
 #include "leakage_model.h"
+#include "crash_handler.h"
+
+#include <csignal>
 
 #include <QtWidgets>
 
@@ -545,6 +548,21 @@ struct GuiTestAccess {
         closeResultTabs();
     }
 
+    // SIGTERM while a job runs and a dialog is open: the quit goes through the
+    // event loop, the job is cancelled, and the teardown frees everything
+    // (the memory tools check that at exit).
+    void scenarioSigtermDuringJob() {
+        drv.then([this]() {
+            w.jobs_->submit("long job", [](JobContext& ctx) {
+                for (int i = 0; i < 3000 && !ctx.cancelled(); i++) QThread::msleep(10);   // up to 30 s
+                return !ctx.cancelled();
+            }, [](bool) {});
+            w.onRunFFT();   // a non-modal dialog left open
+        });
+        drv.then([]() { ::kill(::getpid(), SIGTERM); });
+        drv.step([]() { return false; });   // until the signal ends the run
+    }
+
     // Non-modal dialogs left open at quit: the destructors must cope.
     void scenarioQuitDialogs() {
         drv.then([this]() {
@@ -561,6 +579,7 @@ int main(int argc, char** argv) {
     qputenv("QT_QPA_PLATFORM", qgetenv("QT_QPA_PLATFORM").isEmpty() ? "offscreen" : qgetenv("QT_QPA_PLATFORM"));
     QApplication::setAttribute(Qt::AA_DontUseNativeDialogs);
     QApplication app(argc, argv);
+    installQuitOnTermSignals();   // as the app does: SIGTERM quits through the event loop
 
     QString scenario = "ttest";
     int loops = 3;
@@ -613,6 +632,7 @@ int main(int argc, char** argv) {
             else if (scenario == "snapshots")    t.scenarioSnapshots();
             else if (scenario == "combined")     t.scenarioCombined();
             else if (scenario == "quit_dialogs") { t.scenarioQuitDialogs(); loops = 1; break; }
+            else if (scenario == "sigterm_during_job") { t.scenarioSigtermDuringJob(); loops = 1; break; }
             else if (scenario == "crash_quit_xcorr")   { t.scenarioCrashQuitXcorr(); loops = 1; break; }
             else if (scenario == "crash_job_during_modal")      t.scenarioCrashJobDuringModal();
             else if (scenario == "crash_close_tab_drawing")     t.scenarioCrashCloseTabWhileDrawing();

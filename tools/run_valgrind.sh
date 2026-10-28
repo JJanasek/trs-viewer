@@ -7,6 +7,7 @@
 #
 #   tools/run_valgrind.sh                  # unit tests
 #   tools/run_valgrind.sh --soak average   # plus a GUI soak scenario (slow)
+#   tools/run_valgrind.sh --soak all       # plus every scenario, several at a time
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
@@ -20,6 +21,9 @@ mkdir -p "$logs"
 # valgrind runs one thread at a time: OpenMP threads spinning at a barrier
 # would take turns burning their whole time slice (minutes instead of seconds).
 export OMP_NUM_THREADS=4 OMP_WAIT_POLICY=passive QT_QPA_PLATFORM=offscreen TRS_NO_CRASH_HANDLER=1
+# Python's own allocator pools memory in ways memcheck misreads; with plain
+# malloc every Python allocation is visible (CPython's advice for valgrind).
+export PYTHONMALLOC=malloc
 fail=0
 for t in build-tests/tests/test_*; do
     [ -x "$t" ] && [ -f "$t" ] || continue
@@ -31,14 +35,32 @@ for t in build-tests/tests/test_*; do
         fail=1
     fi
 done
-if [ "${1:-}" = "--soak" ]; then
-    sc="${2:-average}"
+soak_one() {
+    local sc="$1"
     if "${vg[@]}" build-tests/tests/gui_soak --scenario "$sc" --loops 1 --timeout 3600 \
             > "$logs/gui_soak-$sc.log" 2>&1; then
         echo "ok      gui_soak $sc"
+        echo 0 > "$logs/gui_soak-$sc.status"
     else
         echo "FAILED  gui_soak $sc   (see $logs/gui_soak-$sc.log)"
-        fail=1
+        echo 1 > "$logs/gui_soak-$sc.status"
+    fi
+}
+if [ "${1:-}" = "--soak" ]; then
+    if [ "${2:-average}" = "all" ]; then
+        # Every scenario registered with ctest, a few at a time (memcheck runs
+        # each program on one core).
+        mapfile -t scenarios < <(cd build-tests && ctest -N -R '^gui_soak\.' | sed -n 's/.*gui_soak\.\([a-z_0-9]*\)$/\1/p')
+        rm -f "$logs"/gui_soak-*.status
+        for sc in "${scenarios[@]}"; do
+            soak_one "$sc" &
+            while [ "$(jobs -rp | wc -l)" -ge "$(( $(nproc) / 3 ))" ]; do wait -n || true; done
+        done
+        wait
+        grep -qx 1 "$logs"/gui_soak-*.status && fail=1
+    else
+        soak_one "${2:-average}"
+        grep -qx 1 "$logs/gui_soak-${2:-average}.status" && fail=1
     fi
 fi
 exit $fail
