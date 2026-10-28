@@ -14512,65 +14512,69 @@ void MainWindow::onRunFFT() {
         }
 
         // Each trace: one FFT per trace, averaged — and the average trace
-        // alongside, for the inverse-FFT tool.
-        const std::vector<float> window = fftWindow(info->window_mode, info->win_n);
-        std::vector<double> acc_sum(static_cast<size_t>(fft_out_n), 0.0);
-        std::vector<float>  acc_min(static_cast<size_t>(fft_out_n),  std::numeric_limits<float>::max());
-        std::vector<float>  acc_max(static_cast<size_t>(fft_out_n), -std::numeric_limits<float>::max());
-        std::vector<double> mean_sum(static_cast<size_t>(info->win_n), 0.0);
-        int64_t n_ok = 0;
+        // alongside, for the inverse-FFT tool. In the background: a long
+        // trace is a big FFT, and there may be thousands.
+        struct PerTraceOut { QString err; };
+        auto out = std::make_shared<PerTraceOut>();
+        jobs_->submit(QString("FFT of each trace — %1 traces of %2").arg(info->count).arg(activeDs().display_name),
+            [info, show_env, fft_out_n, out](JobContext& ctx) {
+                const std::vector<float> window = fftWindow(info->window_mode, info->win_n);
+                std::vector<double> acc_sum(static_cast<size_t>(fft_out_n), 0.0);
+                std::vector<float>  acc_min(static_cast<size_t>(fft_out_n),  std::numeric_limits<float>::max());
+                std::vector<float>  acc_max(static_cast<size_t>(fft_out_n), -std::numeric_limits<float>::max());
+                std::vector<double> mean_sum(static_cast<size_t>(info->win_n), 0.0);
+                int64_t n_ok = 0;
 
-        QProgressDialog prog("Computing FFT…", "Cancel", 0, info->count, cfg);
-        prog.setWindowModality(Qt::WindowModal);
-        prog.setMinimumDuration(400);
-
-        std::vector<float> trace_buf;
-        Eigen::FFT<float>  fft_engine;
-        std::vector<float> spec;
-        for (int32_t ti = 0; ti < info->count; ++ti) {
-            if (prog.wasCanceled()) return;
-            prog.setValue(ti);
-            QApplication::processEvents();
-
-            int64_t n_out = 0;
-            if (loadProcessedTrace(info->file.get(), info->pipeline, info->first + ti, info->s_first,
-                                   info->raw_ns, {}, 0, 0, h.num_samples, trace_buf, n_out)
-                    != TraceLoad::Ok || n_out < 2)
-                continue;
-
-            for (int64_t s = 0; s < n_out && s < info->win_n; ++s)
-                mean_sum[static_cast<size_t>(s)] += trace_buf[static_cast<size_t>(s)];
-            spectrumOf(trace_buf.data(), n_out, window, info->fft_in_n, info->out_mode, fft_engine, spec);
-            for (int64_t k = 0; k < fft_out_n; ++k) {
-                const float val = spec[static_cast<size_t>(k)];
-                acc_sum[static_cast<size_t>(k)] += static_cast<double>(val);
-                acc_min[static_cast<size_t>(k)] = std::min(acc_min[static_cast<size_t>(k)], val);
-                acc_max[static_cast<size_t>(k)] = std::max(acc_max[static_cast<size_t>(k)], val);
-            }
-            ++n_ok;
-        }
-        prog.setValue(info->count);
-
-        if (n_ok == 0) {
-            QMessageBox::critical(cfg, "FFT", "No traces could be processed.");
-            return;
-        }
-
-        info->n_traces = n_ok;
-        info->spectrum = std::make_shared<std::vector<float>>(static_cast<size_t>(fft_out_n));
-        for (int64_t k = 0; k < fft_out_n; ++k)
-            (*info->spectrum)[static_cast<size_t>(k)] =
-                static_cast<float>(acc_sum[static_cast<size_t>(k)] / static_cast<double>(n_ok));
-        info->mean_trace.resize(static_cast<size_t>(info->win_n));
-        for (int64_t s = 0; s < info->win_n; ++s)
-            info->mean_trace[static_cast<size_t>(s)] =
-                static_cast<float>(mean_sum[static_cast<size_t>(s)] / static_cast<double>(n_ok));
-        if (show_env && n_ok > 1) {
-            info->spec_min = std::move(acc_min);
-            info->spec_max = std::move(acc_max);
-        }
-        showFftResult(info);
-        cfg->accept();   // close the config dialog now that the run succeeded
+                std::vector<float> trace_buf;
+                Eigen::FFT<float>  fft_engine;
+                std::vector<float> spec;
+                const int64_t num_samples = info->file->header().num_samples;
+                for (int32_t ti = 0; ti < info->count; ++ti) {
+                    if (ctx.cancelled()) return false;
+                    ctx.setProgress(ti, info->count);
+                    int64_t n_out = 0;
+                    if (loadProcessedTrace(info->file.get(), info->pipeline, info->first + ti, info->s_first,
+                                           info->raw_ns, {}, 0, 0, num_samples, trace_buf, n_out)
+                            != TraceLoad::Ok || n_out < 2)
+                        continue;
+                    for (int64_t s = 0; s < n_out && s < info->win_n; ++s)
+                        mean_sum[static_cast<size_t>(s)] += trace_buf[static_cast<size_t>(s)];
+                    spectrumOf(trace_buf.data(), n_out, window, info->fft_in_n, info->out_mode, fft_engine, spec);
+                    for (int64_t k = 0; k < fft_out_n; ++k) {
+                        const float val = spec[static_cast<size_t>(k)];
+                        acc_sum[static_cast<size_t>(k)] += static_cast<double>(val);
+                        acc_min[static_cast<size_t>(k)] = std::min(acc_min[static_cast<size_t>(k)], val);
+                        acc_max[static_cast<size_t>(k)] = std::max(acc_max[static_cast<size_t>(k)], val);
+                    }
+                    ++n_ok;
+                }
+                if (n_ok == 0) {
+                    out->err = "No traces could be processed.";
+                    return false;
+                }
+                info->n_traces = n_ok;
+                info->spectrum = std::make_shared<std::vector<float>>(static_cast<size_t>(fft_out_n));
+                for (int64_t k = 0; k < fft_out_n; ++k)
+                    (*info->spectrum)[static_cast<size_t>(k)] =
+                        static_cast<float>(acc_sum[static_cast<size_t>(k)] / static_cast<double>(n_ok));
+                info->mean_trace.resize(static_cast<size_t>(info->win_n));
+                for (int64_t s = 0; s < info->win_n; ++s)
+                    info->mean_trace[static_cast<size_t>(s)] =
+                        static_cast<float>(mean_sum[static_cast<size_t>(s)] / static_cast<double>(n_ok));
+                if (show_env && n_ok > 1) {
+                    info->spec_min = std::move(acc_min);
+                    info->spec_max = std::move(acc_max);
+                }
+                return true;
+            },
+            [this, info, out](bool ok) {
+                if (!ok) {
+                    if (!out->err.isEmpty()) QMessageBox::critical(this, "FFT failed", out->err);
+                    return;
+                }
+                showFftResult(info);
+            });
+        cfg->accept();   // the result tab opens when the job is done
     });
 
     cfg->show();
@@ -14825,48 +14829,54 @@ void MainWindow::showRemoveFrequenciesDialog(PlotWidget* pw, std::shared_ptr<con
     });
 
     connect(btn_show, &QPushButton::clicked, d, [=]() {
-        // The signal, read the way the spectrum's traces were read.
-        auto before = std::make_shared<std::vector<float>>();
-        QString what;
-        if (rb_trace->isChecked()) {
-            std::vector<std::shared_ptr<ITransform>> pl;
-            for (const auto& t : info->pipeline) pl.push_back(t->clone());
-            std::vector<float> buf;
-            int64_t n_out = 0;
-            const int32_t ti = sp_trace->value();
-            const TraceLoad got = loadProcessedTrace(info->file.get(), pl, ti, info->s_first, info->raw_ns,
-                                                     info->shifts, info->shifts_first, info->read_lo,
-                                                     info->read_hi > 0 ? info->read_hi
-                                                                       : info->file->header().num_samples,
-                                                     buf, n_out);
-            if (got != TraceLoad::Ok || n_out < 8) {
-                status->setText(got == TraceLoad::Discarded
-                                    ? QString("Trace %1 is outside the alignment or was discarded by it.").arg(ti)
-                                    : QString("Trace %1 could not be read.").arg(ti));
-                return;
-            }
-            before->assign(buf.begin(), buf.begin() + n_out);
-            what = QString("trace %1").arg(ti);
-        } else {
-            *before = info->mean_trace;
-            what = QString("average of %1 traces").arg(info->n_traces);
-        }
+        const int32_t ti = rb_trace->isChecked() ? sp_trace->value() : -1;   // -1: the average trace
+        const QString what = ti >= 0 ? QString("trace %1").arg(ti)
+                                     : QString("average of %1 traces").arg(info->n_traces);
         // The signal before and after, the FFT scratch, and the tab's copy.
-        if (!confirmMemory(d, static_cast<int64_t>(before->size()) * 4 * 5, "The inverse FFT")) return;
+        if (!confirmMemory(d, info->win_n * 4 * 5, "The inverse FFT")) return;
         const std::vector<SpectralBand> bs = *bands;
-        auto after = std::make_shared<std::vector<float>>(*before);
-        // Two FFTs of the whole signal: on a worker, as a long trace can take a while.
+        auto before = std::make_shared<std::vector<float>>();
+        auto after  = std::make_shared<std::vector<float>>();
+        auto err    = std::make_shared<QString>();
+        // On a worker: reading one long trace through the pipeline and two
+        // FFTs of it can take a while.
         jobs_->submit(QString("Inverse FFT — %1").arg(what),
-            [after, bs](JobContext& ctx) {
-                ctx.setProgress(0, 1);
+            [info, ti, bs, before, after, err](JobContext& ctx) {
+                ctx.setProgress(0, 2);
+                if (ti >= 0) {
+                    // The trace, read the way the spectrum's traces were read.
+                    std::vector<std::shared_ptr<ITransform>> pl;
+                    for (const auto& t : info->pipeline) pl.push_back(t->clone());
+                    std::vector<float> buf;
+                    int64_t n_out = 0;
+                    const TraceLoad got = loadProcessedTrace(
+                        info->file.get(), pl, ti, info->s_first, info->raw_ns, info->shifts,
+                        info->shifts_first, info->read_lo,
+                        info->read_hi > 0 ? info->read_hi : info->file->header().num_samples, buf, n_out);
+                    if (got != TraceLoad::Ok || n_out < 8) {
+                        *err = got == TraceLoad::Discarded
+                                   ? QString("Trace %1 is outside the alignment or was discarded by it.").arg(ti)
+                                   : QString("Trace %1 could not be read.").arg(ti);
+                        return false;
+                    }
+                    before->assign(buf.begin(), buf.begin() + n_out);
+                } else {
+                    *before = info->mean_trace;
+                }
+                if (ctx.cancelled()) return false;
+                ctx.setProgress(1, 2);
+                *after = *before;
                 SpectralExciseTransform ex(bs, SpectralExciseTransform::PhaseMode::Preserve);
                 after->resize(static_cast<size_t>(
                     ex.apply(after->data(), static_cast<int64_t>(after->size()), 0)));
-                ctx.setProgress(1, 1);
+                ctx.setProgress(2, 2);
                 return true;
             },
             [=](bool ok) {
-                if (!ok) return;
+                if (!ok) {
+                    if (!err->isEmpty()) QMessageBox::warning(this, "Inverse FFT", *err);
+                    return;
+                }
                 const int nb = static_cast<int>(bs.size());
                 addResultTab(*before, QString("Inverse FFT — %1, %2 band%3 removed")
                                           .arg(what).arg(nb).arg(nb == 1 ? "" : "s"),
