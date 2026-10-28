@@ -1,4 +1,6 @@
 #include "figure_dialog.h"
+
+#include <QPointer>
 #include "figure.h"
 #include "plot_widget.h"
 
@@ -388,9 +390,10 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
     QObject::connect(cmb_y, QOverload<int>::of(&QComboBox::currentIndexChanged), &dlg, unitsChanged);
     QObject::connect(sp_rate, QOverload<double>::of(&QDoubleSpinBox::valueChanged), &dlg, unitsChanged);
 
+    const QPointer<PlotWidget> pw_guard = pw;
     QObject::connect(btn_copy, &QPushButton::clicked, &dlg, [&]() {
         cfg->save();
-        copyFigureToClipboard(pw);
+        if (pw_guard) copyFigureToClipboard(pw_guard);
     });
     QObject::connect(bb, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
     QObject::connect(btn_export, &QPushButton::clicked, &dlg, [&]() {
@@ -423,6 +426,9 @@ void showFigureExportDialog(PlotWidget* pw, QWidget* parent) {
     }
     unitsChanged();
     dlg.resize(1080, 720);
+    // Modal from the start: exec() below can't make a dialog that is already
+    // showing modal, and the plot this exports must not be closed meanwhile.
+    dlg.setWindowModality(Qt::ApplicationModal);
     dlg.show();
     QApplication::processEvents();   // let the preview label get its real size
     refresh();

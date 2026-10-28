@@ -170,8 +170,9 @@ private:
                 return;   // one action per tick; the dialog reacts first
             }
             if (auto* mb = qobject_cast<QMessageBox*>(d)) {
-                if (answered_.contains(mb)) continue;
-                answered_.insert(mb);
+                // Marked on the box itself: a new box can reuse a freed one's address.
+                if (mb->property("soak_answered").toBool()) continue;
+                mb->setProperty("soak_answered", true);
                 fail(QString("unexpected message box '%1': %2").arg(mb->windowTitle(), mb->text().left(200)));
                 QMetaObject::invokeMethod(mb, "reject", Qt::QueuedConnection);
             }
@@ -180,7 +181,6 @@ private:
 
     std::deque<Step>    steps_;
     std::deque<Pending> handlers_;
-    QSet<QMessageBox*>  answered_;
     bool in_step_  = false;
     bool step_queued_ = false;
     bool announced_ = false;
@@ -374,6 +374,76 @@ struct GuiTestAccess {
         drv.step([]() { QApplication::processEvents(); return true; });
     }
 
+    // ---- crash recipes: each once reached freed memory or a null file ----
+
+    // Quit with a Template Match result window open, showing its peaks on
+    // the main plot: its destroyed() handler ran during ~MainWindow.
+    void scenarioCrashQuitXcorr() {
+        drv.onDialog("Cross-Correlation — configuration", [](QDialog* d) {
+            for (auto* rb : d->findChildren<QRadioButton*>())
+                if (rb->text().startsWith("Template Match")) rb->setChecked(true);
+            return clickOk(d);
+        });
+        drv.onDialog("Template Match", [](QDialog* d) {
+            auto* show = qobject_cast<QCheckBox*>(button(d, "Show on main plot"));
+            if (show) show->setChecked(true);
+            return true;
+        });
+        drv.then([this]() { w.onRunXCorr(); });
+        drv.step([this]() { return drv.dialogsAnswered(); });
+    }
+
+    // A job finishing while a modal dialog is open adds a result tab and
+    // makes it active; the dialog's run then read activeDs() — the result.
+    void scenarioCrashJobDuringModal() {
+        drv.then([this]() {
+            w.jobs_->submit("slow job", [](JobContext&) { QThread::msleep(400); return true; },
+                            [this](bool) {
+                                w.addResultTab(std::vector<float>(100, 1.0f), "late result",
+                                               QColor(Qt::red), "late");
+                            });
+        });
+        drv.onDialog("Average Trace", [this](QDialog* d) {
+            if (!jobsIdle()) return false;   // press Run only after the job's tab is there
+            return clickOk(d);
+        });
+        drv.then([this]() { w.onRunAverage(); });
+        waitJobs();
+    }
+
+    // Close the file's tab while drawing the t-test range, then Run.
+    void scenarioCrashCloseTabWhileDrawing() {
+        drv.onDialog("Welch t-test", [](QDialog* d) { return clickButton(d, "Draw on plot"); });
+        drv.onDialog("Welch t-test", [this](QDialog* d) {
+            if (!button(d, "Drawing")) return false;
+            w.closeDatasetAt(0);
+            return clickOk(d);
+        });
+        // The run then finds its file gone, and says so.
+        drv.onDialog("Trace file closed", [](QDialog* d) { return clickOk(d); });
+        drv.then([this]() { w.showTTestDialog(nullptr); });
+        waitJobs();
+        openTestFile();   // for the next loop
+    }
+
+    // A non-modal dialog's Run pressed while a result tab is active.
+    void scenarioCrashNonModalOtherTab() {
+        useFileTab();        // a result tab to switch to
+        drv.onDialog("Average Trace", [](QDialog* d) { return clickOk(d); });
+        drv.then([this]() { w.onRunAverage(); });
+        waitJobs();
+        useFileTab();
+        drv.onDialog("FFT Spectrum — configuration", [this](QDialog* d) {
+            // Switch to the result tab, then press Run.
+            for (int i = 0; i < tabs(); i++)
+                if (w.datasets_[static_cast<size_t>(i)].is_result) w.tab_bar_->setCurrentIndex(i);
+            return clickOk(d);
+        });
+        drv.then([this]() { w.onRunFFT(); });
+        waitJobs();
+        closeResultTabs();
+    }
+
     // Non-modal dialogs left open at quit: the destructors must cope.
     void scenarioQuitDialogs() {
         drv.then([this]() {
@@ -430,6 +500,10 @@ int main(int argc, char** argv) {
             else if (scenario == "snapshots")    t.scenarioSnapshots();
             else if (scenario == "combined")     t.scenarioCombined();
             else if (scenario == "quit_dialogs") { t.scenarioQuitDialogs(); loops = 1; break; }
+            else if (scenario == "crash_quit_xcorr")   { t.scenarioCrashQuitXcorr(); loops = 1; break; }
+            else if (scenario == "crash_job_during_modal")      t.scenarioCrashJobDuringModal();
+            else if (scenario == "crash_close_tab_drawing")     t.scenarioCrashCloseTabWhileDrawing();
+            else if (scenario == "crash_nonmodal_other_tab")    t.scenarioCrashNonModalOtherTab();
             else { std::fprintf(stderr, "unknown scenario %s\n", qPrintable(scenario)); return 2; }
             if (loop == 0) drv.then([&]() { rss_first = rssMB(); });
         }

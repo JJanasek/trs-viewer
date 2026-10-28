@@ -72,6 +72,7 @@ JobManager::JobManager(QObject* parent) : QObject(parent) {
 
 JobManager::~JobManager() {
     cancelAll();
+    pool_.clear();   // queued jobs that never started don't start now
     // Work functions poll cancelled() regularly, so this returns promptly;
     // it must not be skipped, or a pool thread could outlive the file and
     // parameters it is reading.

@@ -332,6 +332,18 @@ static double fileSampleInterval(const TrsHeader& h) {
 static double fileValueScale(const TrsHeader& h) {
     return (!h.label_y.empty() || h.scale_y != 1.0f) && h.scale_y > 0 ? static_cast<double>(h.scale_y) : 0.0;
 }
+// A private copy of a pipeline, for work that runs through processEvents()
+// (a progress dialog) or on a worker: the dataset's own list can change, or
+// go with its tab, while the work is still using it.
+static std::vector<std::shared_ptr<ITransform>> clonePipeline(
+    const std::vector<std::shared_ptr<ITransform>>& pl)
+{
+    std::vector<std::shared_ptr<ITransform>> out;
+    out.reserve(pl.size());
+    for (const auto& t : pl) out.push_back(t->clone());
+    return out;
+}
+
 // True if the pipeline keeps sample positions (so result index i is raw
 // sample first + i and time can be derived).
 static bool keepsSamplePositions(const std::vector<std::shared_ptr<ITransform>>& pl) {
@@ -817,7 +829,17 @@ MainWindow::MainWindow(QWidget* parent)
         });
 }
 
-MainWindow::~MainWindow() = default;
+MainWindow::~MainWindow() {
+    // Qt deletes this window's children only after this body has run and
+    // the members are gone. A dialog still open at quit would then be
+    // destroyed — and its signal handlers run — against a half-destroyed
+    // window (the exit crashes of Oct 19). Delete them first, while every
+    // tab and member is still there, and don't start jobs not yet running.
+    jobs_->cancelAll();
+    QList<QPointer<QDialog>> dialogs;
+    for (QDialog* d : findChildren<QDialog*>()) dialogs << d;
+    for (const QPointer<QDialog>& d : dialogs) delete d.data();   // null if a parent took it already
+}
 
 // ---------------------------------------------------------------------------
 // Dataset switching
@@ -977,6 +999,18 @@ int MainWindow::datasetIndexForWidget(PlotWidget* pw) const {
     return -1;
 }
 
+bool MainWindow::returnToFile(const std::shared_ptr<TrsFile>& file, QWidget* parent) {
+    if (!file) return true;   // a result tab's own action: nothing to go back to
+    for (size_t i = 0; i < datasets_.size(); i++) {
+        if (datasets_[i].is_result || datasets_[i].file != file) continue;
+        if (static_cast<int>(i) != active_idx_) tab_bar_->setCurrentIndex(static_cast<int>(i));
+        return true;
+    }
+    QMessageBox::information(parent, "Trace file closed",
+                             "The trace file this was set up for has been closed.");
+    return false;
+}
+
 void MainWindow::activateDatasetForWidget(PlotWidget* pw) {
     int idx = datasetIndexForWidget(pw);
     if (idx < 0 || idx == active_idx_) return;
@@ -1090,7 +1124,9 @@ void MainWindow::refreshRecentLists() {
             recent_menu_->addSeparator();
             connect(recent_menu_->addAction("Clear List"), &QAction::triggered, this, [this]() {
                 QSettings("trs-viewer", "trs-viewer").remove("recentFiles");
-                refreshRecentLists();
+                // Rebuilding the menu deletes this very action: not while
+                // it is still emitting.
+                QTimer::singleShot(0, this, [this]() { refreshRecentLists(); });
             });
         }
     }
@@ -1822,11 +1858,13 @@ void MainWindow::onWarmPageCache() {
         QMessageBox::information(this, "Warm Page Cache", "No file loaded.");
         return;
     }
-    prefetchWithProgress(activeDs().file.get(),
+    prefetchWithProgress(activeDs().file,
         "Warming page cache for " + activeDs().display_name + "…");
 }
 
-void MainWindow::prefetchWithProgress(TrsFile* file, const QString& label) {
+void MainWindow::prefetchWithProgress(std::shared_ptr<TrsFile> file, const QString& label) {
+    // Held for the duration: the tab can be closed while the progress
+    // dialog runs the event loop.
     QProgressDialog prog(label, "Skip", 0, 100, this);
     prog.setWindowModality(Qt::WindowModal);
     prog.setMinimumDuration(400);   // small/already-cached files never show it
@@ -2901,7 +2939,10 @@ void MainWindow::onExportTrs() {
     fl->addRow(bb);
     connect(bb, &QDialogButtonBox::accepted, &range_dlg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &range_dlg, &QDialog::reject);
-    if (range_dlg.exec() != QDialog::Accepted) return;
+    // A job finishing while the dialog is open can make its result tab the
+    // active one: carry on with the file the dialog was opened for.
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    if (range_dlg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
 
     int32_t first = static_cast<int32_t>(sp_first->value());
     int32_t count = static_cast<int32_t>(sp_count->value());
@@ -2939,9 +2980,14 @@ void MainWindow::onExportTrs() {
 
     QString err;
     int32_t n_written = 0;
-    bool ok = exportTracesToTrs(path, activeDs().file.get(), first, count,
-                                shifts, activeDs().align_first_trace,
-                                activeDs().pipeline, &progress, err, &n_written,
+    // The file and pipeline as they are now: the progress dialog below runs the
+    // event loop, where the tab can be closed or its pipeline edited.
+    const std::shared_ptr<TrsFile> src = activeDs().file;
+    const auto src_pipeline = clonePipeline(activeDs().pipeline);
+    const int32_t src_shifts_first = activeDs().align_first_trace;
+    bool ok = exportTracesToTrs(path, src.get(), first, count,
+                                shifts, src_shifts_first,
+                                src_pipeline, &progress, err, &n_written,
                                 base_sample, window_len, read_lo, read_hi);
     progress.setValue(count);
 
@@ -2996,7 +3042,10 @@ void MainWindow::onImportTraceSubset() {
     fl->addRow(bb);
     connect(bb, &QDialogButtonBox::accepted, &range_dlg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &range_dlg, &QDialog::reject);
-    if (range_dlg.exec() != QDialog::Accepted) return;
+    // A job finishing while the dialog is open can make its result tab the
+    // active one: carry on with the file the dialog was opened for.
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    if (range_dlg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
 
     int32_t first = static_cast<int32_t>(sp_first->value());
     int32_t count = static_cast<int32_t>(sp_count->value());
@@ -5373,7 +5422,10 @@ void MainWindow::onExportNpy() {
     fl->addRow(bb);
     connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
-    if (cfg.exec() != QDialog::Accepted) return;
+    // A job finishing while the dialog is open can make its result tab the
+    // active one: carry on with the file the dialog was opened for.
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    if (cfg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
 
     int32_t first = static_cast<int32_t>(sp_first->value());
     int32_t count = static_cast<int32_t>(sp_count->value());
@@ -5410,9 +5462,14 @@ void MainWindow::onExportNpy() {
 
     QString err;
     int32_t n_written = 0;
-    bool ok = exportTracesToNpy(path, activeDs().file.get(), first, count,
-                                 shifts, activeDs().align_first_trace,
-                                 activeDs().pipeline, this, &prog, err, &n_written,
+    // The file and pipeline as they are now: the progress dialog below runs the
+    // event loop, where the tab can be closed or its pipeline edited.
+    const std::shared_ptr<TrsFile> src = activeDs().file;
+    const auto src_pipeline = clonePipeline(activeDs().pipeline);
+    const int32_t src_shifts_first = activeDs().align_first_trace;
+    bool ok = exportTracesToNpy(path, src.get(), first, count,
+                                 shifts, src_shifts_first,
+                                 src_pipeline, this, &prog, err, &n_written,
                                  base_sample, window_len, read_lo, read_hi);
     if (!ok) {
         if (err != "Export cancelled.") QMessageBox::critical(this, "Export failed", err);
@@ -5460,7 +5517,10 @@ void MainWindow::onExportNpz() {
     fl->addRow(bb);
     connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
-    if (cfg.exec() != QDialog::Accepted) return;
+    // A job finishing while the dialog is open can make its result tab the
+    // active one: carry on with the file the dialog was opened for.
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    if (cfg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
 
     int32_t first = static_cast<int32_t>(sp_first->value());
     int32_t count = static_cast<int32_t>(sp_count->value());
@@ -5497,9 +5557,14 @@ void MainWindow::onExportNpz() {
 
     QString err;
     int32_t n_written = 0;
-    bool ok = exportTracesToNpz(path, activeDs().file.get(), first, count,
-                                 shifts, activeDs().align_first_trace,
-                                 activeDs().pipeline, &prog, err, &n_written,
+    // The file and pipeline as they are now: the progress dialog below runs the
+    // event loop, where the tab can be closed or its pipeline edited.
+    const std::shared_ptr<TrsFile> src = activeDs().file;
+    const auto src_pipeline = clonePipeline(activeDs().pipeline);
+    const int32_t src_shifts_first = activeDs().align_first_trace;
+    bool ok = exportTracesToNpz(path, src.get(), first, count,
+                                 shifts, src_shifts_first,
+                                 src_pipeline, &prog, err, &n_written,
                                  base_sample, window_len, read_lo, read_hi);
     if (!ok) {
         if (err != "Export cancelled.") QMessageBox::critical(this, "Export failed", err);
@@ -6073,7 +6138,10 @@ void MainWindow::onRunAverage() {
     mem.restore();
     if (h.data_length <= 0) cmb_mode->setCurrentIndex(0);
     syncMode();
-    if (cfg.exec() != QDialog::Accepted) return;
+    // A job finishing while the dialog is open can make its result tab the
+    // active one: carry on with the file the dialog was opened for.
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    if (cfg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
     mem.save();
 
     const int32_t first = sp_first->value();
@@ -6178,7 +6246,10 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         QMessageBox::information(this, "T-test", "No file loaded.");
         return;
     }
-    const TrsHeader& h = activeDs().file->header();
+    // Held for the whole dialog: h stays valid even if the tab is closed
+    // while the range is being drawn (see the exec() loop below).
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    const TrsHeader& h = run_file->header();
     if (h.data_length <= 0) {
         QMessageBox::critical(this, "T-test",
             "This TRS file has no per-trace data bytes.\n"
@@ -6273,19 +6344,24 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     // forcing the full aligned range. computeTTest() looks up each trace's
     // shift by its absolute index, so any subset works correctly regardless
     // of where it starts.
+    // The dialog's own file, not activeDs(): while the range is drawn other
+    // tabs can be activated or this one closed.
     auto applyAlignmentToSpinboxes = [&](bool on) {
-        if (on) {
-            sp_first->setValue(activeDs().align_first_trace);
-            sp_count->setValue(align_trace_count);
-            int32_t tile_idx = sp_tile ? sp_tile->value() : 0;
-            ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), tile_idx);
-            sp_s_first->setValue(static_cast<int>(resolved.first_sample));
-            sp_s_count->setValue(static_cast<int>(resolved.n_samples));
-        }
+        if (!on) return;
+        const Dataset* ds = nullptr;
+        for (const Dataset& d : datasets_)
+            if (!d.is_result && d.file == run_file) ds = &d;
+        if (!ds) return;
+        sp_first->setValue(ds->align_first_trace);
+        sp_count->setValue(align_trace_count);
+        int32_t tile_idx = sp_tile ? sp_tile->value() : 0;
+        ResolvedAlignment resolved = resolveAlignmentTile(*ds, tile_idx);
+        sp_s_first->setValue(static_cast<int>(resolved.first_sample));
+        sp_s_count->setValue(static_cast<int>(resolved.n_samples));
     };
-    connect(chk_shifts, &QCheckBox::toggled, [&](bool on){ applyAlignmentToSpinboxes(on); });
+    connect(chk_shifts, &QCheckBox::toggled, &cfg, [&](bool on){ applyAlignmentToSpinboxes(on); });
     if (sp_tile)
-        connect(sp_tile, QOverload<int>::of(&QSpinBox::valueChanged), [&](int){
+        connect(sp_tile, QOverload<int>::of(&QSpinBox::valueChanged), &cfg, [&](int){
             if (chk_shifts->isChecked()) applyAlignmentToSpinboxes(true);
         });
     if (has_alignment) applyAlignmentToSpinboxes(true);
@@ -6707,8 +6783,8 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         // Drawing: the main plot needs the mouse, so the dialog stays up
         // non-modal until a range is dragged, the button is pressed again,
         // or Run/Cancel is pressed, then goes back to being modal.
-        const int ds_idx = active_idx_;
-        PlotWidget* pw = plotWidget();
+        // The tab can be closed while drawing, taking its plot with it.
+        const QPointer<PlotWidget> pw = plotWidget();
         drawing = true;
         btn_draw->setText("Drawing… (drag on plot; click here to cancel)");
         cfg.show();
@@ -6727,19 +6803,21 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         });
         connect(btn_draw, &QPushButton::clicked, &loop, &QEventLoop::quit);
         connect(&cfg, &QDialog::finished, &loop, [&](int r) { finished = r; loop.quit(); });
+        connect(pw, &QObject::destroyed, &loop, &QEventLoop::quit);
         loop.exec();
         drawing = false;
         btn_draw->setText("Draw on plot →");
-        pw->setCropAutoConfirm(false);
-        if (pw->mode() == InteractionMode::CropSelect) pw->setMode(InteractionMode::Pan);
-        // The run reads the dialog's file through activeDs(), so undo a tab
-        // switch made while drawing.
-        if (active_idx_ != ds_idx && ds_idx < static_cast<int>(datasets_.size()))
-            tab_bar_->setCurrentIndex(ds_idx);
+        if (pw) {
+            pw->setCropAutoConfirm(false);
+            if (pw->mode() == InteractionMode::CropSelect) pw->setMode(InteractionMode::Pan);
+        }
         if (finished == QDialog::Accepted) break;
         if (finished >= 0) return;
         cfg.hide();   // exec() makes it modal again only when it shows it
     }
+    // The run reads the dialog's file through activeDs(): go back to it if a
+    // tab switch (or a job's result tab) took over meanwhile.
+    if (!returnToFile(run_file, this)) return;
     mem.save();
 
     int32_t first    = static_cast<int32_t>(sp_first->value());
@@ -7387,6 +7465,7 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     auto* btn_calc_th = new QPushButton("Calc TH…");
     connect(btn_calc_th, &QPushButton::clicked, pw, [=]() {
         auto* cd = new QDialog(pw);
+        cd->setAttribute(Qt::WA_DeleteOnClose);   // a new one per click
         cd->setWindowTitle("Threshold Calculator");
         cd->setWindowModality(Qt::WindowModal);
         auto* fl = new QFormLayout(cd);
@@ -7452,6 +7531,7 @@ void MainWindow::buildTTestResultTab(const std::shared_ptr<TTestAccumulator>& ac
     auto* btn_style = new QPushButton("Style…");
     connect(btn_style, &QPushButton::clicked, pw, [=]() {
         auto* sd = new QDialog(pw);
+        sd->setAttribute(Qt::WA_DeleteOnClose);   // a new one per click
         sd->setWindowTitle("Plot Style");
         sd->setWindowModality(Qt::NonModal);
         auto* fl2 = new QFormLayout(sd);
@@ -7634,6 +7714,9 @@ void MainWindow::onCropEdit() {
         QMessageBox::information(this, "Crop & Merge", "No file loaded.");
         return;
     }
+    // A non-modal dialog: by the time a button here is pressed another tab
+    // may be active. Its actions go back to this file first (returnToFile).
+    const std::shared_ptr<TrsFile> dlg_file = activeDs().file;
 
     // Restore Pan mode when dialog is closed
     InteractionMode prev_mode = plotWidget()->mode();
@@ -7790,7 +7873,8 @@ void MainWindow::onCropEdit() {
     });
 
     // ---- export ----
-    connect(btn_export, &QPushButton::clicked, dlg, [this, dlg, chk_separate]() {
+    connect(btn_export, &QPushButton::clicked, dlg, [this, dlg, chk_separate, dlg_file]() {
+        if (!returnToFile(dlg_file, dlg)) return;
         const auto& ranges = plotWidget()->cropRanges();
         if (ranges.empty()) return;
 
@@ -7816,7 +7900,10 @@ void MainWindow::onCropEdit() {
         for (const auto& r : ranges) total_samples += r.second - r.first;
         if (total_samples <= 0) return;
 
-        const TrsHeader& h = activeDs().file->header();
+        // The file itself, held: the progress loop below runs the event loop,
+        // where the tab can be closed.
+        const std::shared_ptr<TrsFile> src = activeDs().file;
+        const TrsHeader& h = src->header();
 
         QString path = QFileDialog::getSaveFileName(
             dlg, "Export cropped TRS", MainWindow::recentDir("trs"), "TRS files (*.trs)");
@@ -7869,7 +7956,7 @@ void MainWindow::onCropEdit() {
         auto writeSampleRange = [&](int ti, int64_t s, int64_t end) {
             while (s < end) {
                 int64_t chunk = std::min(CHUNK, end - s);
-                int64_t read  = activeDs().file->readSamples(ti, s, chunk, buf.data());
+                int64_t read  = src->readSamples(ti, s, chunk, buf.data());
                 if (read <= 0) {
                     int64_t remain = end - s;
                     std::fill(buf.begin(), buf.begin() + remain, 0.0f);
@@ -7890,7 +7977,7 @@ void MainWindow::onCropEdit() {
             QApplication::processEvents();
 
             std::vector<uint8_t> data;
-            if (h.data_length > 0) data = activeDs().file->readData(ti);
+            if (h.data_length > 0) data = src->readData(ti);
 
             if (separate) {
                 // One output trace per range: aux data (if any) is repeated
@@ -7937,6 +8024,9 @@ void MainWindow::onRunXCorr() {
         QMessageBox::information(this, "Cross-Correlation", "No file loaded.");
         return;
     }
+    // A non-modal dialog: by the time a button here is pressed another tab
+    // may be active. Its actions go back to this file first (returnToFile).
+    const std::shared_ptr<TrsFile> dlg_file = activeDs().file;
     const TrsHeader& h = activeDs().file->header();
     int n_total   = h.num_traces;
     int n_samples = h.num_samples;
@@ -8325,7 +8415,11 @@ void MainWindow::onRunXCorr() {
     // OK, via QDialog::accepted() (emitted from within accept(), so this fires
     // right after cfg_bb's "accepted" -> cfg->accept() connection above runs).
     connect(cfg, &QDialog::accepted, cfg, [=]() {
+    if (!returnToFile(dlg_file, cfg)) return;
     mem->save();
+    // Copies: the progress loops below run the event loop, where the tab can
+    // be closed or its pipeline edited.
+    const auto xc_pipeline = clonePipeline(activeDs().pipeline);
 
     int32_t first_trace  = static_cast<int32_t>(sp_first->value());
     int32_t num_traces   = static_cast<int32_t>(sp_count->value());
@@ -8358,7 +8452,7 @@ void MainWindow::onRunXCorr() {
         if (template_specs.empty()) {
             // sp_tmpl_first/sp_tmpl_len are pipeline-processed; convert to
             // raw, same as the "Add to list" button does.
-            const auto& pl = activeDs().pipeline;
+            const auto& pl = xc_pipeline;
             int64_t proc_first = static_cast<int64_t>(sp_tmpl_first->value());
             int64_t proc_end    = proc_first + static_cast<int64_t>(sp_tmpl_len->value());
             int64_t raw_first  = rawStartForProcessedIndex(pl, proc_first, h.num_samples);
@@ -8373,12 +8467,12 @@ void MainWindow::onRunXCorr() {
     // each is computed (and shown) one at a time, so memory isn't cumulative.
     {
         int64_t ns = num_samples_req == 0 ? (n_samples - first_sample) : num_samples_req;
-        for (const auto& t : activeDs().pipeline) ns = t->transformedCount(ns);
+        for (const auto& t : xc_pipeline) ns = t->transformedCount(ns);
         double mem_mb = 0.0;
         if (is_template) {
             for (const auto& spec : template_specs) {
                 int64_t tmpl_ns = spec.len;
-                for (const auto& t : activeDs().pipeline) tmpl_ns = t->transformedCount(tmpl_ns);
+                for (const auto& t : xc_pipeline) tmpl_ns = t->transformedCount(tmpl_ns);
                 int64_t n_lags = std::max<int64_t>(1, (ns - tmpl_ns) / std::max(1, stride) + 1);
                 double mb = static_cast<double>(num_traces) * static_cast<double>(n_lags) * 4.0
                           / (1024.0 * 1024.0);
@@ -8757,10 +8851,14 @@ void MainWindow::onRunXCorr() {
 
         auto* chk_peak_show  = new QCheckBox("Show on main plot");
         auto* lbl_peak_count = new QLabel;
+        // The plot of the file this ran on — not whichever tab is active by
+        // the time the markers change — and it may be closed first.
+        const QPointer<PlotWidget> marked_plot = plotWidget();
 
         auto updatePeaks = [=]() {
+            if (!marked_plot) return;
             if (!chk_peak_show->isChecked()) {
-                plotWidget()->clearMatchMarkers();
+                marked_plot->clearMatchMarkers();
                 lbl_peak_count->setText(QString());
                 return;
             }
@@ -8789,7 +8887,7 @@ void MainWindow::onRunXCorr() {
                     lag++;
                 }
             }
-            plotWidget()->setMatchMarkers(ranges);
+            marked_plot->setMatchMarkers(ranges);
             lbl_peak_count->setText(QString("%1 match%2 found")
                 .arg(ranges.size()).arg(ranges.size() == 1 ? "" : "es"));
         };
@@ -8798,10 +8896,12 @@ void MainWindow::onRunXCorr() {
         connect(sp_peak_thr,   QOverload<double>::of(&QDoubleSpinBox::valueChanged), dlg, [=](double) { updatePeaks(); });
         connect(chk_peak_show, &QCheckBox::toggled,                            dlg, [=](bool)   { updatePeaks(); });
 
-        // Clear this window's markers when it closes, but only if it was the
-        // one showing them — avoids stomping on another still-open result window.
-        connect(dlg, &QObject::destroyed, this, [this, chk_peak_show]() {
-            if (chk_peak_show->isChecked()) plotWidget()->clearMatchMarkers();
+        // Clear this window's markers when it is closed, but only if it was
+        // the one showing them — avoids stomping on another still-open result
+        // window. finished, not destroyed: destroyed also fires while the
+        // main window is being torn down, when no plot is safe to touch.
+        connect(dlg, &QDialog::finished, dlg, [chk_peak_show, marked_plot](int) {
+            if (marked_plot && chk_peak_show->isChecked()) marked_plot->clearMatchMarkers();
         });
 
         pl->addWidget(new QLabel("Trace:"));
@@ -8854,10 +8954,10 @@ void MainWindow::onRunXCorr() {
 
             XCorrResult result;
             bool ok = computeTemplateMatch(
-                activeDs().file.get(), spec.trace, spec.first, spec.len,
+                dlg_file.get(), spec.trace, spec.first, spec.len,
                 first_trace, num_traces,
                 first_sample, ns,
-                stride, activeDs().pipeline, use_shifts, result, progCb, err);
+                stride, xc_pipeline, use_shifts, result, progCb, err);
             prog.setValue(prog.maximum());
 
             if (!ok) {
@@ -8889,7 +8989,7 @@ void MainWindow::onRunXCorr() {
         bool ok;
         if (is_twowin) {
             // sp_r_first/sp_r_count are pipeline-processed; convert to raw.
-            const auto& pl = activeDs().pipeline;
+            const auto& pl = xc_pipeline;
             int64_t proc_ref_first = static_cast<int64_t>(sp_r_first->value());
             int64_t proc_ref_end    = proc_ref_first + static_cast<int64_t>(sp_r_count->value());
             int64_t ref_first = rawStartForProcessedIndex(pl, proc_ref_first, h.num_samples);
@@ -8897,16 +8997,16 @@ void MainWindow::onRunXCorr() {
             int64_t ref_count = std::max<int64_t>(1, ref_end - ref_first);
             int64_t ns = (num_samples_req == 0) ? (h.num_samples - first_sample) : num_samples_req;
             ok = computeTwoWindowCorr(
-                activeDs().file.get(), first_trace, num_traces,
+                dlg_file.get(), first_trace, num_traces,
                 ref_first, ref_count,
                 first_sample, ns,
-                stride, activeDs().pipeline, use_shifts, result, progCb, err);
+                stride, xc_pipeline, use_shifts, result, progCb, err);
         } else {
             ok = computeXCorr(
-                activeDs().file.get(),
+                dlg_file.get(),
                 first_trace, num_traces,
                 first_sample, num_samples_req,
-                stride, method, activeDs().pipeline, use_shifts, result, progCb, err,
+                stride, method, xc_pipeline, use_shifts, result, progCb, err,
                 mp_scale);
         }
         prog.setValue(prog.maximum());
@@ -9022,6 +9122,10 @@ void MainWindow::showSpectralLineDialog(QWidget* parent, PlotWidget* pw,
     vl->addWidget(status);
 
     auto lines = std::make_shared<std::vector<SpectralLine>>();
+    // Where this dialog's noise-floor overlay sits in its plot's trace list,
+    // so a re-detect replaces it instead of stacking another copy (-1: none).
+    // Per dialog: each FFT tab can have its own.
+    auto baseline_marker = std::make_shared<int>(-1);
 
     // A spectrum in dB and one in linear magnitude need different excess
     // arithmetic; the detector is told which it got rather than guessing.
@@ -9075,9 +9179,9 @@ void MainWindow::showSpectralLineDialog(QWidget* parent, PlotWidget* pw,
         if (chk_base->isChecked()) {
             // Trace 0 is the spectrum itself; re-adding the baseline each run
             // would stack copies, so the previous one is dropped first.
-            pw->removeTracesFrom(baseline_trace_marker_);
+            pw->removeTracesFrom(*baseline_marker);
             auto base_ptr = std::make_shared<std::vector<float>>(std::move(baseline));
-            baseline_trace_marker_ = pw->traceCount();
+            *baseline_marker = pw->traceCount();
             pw->addTrace(base_ptr, currentTheme().muted, "Noise floor");
         }
 
@@ -9160,10 +9264,10 @@ void MainWindow::showSpectralLineDialog(QWidget* parent, PlotWidget* pw,
     // Clean the overlay up on close — leaving amber markers and a stray
     // baseline trace on someone's spectrum after the dialog is gone is
     // confusing, and the markers mean nothing without the table.
-    connect(d, &QDialog::finished, d, [this, pw](int) {
+    connect(d, &QDialog::finished, d, [pw, baseline_marker](int) {
         pw->clearMatchMarkers();
-        pw->removeTracesFrom(baseline_trace_marker_);
-        baseline_trace_marker_ = -1;
+        pw->removeTracesFrom(*baseline_marker);
+        *baseline_marker = -1;
     });
 
     run();          // detect once up front with the defaults
@@ -9874,7 +9978,10 @@ void MainWindow::onRunSpectralLeakage() {
     connect(bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
     mem.restore();
-    if (cfg.exec() != QDialog::Accepted) return;
+    // A job finishing while the dialog is open can make its result tab the
+    // active one: carry on with the file the dialog was opened for.
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    if (cfg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
     mem.save();
 
     const bool use_alignment = chk_align->isChecked();
@@ -10861,6 +10968,9 @@ void MainWindow::onPatternEditor() {
     dlg->setWindowTitle("Patterns — " + activeDs().display_name);
     dlg->resize(760, 560);
     pattern_dlg_ = dlg;
+    // An alignment job can finish after this editor was closed (and another
+    // opened): its completion only rebuilds the editor it was started from.
+    const QPointer<QDialog> this_editor = dlg;
     auto* vl = new QVBoxLayout(dlg);
 
     auto* hint = new QLabel(
@@ -11414,7 +11524,7 @@ void MainWindow::onPatternEditor() {
                 if (!ok) {
                     if (*err != "Cancelled." && err->find("Cancelled.") == std::string::npos)
                         QMessageBox::critical(this, "Pattern alignment failed", QString::fromStdString(*err));
-                    if (pattern_dlg_) rebuild();
+                    if (this_editor) rebuild();
                     return;
                 }
                 tab_bar_->setCurrentIndex(j);
@@ -11441,7 +11551,7 @@ void MainWindow::onPatternEditor() {
                 }
                 refreshPatternBands(d);
                 updateStateIndicators();
-                if (pattern_dlg_) rebuild();
+                if (this_editor) rebuild();
             });
     };
     connect(btn_align, &QPushButton::clicked, dlg, [=]() {
@@ -11479,6 +11589,9 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
         QMessageBox::information(this, "Align Traces", "No file loaded.");
         return;
     }
+    // A non-modal dialog: by the time a button here is pressed another tab
+    // may be active. Its actions go back to this file first (returnToFile).
+    const std::shared_ptr<TrsFile> dlg_file = activeDs().file;
     const TrsHeader& h = activeDs().file->header();
 
     // Every range control below (reference region, search window, drag-to-
@@ -11869,6 +11982,7 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
 
     // ── Run ──────────────────────────────────────────────────────────────────
     connect(btn_run, &QPushButton::clicked, dlg, [=]() {
+        if (!returnToFile(dlg_file, dlg)) return;
         int32_t first_tr = static_cast<int32_t>(sp_tr_first->value());
         int32_t num_tr   = static_cast<int32_t>(sp_tr_count->value());
         num_tr = std::min(num_tr, h.num_traces - first_tr);
@@ -11892,7 +12006,10 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
         // sample positions/counts here, right before calling into align.cpp,
         // which — like the rest of the app — works in raw terms and applies
         // the pipeline itself.
-        const auto& pipeline_now = activeDs().pipeline;
+        // Copies: the progress loop below runs the event loop, where the tab
+        // can be closed or its pipeline edited.
+        const auto pipeline_now = clonePipeline(activeDs().pipeline);
+        const std::shared_ptr<TrsFile> file_now = activeDs().file;
         int64_t proc_ref_first = static_cast<int64_t>(sp_ref_first->value());
         int64_t proc_ref_end   = proc_ref_first + static_cast<int64_t>(sp_ref_len->value());
         int64_t ref_first = rawStartForProcessedIndex(pipeline_now, proc_ref_first, h.num_samples);
@@ -11925,18 +12042,18 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
         std::string err;
         bool ok;
         if (tile_size_val > 0) {
-            ok = runTiledAlignment(activeDs().file.get(), activeDs().pipeline,
+            ok = runTiledAlignment(file_now.get(), pipeline_now,
                                     first_tr, num_tr, ref_off, ref_count,
                                     ref_first, ref_len, shalf, tile_size_val,
                                     is_peak, use_abs, min_corr,
                                     *result_ptr, progress_fn, err);
         } else if (is_peak) {
-            ok = alignByPeak(activeDs().file.get(), activeDs().pipeline,
+            ok = alignByPeak(file_now.get(), pipeline_now,
                              first_tr, num_tr, ref_off, ref_count,
                              ref_first, ref_len, shalf, use_abs,
                              *result_ptr, progress_fn, err);
         } else {
-            ok = alignByXCorr(activeDs().file.get(), activeDs().pipeline,
+            ok = alignByXCorr(file_now.get(), pipeline_now,
                               first_tr, num_tr, ref_off, ref_count,
                               ref_first, ref_len, shalf, min_corr,
                               *result_ptr, progress_fn, err);
@@ -12053,6 +12170,7 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     };
 
     connect(btn_show, &QPushButton::clicked, dlg, [=]() {
+        if (!returnToFile(dlg_file, dlg)) return;
         if (result_ptr->shifts.empty()) return;
         int32_t tsz = *result_tile_size_ptr;
         int32_t tile_idx = tsz > 0 ? static_cast<int32_t>(sp_result_tile->value()) : 0;
@@ -12078,6 +12196,7 @@ void MainWindow::showAlignDialog(std::function<void(const ChainStep&)> onAddToCh
     });
 
     connect(btn_apply, &QPushButton::clicked, dlg, [=]() {
+        if (!returnToFile(dlg_file, dlg)) return;
         if (result_ptr->shifts.empty()) return;
         const int32_t tsz = *result_tile_size_ptr;
         // The tile applied is whatever the current result was actually
@@ -12361,7 +12480,10 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         // sample units, same convention as the Align Traces dialog (see its
         // top-of-function comment) — convert to raw using the *current*
         // pipeline, right before calling into align.cpp.
-        const auto& pipeline_now = activeDs().pipeline;
+        // Copies: the progress loop below runs the event loop, where the tab
+        // can be closed or its pipeline edited.
+        const auto pipeline_now = clonePipeline(activeDs().pipeline);
+        const std::shared_ptr<TrsFile> file_now = activeDs().file;
         int64_t ref_first = rawStartForProcessedIndex(pipeline_now, step.ref_first, h.num_samples);
         int64_t ref_end   = rawCountForProcessedCount(pipeline_now, step.ref_first + step.ref_len,
                                                        h.num_samples);
@@ -12388,17 +12510,17 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         // ran with; alignByPeak/alignByXCorr/runTiledAlignment also clamp it
         // to >= 1 themselves regardless, so it's safe to pass through as-is.
         if (step.align_tile_size > 0) {
-            ok = runTiledAlignment(activeDs().file.get(), pipeline_now, first_tr, num_tr, step.ref_offset,
+            ok = runTiledAlignment(file_now.get(), pipeline_now, first_tr, num_tr, step.ref_offset,
                                     step.ref_count, ref_first, ref_len, shalf, step.align_tile_size,
                                     step.align_method == 0, step.peak_use_abs,
                                     step.discard_enabled ? static_cast<float>(step.min_corr) : -2.0f,
                                     result, progress_fn, aerr);
         } else if (step.align_method == 0) {
-            ok = alignByPeak(activeDs().file.get(), pipeline_now, first_tr, num_tr, step.ref_offset,
+            ok = alignByPeak(file_now.get(), pipeline_now, first_tr, num_tr, step.ref_offset,
                               step.ref_count, ref_first, ref_len, shalf, step.peak_use_abs, result, progress_fn, aerr);
         } else {
             float min_corr = step.discard_enabled ? static_cast<float>(step.min_corr) : -2.0f;
-            ok = alignByXCorr(activeDs().file.get(), pipeline_now, first_tr, num_tr, step.ref_offset,
+            ok = alignByXCorr(file_now.get(), pipeline_now, first_tr, num_tr, step.ref_offset,
                                step.ref_count, ref_first, ref_len, shalf, min_corr, result, progress_fn, aerr);
         }
         if (!ok) {
@@ -12570,9 +12692,13 @@ void MainWindow::onChainEditor() {
     vl->addWidget(list, 1);
 
     auto steps = std::make_shared<std::vector<ChainStep>>();
+    // Also handed to the Align and t-test dialogs, whose "Add to Chain" can
+    // fire after this editor has been closed: the list may be gone by then.
+    const QPointer<QListWidget> list_guard = list;
     auto refreshList = [=]() {
-        list->clear();
-        for (const auto& s : *steps) list->addItem(s.summary());
+        if (!list_guard) return;
+        list_guard->clear();
+        for (const auto& s : *steps) list_guard->addItem(s.summary());
     };
 
     // ── Add Transform sub-dialog: reuses combo_transform_'s item list and
@@ -13544,7 +13670,10 @@ void MainWindow::onRunSNR() {
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
     mem.restore();
-    if (cfg.exec() != QDialog::Accepted) return;
+    // A job finishing while the dialog is open can make its result tab the
+    // active one: carry on with the file the dialog was opened for.
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    if (cfg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
     mem.save();
 
     const int32_t first    = sp_first->value();
@@ -13756,7 +13885,10 @@ void MainWindow::onRunStaticSNR() {
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::accepted, &cfg, &QDialog::accept);
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
-    if (cfg.exec() != QDialog::Accepted) return;
+    // A job finishing while the dialog is open can make its result tab the
+    // active one: carry on with the file the dialog was opened for.
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    if (cfg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
 
     const int32_t first = sp_first->value();
     const int32_t count = sp_count->value();
@@ -13908,6 +14040,9 @@ void MainWindow::onRunFFT() {
         QMessageBox::information(this, "FFT", "No file loaded.");
         return;
     }
+    // A non-modal dialog: by the time a button here is pressed another tab
+    // may be active. Its actions go back to this file first (returnToFile).
+    const std::shared_ptr<TrsFile> dlg_file = activeDs().file;
     const TrsHeader& h = activeDs().file->header();
 
     // --- Configuration dialog ---
@@ -14111,6 +14246,7 @@ void MainWindow::onRunFFT() {
     fl->addRow(cfg_bb);
     connect(cfg_bb, &QDialogButtonBox::rejected, cfg, &QDialog::reject);
     connect(cfg_bb, &QDialogButtonBox::accepted, cfg, [=]() {
+        if (!returnToFile(dlg_file, cfg)) return;
         mem->save();
         auto info = std::make_shared<FftResultInfo>();
         info->file        = activeDs().file;
@@ -14950,7 +15086,10 @@ void MainWindow::onExportDataset() {
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
     vl_cfg->addWidget(cfg_bb);
 
-    if (cfg.exec() != QDialog::Accepted) return;
+    // A job finishing while the dialog is open can make its result tab the
+    // active one: carry on with the file the dialog was opened for.
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    if (cfg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
 
     // ── Resolve parameters ────────────────────────────────────────────────
     const int32_t first   = sp_first->value();
@@ -14962,7 +15101,10 @@ void MainWindow::onExportDataset() {
         : std::min<int64_t>(s_count, h.num_samples - s_first);
 
     int64_t eff_ns = raw_ns;
-    for (const auto& t : activeDs().pipeline)
+    // Copies: the progress loop below runs the event loop, where the tab can
+    // be closed or its pipeline edited.
+    const auto ds_pipeline = clonePipeline(activeDs().pipeline);
+    for (const auto& t : ds_pipeline)
         eff_ns = t->transformedCount(eff_ns);
 
     // Memory estimate
@@ -15002,7 +15144,7 @@ void MainWindow::onExportDataset() {
 
         // Labels
         if (!labels.isEmpty()) {
-            auto data_bytes = activeDs().file->readData(src_idx);
+            auto data_bytes = run_file->readData(src_idx);
             for (int li = 0; li < labels.size(); li++)
                 label_vals[li][ti] = labels[li].compute(data_bytes);
         }
@@ -15013,12 +15155,12 @@ void MainWindow::onExportDataset() {
             int64_t src_start = std::max<int64_t>(0, s_first);
             int64_t src_end   = std::min<int64_t>(h.num_samples, s_first + raw_ns);
             int64_t dst_off   = src_start - s_first;
-            activeDs().file->readSamples(src_idx, src_start, src_end - src_start,
+            run_file->readSamples(src_idx, src_start, src_end - src_start,
                                    trace_buf.data() + dst_off);
         }
-        for (const auto& t : activeDs().pipeline) t->reset();
+        for (const auto& t : ds_pipeline) t->reset();
         int64_t n_out = raw_ns;
-        for (const auto& t : activeDs().pipeline)
+        for (const auto& t : ds_pipeline)
             n_out = t->apply(trace_buf.data(), n_out, 0);
 
         float* row = traces_flat.data() + static_cast<size_t>(ti) * static_cast<size_t>(eff_ns);

@@ -17,7 +17,9 @@ vg=(valgrind --tool=memcheck --error-exitcode=99 --leak-check=full
     --track-origins=yes --suppressions="$root/tools/valgrind.supp" -q)
 logs="build-tests/valgrind"
 mkdir -p "$logs"
-export OMP_NUM_THREADS=4 QT_QPA_PLATFORM=offscreen TRS_NO_CRASH_HANDLER=1
+# valgrind runs one thread at a time: OpenMP threads spinning at a barrier
+# would take turns burning their whole time slice (minutes instead of seconds).
+export OMP_NUM_THREADS=4 OMP_WAIT_POLICY=passive QT_QPA_PLATFORM=offscreen TRS_NO_CRASH_HANDLER=1
 fail=0
 for t in build-tests/tests/test_*; do
     [ -x "$t" ] && [ -f "$t" ] || continue

@@ -257,10 +257,6 @@ private:
                                  std::shared_ptr<std::vector<float>> spec,
                                  bool spec_is_db, int64_t fft_in_n, double fs_hz);
 
-    // Where showSpectralLineDialog()'s noise-floor overlay sits in the FFT
-    // plot's trace list, so a re-detect replaces it instead of stacking
-    // another copy. -1 = nothing overlaid.
-    int baseline_trace_marker_ = -1;
 
     // An FFT Spectrum result, kept by its tab for the tools on its toolbar.
     struct FftResultInfo {
@@ -335,7 +331,7 @@ private:
     // warming actually takes a while (small files finish before the dialog's
     // minimum duration elapses) — cancelling just stops early, the file is
     // already fully usable via on-demand page faults either way.
-    void prefetchWithProgress(TrsFile* file, const QString& label);
+    void prefetchWithProgress(std::shared_ptr<TrsFile> file, const QString& label);
 
     // Opens a new tab holding a derived, pre-computed 1-D result (t-test/
     // SNR/... curve) — same mechanism as opening another trace file, just
@@ -355,6 +351,12 @@ private:
     // — does not touch any plot's content) so state-changing signals from a
     // tiled, non-selected panel land on the right dataset.
     void activateDatasetForWidget(PlotWidget* pw);
+    // After a modal dialog or a nested event loop, during which a job's result
+    // tab may have become the active one or tabs been closed: makes the tab of
+    // `file` active again so activeDs() is the dataset the dialog was set up
+    // for. False, after telling the user, if that file's tab has been closed.
+    // A null file (an action on a result tab) needs nothing and returns true.
+    bool returnToFile(const std::shared_ptr<TrsFile>& file, QWidget* parent);
 
     // Re-applies the *current* pipeline to a tab's stored alignment (shifts +
     // window) and redraws it. Called whenever the pipeline changes on a tab
@@ -498,8 +500,11 @@ private:
     struct JobRow { QWidget* row; QProgressBar* bar; QLabel* label; };
     std::map<int, JobRow> job_rows_;
 
-    // Multi-dataset state
-    std::vector<Dataset> datasets_;
+    // Multi-dataset state. A deque: adding a tab (a job's result can arrive
+    // inside any dialog's event loop) never moves the others, so a Dataset&
+    // or its pipeline held across a dialog stays valid; it also saves copying
+    // every dataset, undo stack and all, whenever a vector would regrow.
+    std::deque<Dataset>  datasets_;
     int                  active_idx_ = -1;
     bool                 tiled_      = false;
 
