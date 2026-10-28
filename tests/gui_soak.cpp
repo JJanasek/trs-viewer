@@ -424,6 +424,37 @@ struct GuiTestAccess {
         drv.step([]() { QApplication::processEvents(); return true; });
     }
 
+    // Export as NPZ through the dialogs, then open the archive as traces.
+    void scenarioExportNpz() {
+        const QString out = QFileInfo(file).dir().filePath("export.npz");
+        drv.then([out]() { QFile::remove(out); });   // no "replace it?" question
+        drv.onDialog("Export as NPZ — configuration", [](QDialog* d) { return clickOk(d); });
+        drv.onDialog("Export traces as NPZ", [out](QDialog* d) {
+            auto* fd = qobject_cast<QFileDialog*>(d);
+            if (!fd) return false;
+            if (auto* name = fd->findChild<QLineEdit*>("fileNameEdit")) name->setText(out);
+            QMetaObject::invokeMethod(fd, "accept", Qt::QueuedConnection);
+            return true;
+        });
+        drv.onDialog("Exported", [](QDialog* d) { return clickOk(d); });
+        useFileTab();
+        drv.then([this]() { w.onExportNpz(); });
+        drv.step([this]() { return drv.dialogsAnswered(); });
+        drv.then([this, out]() {
+            const int before = tabs();
+            w.openNpyTraces(out);
+            if (tabs() != before + 1) { drv.fail("the exported .npz did not open"); return; }
+            const TrsHeader& h = w.datasets_.back().file->header();
+            if (h.num_traces != 400 || h.num_samples != 4000)
+                drv.fail(QString("re-opened .npz has %1 × %2").arg(h.num_traces).arg(h.num_samples));
+            const float a = w.datasets_.back().file->readSample(7, 1234);
+            const float b = w.datasets_[0].file->readSample(7, 1234);
+            if (a != b) drv.fail(QString("sample differs after the round trip: %1 vs %2").arg(a).arg(b));
+            w.closeDatasetAt(tabs() - 1);
+        });
+        drv.step([]() { QApplication::processEvents(); return true; });
+    }
+
     void scenarioSnapshots() {
         useFileTab();
         drv.then([this]() {
@@ -542,6 +573,10 @@ int main(int argc, char** argv) {
     }
 
     QTemporaryDir dir;
+    if (qEnvironmentVariableIsSet("SOAK_KEEP_DIR")) {   // to look at the files afterwards
+        dir.setAutoRemove(false);
+        std::fprintf(stderr, "test files kept in %s\n", qPrintable(dir.path()));
+    }
     const QString file = dir.filePath("soak.trs");
     writeTrs(file, 400, 4000, 1);
     writeTrs(dir.filePath("soak_part000.trs"), 100, 4000, 2);
@@ -574,6 +609,7 @@ int main(int argc, char** argv) {
             else if (scenario == "cpa")          t.scenarioCpa();
             else if (scenario == "cpa_top_curves") t.scenarioCpaTopCurves();
             else if (scenario == "plot_whole_trace") t.scenarioPlotWholeTrace();
+            else if (scenario == "export_npz")   t.scenarioExportNpz();
             else if (scenario == "snapshots")    t.scenarioSnapshots();
             else if (scenario == "combined")     t.scenarioCombined();
             else if (scenario == "quit_dialogs") { t.scenarioQuitDialogs(); loops = 1; break; }

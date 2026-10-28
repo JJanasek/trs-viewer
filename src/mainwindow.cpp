@@ -2749,7 +2749,11 @@ static bool exportTracesToTrs(
     const bool whole_trace = pipelineRequiresWholeTrace(pipeline);
     const int64_t CHUNK = whole_trace ? std::max<int64_t>(1, n_samples)
                                       : 256 * 1024;
-    std::vector<float> buf(static_cast<size_t>(CHUNK));
+    // The pipeline works in place and a stage can put out more than it gets
+    // (STFT): room for the longest intermediate length, not just the read.
+    int64_t buf_len = CHUNK, stage_len = CHUNK;
+    for (const auto& t : pipeline) buf_len = std::max(buf_len, stage_len = t->transformedCount(stage_len));
+    std::vector<float> buf(static_cast<size_t>(buf_len));
     int64_t clipped = 0;
 
     for (int32_t ki = 0; ki < n_traces; ki++) {
@@ -3370,22 +3374,36 @@ static bool saveNpz(const QString& path,
                      const std::vector<std::pair<std::string, std::vector<uint8_t>>>& entries,
                      QString& err)
 {
-    std::vector<uint8_t> buf;
-    buf.reserve(1 << 20);
+    // Plain ZIP (no ZIP64): sizes and offsets are 32-bit, so the archive must
+    // stay under 4 GiB — past that it would be silently corrupt.
+    uint64_t total = 22;
+    for (const auto& [name, data] : entries) total += 30 + 46 + 2 * name.size() + data.size();
+    if (total >= 0xFFFFFFFFull || entries.size() > 0xFFFF) {
+        err = QString("The archive would be %1 GB; .npz files written here hold at most 4 GB. "
+                      "Export as .npy instead, or fewer traces or samples.")
+                  .arg(static_cast<double>(total) / (1024.0 * 1024 * 1024), 0, 'f', 1);
+        return false;
+    }
+
+    FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
+    if (!fp) { err = "Cannot create: " + path; return false; }
 
     struct CDEntry {
         std::string name;
         uint32_t crc, size, offset;
     };
     std::vector<CDEntry> cd;
+    std::vector<uint8_t> buf;   // one header at a time; the data goes straight to the file
+    uint32_t off = 0;
+    bool ok = true;
 
     for (const auto& [name, data] : entries) {
         uint32_t crc  = zip_crc32(data.data(), data.size());
         uint32_t sz   = static_cast<uint32_t>(data.size());
-        uint32_t off  = static_cast<uint32_t>(buf.size());
         cd.push_back({name, crc, sz, off});
 
         // Local file header
+        buf.clear();
         zip_write_u32(buf, 0x04034b50u); // signature
         zip_write_u16(buf, 20);          // version needed: 2.0
         zip_write_u16(buf, 0);           // flags
@@ -3398,11 +3416,13 @@ static bool saveNpz(const QString& path,
         zip_write_u16(buf, static_cast<uint16_t>(name.size()));
         zip_write_u16(buf, 0);           // extra field length
         buf.insert(buf.end(), name.begin(), name.end());
-        buf.insert(buf.end(), data.begin(), data.end());
+        ok = ok && std::fwrite(buf.data(), 1, buf.size(), fp) == buf.size()
+                && std::fwrite(data.data(), 1, data.size(), fp) == data.size();
+        off += static_cast<uint32_t>(buf.size() + data.size());
     }
 
-    uint32_t cd_offset = static_cast<uint32_t>(buf.size());
-
+    const uint32_t cd_offset = off;
+    buf.clear();
     for (const auto& e : cd) {
         zip_write_u32(buf, 0x02014b50u); // central dir signature
         zip_write_u16(buf, 20);          // version made by
@@ -3421,8 +3441,8 @@ static bool saveNpz(const QString& path,
         buf.insert(buf.end(), e.name.begin(), e.name.end());
     }
 
-    uint32_t cd_size = static_cast<uint32_t>(buf.size()) - cd_offset;
-    uint16_t n_entries = static_cast<uint16_t>(cd.size());
+    const uint32_t cd_size = static_cast<uint32_t>(buf.size());
+    const uint16_t n_entries = static_cast<uint16_t>(cd.size());
 
     // End of central directory
     zip_write_u32(buf, 0x06054b50u);
@@ -3432,10 +3452,13 @@ static bool saveNpz(const QString& path,
     zip_write_u32(buf, cd_offset);
     zip_write_u16(buf, 0);  // comment length
 
-    FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
-    if (!fp) { err = "Cannot create: " + path; return false; }
-    std::fwrite(buf.data(), 1, buf.size(), fp);
-    std::fclose(fp);
+    ok = ok && std::fwrite(buf.data(), 1, buf.size(), fp) == buf.size();
+    ok = (std::fclose(fp) == 0) && ok;
+    if (!ok) {
+        QFile::remove(path);
+        err = "Writing " + path + " failed (disk full?).";
+        return false;
+    }
     return true;
 }
 
@@ -5600,11 +5623,10 @@ void MainWindow::onExportNpz() {
     }
 
     {
-        // The archive is built in memory: the traces, their .npy bytes and
-        // the archive holding them.
+        // The traces, and their .npy bytes written into the archive.
         int64_t eff = window_len > 0 ? window_len : h.num_samples;
         for (const auto& t : activeDs().pipeline) eff = t->transformedCount(eff);
-        if (!confirmMemory(this, 3 * static_cast<int64_t>(count) * eff * 4, "The export"))
+        if (!confirmMemory(this, 2 * static_cast<int64_t>(count) * eff * 4, "The export"))
             return;
     }
 
@@ -12661,24 +12683,31 @@ bool MainWindow::runChainStep(const ChainStep& step, QWidget* msg_parent, QStrin
         // alignment's own starting trace either.
         const int32_t shifts_first_trace = activeDs().align_first_trace;
         int32_t n_written = 0;
+        // Progress, so a long export doesn't freeze the window — and since
+        // that runs the event loop, the file and pipeline as they are now.
+        const std::shared_ptr<TrsFile> exp_file = activeDs().file;
+        const auto exp_pipeline = clonePipeline(activeDs().pipeline);
+        QProgressDialog prog("Chain: exporting traces…", "Cancel", 0, step.exp_count, msg_parent);
+        prog.setWindowModality(Qt::WindowModal);
+        prog.setMinimumDuration(400);
         bool ok;
         switch (step.export_format) {
         case 0:
-            ok = exportTracesToTrs(path, activeDs().file.get(), step.exp_first, step.exp_count,
-                                    shifts, shifts_first_trace, activeDs().pipeline, nullptr, err,
+            ok = exportTracesToTrs(path, exp_file.get(), step.exp_first, step.exp_count,
+                                    shifts, shifts_first_trace, exp_pipeline, &prog, err,
                                     &n_written, base_sample, window_len, read_lo, read_hi);
             // exportTracesToTrs repurposes a non-empty err as a non-fatal
             // clipped-sample-count note on success, not a failure.
             if (ok) err.clear();
             break;
         case 1:
-            ok = exportTracesToNpy(path, activeDs().file.get(), step.exp_first, step.exp_count,
-                                    shifts, shifts_first_trace, activeDs().pipeline, msg_parent,
-                                    nullptr, err, &n_written, base_sample, window_len, read_lo, read_hi);
+            ok = exportTracesToNpy(path, exp_file.get(), step.exp_first, step.exp_count,
+                                    shifts, shifts_first_trace, exp_pipeline, msg_parent,
+                                    &prog, err, &n_written, base_sample, window_len, read_lo, read_hi);
             break;
         default:
-            ok = exportTracesToNpz(path, activeDs().file.get(), step.exp_first, step.exp_count,
-                                    shifts, shifts_first_trace, activeDs().pipeline, nullptr, err,
+            ok = exportTracesToNpz(path, exp_file.get(), step.exp_first, step.exp_count,
+                                    shifts, shifts_first_trace, exp_pipeline, &prog, err,
                                     &n_written, base_sample, window_len, read_lo, read_hi);
             break;
         }
@@ -15267,8 +15296,8 @@ void MainWindow::onExportDataset() {
         eff_ns = t->transformedCount(eff_ns);
 
     // Memory estimate
-    // The trace matrix, its .npy bytes and the archive holding them.
-    const int64_t mem_est = 3 * static_cast<int64_t>(count) * eff_ns * static_cast<int64_t>(sizeof(float));
+    // The trace matrix, and its .npy bytes written into the archive.
+    const int64_t mem_est = 2 * static_cast<int64_t>(count) * eff_ns * static_cast<int64_t>(sizeof(float));
     if (!confirmMemory(this, mem_est, "The export"))
         return;
 
