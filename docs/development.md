@@ -100,7 +100,7 @@ Three scripts in `tools/` run the tests under the memory tools:
 | Script | Tool | Finds |
 |---|---|---|
 | `tools/run_asan.sh` | AddressSanitizer, LeakSanitizer, UBSan (`-DTRS_SANITIZE=address,undefined`, in `build-asan/`) | use after free, out-of-bounds access, leaks, undefined behaviour; every test and soak scenario |
-| `tools/run_valgrind.sh [--soak <scenario>]` | valgrind memcheck | the same plus reads of uninitialised memory; no special build, but slow |
+| `tools/run_valgrind.sh [--soak <scenario>\|all]` | valgrind memcheck | the same plus reads of uninitialised memory; no special build, but slow (`--soak all`: about 30 minutes) |
 | `tools/run_heaptrack.sh <scenario> <loops>` | heaptrack | what is still allocated at exit, and memory that grows with the number of loops |
 
 Suppressions go in `tools/lsan.supp`, `tools/valgrind.supp` and

@@ -13,17 +13,22 @@ root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$root"
 cmake --build build-tests -j"$(nproc)" > /dev/null
 
-vg=(valgrind --tool=memcheck --error-exitcode=99 --leak-check=full
+vg=(valgrind --tool=memcheck --fair-sched=yes --error-exitcode=99 --leak-check=full
     --errors-for-leak-kinds=definite --show-leak-kinds=definite
     --track-origins=yes --suppressions="$root/tools/valgrind.supp" -q)
 logs="build-tests/valgrind"
 mkdir -p "$logs"
-# valgrind runs one thread at a time: OpenMP threads spinning at a barrier
-# would take turns burning their whole time slice (minutes instead of seconds).
+# valgrind runs one thread at a time, and its default lock hands the CPU from
+# thread to thread so unevenly that an OpenMP loop takes minutes instead of
+# seconds; --fair-sched=yes (above) and passive waiting at barriers fix that.
 export OMP_NUM_THREADS=4 OMP_WAIT_POLICY=passive QT_QPA_PLATFORM=offscreen TRS_NO_CRASH_HANDLER=1
 # Python's own allocator pools memory in ways memcheck misreads; with plain
 # malloc every Python allocation is visible (CPython's advice for valgrind).
 export PYTHONMALLOC=malloc
+# QRegularExpression's JIT (PCRE2) reads 16 bytes at a time past the end of a
+# string; memcheck reports every match as an invalid read. Qt turns it off
+# only in its own debug builds.
+export QT_ENABLE_REGEXP_JIT=0
 fail=0
 for t in build-tests/tests/test_*; do
     [ -x "$t" ] && [ -f "$t" ] || continue

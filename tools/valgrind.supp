@@ -1,1 +1,14 @@
 # valgrind memcheck suppressions (tools/run_valgrind.sh). Each entry says why.
+
+# NumPy's import_array() imports numpy through the import machinery, which
+# stats files and keeps the times as Python floats that Py_FinalizeEx never
+# frees (extension modules can't be unloaded). Only leaks made while a module
+# is imported match; ones from calling the leakage model don't.
+{
+   python-import-leftovers
+   Memcheck:Leak
+   match-leak-kinds: definite
+   fun:malloc
+   ...
+   fun:PyImport_Import
+}
