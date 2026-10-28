@@ -88,6 +88,25 @@ Result windows (t-test, SNR, FFT, loaded NPY) carry their own smaller toolbar: *
 2. Reorder with **↑ / ↓**, remove with **Remove**.
 3. Applied live on every render and on all SCA computations.
 
+Some steps need a whole trace in one piece: Spectral Excise, FFT and STFT
+Magnitude, zero-phase filters, Periodic Subtract and Complex Demodulate. The
+plot applies them only when the view holds at most 4M samples. Zoomed out
+further, the traces are drawn without them and a note on the plot names the
+steps left out. Analyses always apply the whole pipeline.
+
+## Memory
+
+Before a large analysis or export, trs-viewer compares what it will need
+with the memory free at that moment:
+
+- below half of the free memory it just runs;
+- up to 90 % it asks first;
+- above that it refuses and says what needs less: a narrower sample range,
+  fewer traces, or a **Window Resample** step in the pipeline.
+
+Running out of memory would close the whole program, along with the work in
+every other tab.
+
 
 ## Exporting
 

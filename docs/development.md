@@ -78,14 +78,20 @@ generates itself. Each scenario loops:
 | `cpa` | CPA with a Python leakage model |
 | `snapshots` | 70 view changes past the undo limit, then undo |
 | `combined` | opens and closes a `.trslist` |
+| `cpa_top_curves` | CPA with less memory (pretended) than every curve needs: keeps the 10 strongest |
+| `plot_whole_trace` | a 10M-sample trace with Spectral Excise: left out zoomed out, applied zoomed in |
+| `export_npz` | exports as NPZ through the dialogs and opens it again |
 | `quit_dialogs` | quits with non-modal dialogs still open |
+| `crash_*` | recipes that once crashed: quitting with a Template Match window open, a job finishing during a modal dialog, closing the tab while drawing, Run in a dialog after switching tabs |
 
 ```bash
 QT_QPA_PLATFORM=offscreen build-tests/tests/gui_soak --scenario fft --loops 10
 ```
 
 A scenario fails on a crash, an unexpected message box, a timeout, or memory
-that keeps growing after the first loop.
+that keeps growing after the first loop. `SOAK_KEEP_DIR=1` keeps the generated files for a
+look afterwards, and `TRS_MEMORY_AVAILABLE_MB` makes the app believe that
+much memory is free.
 
 ### Memory checks
 
