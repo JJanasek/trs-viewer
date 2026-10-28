@@ -76,7 +76,18 @@ struct TraceCache {
     // Data range (no padding), used by computeYRange
     float ymin = 0;
     float ymax = 0;
+
+    // Pipeline steps left out because the view was too long for them
+    // (kWholeTraceViewLimit); named in a note on the plot.
+    QString skipped;
 };
+
+// Pipeline steps that need a whole trace in one call (Spectral Excise, FFT,
+// zero-phase filters, ...) are applied to the view only when it holds at
+// most this many samples, in one piece; zoomed out further the traces are
+// drawn without them, with a note. Applying them to a 62.5M-sample view on
+// every repaint froze the window.
+constexpr int64_t kWholeTraceViewLimit = 4'000'000;
 
 // ---------------------------------------------------------------------------
 // Trace entry

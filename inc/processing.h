@@ -49,10 +49,11 @@ public:
     // are not: split the trace and each piece gets its own reverse pass, its
     // own spectrum, its own interference estimate, and the seams show.
     //
-    // Callers that chunk (the TRS export writer is the only one today — the
-    // plot and every analysis already apply the pipeline to a whole window in
-    // a single call) must feed the whole trace at once when any stage says
-    // true. See pipelineRequiresWholeTrace() below.
+    // Callers that chunk must feed the whole trace (or window) at once when any
+    // stage says true: the TRS export writer, the dcor test and CPA (their
+    // sample blocks), and the plot, which applies such stages only when the
+    // view is small enough to process in one piece (kWholeTraceViewLimit in
+    // plot_widget.h). See pipelineRequiresWholeTrace() below.
     virtual bool requiresWholeTrace() const { return false; }
 
     // Number of leading output samples that are part of a startup transient
@@ -290,6 +291,8 @@ public:
     }
     void reset() override {}
     bool requiresSequential() const override { return true; }
+    // One spectrum of whatever it is handed: pieces give pieces' spectra.
+    bool requiresWholeTrace() const override { return true; }
 
     void   setWindow(Window w) { window_ = w; }
     Window window()      const { return window_; }
@@ -459,6 +462,9 @@ public:
         int64_t num_windows = (input_count - window_size_) / hop_size_ + 1;
         return num_windows * (window_size_ / 2 + 1);
     }
+    // Its frames are laid out from the first sample it is handed: pieces
+    // would each restart the frame grid.
+    bool requiresWholeTrace() const override { return true; }
 
     void reset() override {}
     bool requiresSequential() const override { return true; }

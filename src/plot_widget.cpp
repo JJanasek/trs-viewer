@@ -640,11 +640,26 @@ void PlotWidget::buildTraceCache(TraceEntry& te, int W)
     te.cache.ymin       =  std::numeric_limits<float>::max();
     te.cache.ymax       =  std::numeric_limits<float>::lowest();
 
-    for (auto& t : te.transforms) t->reset();
+    // The steps applied to this view: all of them, unless it is too long for
+    // the ones that need whole traces (see kWholeTraceViewLimit).
+    std::vector<ITransform*> steps;
+    bool whole = false;
+    QStringList skipped;
+    for (auto& t : te.transforms) {
+        if (t->requiresWholeTrace() && view_len > kWholeTraceViewLimit) {
+            skipped << QString::fromStdString(t->name());
+            continue;
+        }
+        whole = whole || t->requiresWholeTrace();
+        steps.push_back(t.get());
+    }
+    te.cache.skipped = skipped.join(", ");
+
+    for (auto* t : steps) t->reset();
 
     // Expected output sample count after the full pipeline.
     int64_t expected_out = view_len;
-    for (const auto& t : te.transforms)
+    for (const auto* t : steps)
         expected_out = t->transformedCount(expected_out);
 
     // ------------------------------------------------------------------
@@ -662,9 +677,11 @@ void PlotWidget::buildTraceCache(TraceEntry& te, int W)
                                              te.cache.samples.data());
         if (raw_read <= 0) { te.cache.valid = false; return; }
         int64_t out_count = raw_read;
-        for (auto& t : te.transforms)
+        for (auto* t : steps)
             out_count = t->apply(te.cache.samples.data(), out_count, view_start_);
         te.cache.samples.resize(static_cast<size_t>(std::max(INT64_C(0), out_count)));
+        // The read needed the whole view; what is drawn is at most W samples.
+        te.cache.samples.shrink_to_fit();
         te.cache.raw_read = raw_read;
 
         for (float v : te.cache.samples) {
@@ -685,29 +702,33 @@ void PlotWidget::buildTraceCache(TraceEntry& te, int W)
     te.cache.pix_min.assign(static_cast<size_t>(W),  std::numeric_limits<float>::max());
     te.cache.pix_max.assign(static_cast<size_t>(W),  std::numeric_limits<float>::lowest());
 
+    // A step that needs the whole trace gets the whole view in one piece (it
+    // is at most kWholeTraceViewLimit samples, or the step was left out).
+    const int64_t chunk = whole ? view_len : RENDER_CHUNK;
+
     // Pre-compute the maximum buffer size needed for any chunk after transforms.
     // Expanding transforms (e.g. STFT) can produce more output than input.
-    int64_t max_chunk_out = RENDER_CHUNK;
-    for (const auto& t : te.transforms)
+    int64_t max_chunk_out = chunk;
+    for (const auto* t : steps)
         max_chunk_out = t->transformedCount(max_chunk_out);
-    const size_t buf_capacity = static_cast<size_t>(std::max(RENDER_CHUNK, max_chunk_out));
+    const size_t buf_capacity = static_cast<size_t>(std::max(chunk, max_chunk_out));
 
     std::vector<float> buf;
     buf.reserve(buf_capacity);
 
     int64_t chunk_start = view_start_;
     while (chunk_start < view_end_) {
-        int64_t chunk_end = std::min(chunk_start + RENDER_CHUNK, view_end_);
+        int64_t chunk_end = std::min(chunk_start + chunk, view_end_);
         int64_t chunk_len = chunk_end - chunk_start;
         // Size for both input read and worst-case transformed output.
         int64_t chunk_out = chunk_len;
-        for (const auto& t : te.transforms)
+        for (const auto* t : steps)
             chunk_out = t->transformedCount(chunk_out);
         buf.resize(static_cast<size_t>(std::max(chunk_len, chunk_out)));
         int64_t raw_read  = readTraceSamples(te, chunk_start, chunk_len, buf.data());
         if (raw_read <= 0) break;
         int64_t out_count = raw_read;
-        for (auto& t : te.transforms)
+        for (auto* t : steps)
             out_count = t->apply(buf.data(), out_count, chunk_start);
 
         for (int64_t i = 0; i < out_count; i++) {
@@ -1155,6 +1176,28 @@ void PlotWidget::paintEvent(QPaintEvent*) {
     // Border
     p.setPen(theme_.border);
     p.drawRect(pr);
+
+    // Steps left out at this zoom (kWholeTraceViewLimit): say so, or the
+    // traces look as if the pipeline did nothing.
+    {
+        QString skipped;
+        for (const auto& te : traces_)
+            if (te.visible && te.cache.valid && !te.cache.skipped.isEmpty()) { skipped = te.cache.skipped; break; }
+        if (!skipped.isEmpty()) {
+            QFont nf = font(); nf.setPointSize(9); p.setFont(nf);
+            const QString note = QString("%1 not applied at this zoom — zoom in to %2M samples or fewer")
+                                     .arg(skipped).arg(kWholeTraceViewLimit / 1'000'000);
+            const QRect box = p.fontMetrics().boundingRect(note).adjusted(-6, -3, 6, 3)
+                                  .translated(pr.left() + 8 - p.fontMetrics().boundingRect(note).left(),
+                                              pr.top() + 22 - p.fontMetrics().boundingRect(note).top());
+            QColor bg = theme_.bg_plot;
+            bg.setAlpha(220);
+            p.fillRect(box, bg);
+            p.setPen(theme_.axis_text);
+            p.drawRect(box);
+            p.drawText(box, Qt::AlignCenter, note);
+        }
+    }
 
     // Axis name labels
     if (!axis_label_x_.isEmpty() || !axis_label_y_.isEmpty()) {

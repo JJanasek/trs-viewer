@@ -229,7 +229,7 @@ bool selectItem(QWidget* d, const QString& item) {
 struct GuiTestAccess {
     MainWindow& w;
     Driver&     drv;
-    QString     file, list;
+    QString     file, list, long_file;
 
     bool jobsIdle() const { return w.jobs_->activeCount() == 0; }
     int  tabs() const { return static_cast<int>(w.datasets_.size()); }
@@ -390,6 +390,40 @@ struct GuiTestAccess {
         drv.then([]() { qunsetenv("TRS_MEMORY_AVAILABLE_MB"); });
     }
 
+    // A long trace with a step that needs whole traces (Spectral Excise):
+    // zoomed out it is left out, quickly and with a note, instead of being
+    // run over the whole view on every repaint; zoomed in it is applied.
+    void scenarioPlotWholeTrace() {
+        drv.then([this]() {
+            w.openFile(long_file);
+            w.addTransformToPipeline(std::make_shared<SpectralExciseTransform>(
+                std::vector<SpectralBand>{SpectralBand{0.5, 0.01}}));
+        });
+        drv.then([this]() {
+            PlotWidget* pw = w.plotWidget();
+            pw->setViewRange(1, pw->totalSamples());   // a view not cached yet: a real rebuild
+            QElapsedTimer t;
+            t.start();
+            pw->grab();   // paints, building the trace caches
+            const qint64 ms = t.elapsed();
+            const QString skipped = pw->traces_.empty() ? QString() : pw->traces_[0].cache.skipped;
+            std::fprintf(stderr, "  zoomed out (%lld samples): %lld ms, left out: '%s'\n",
+                         static_cast<long long>(pw->viewEnd() - pw->viewStart()), static_cast<long long>(ms),
+                         qPrintable(skipped));
+            if (skipped.isEmpty()) drv.fail("the whole-trace step was not left out at full zoom");
+            if (ms > 3000) drv.fail(QString("drawing the long view took %1 ms").arg(ms));
+
+            pw->setViewRange(0, 1'000'000);
+            t.restart();
+            pw->grab();
+            std::fprintf(stderr, "  zoomed in (1M samples): %lld ms, left out: '%s'\n",
+                         static_cast<long long>(t.elapsed()), qPrintable(pw->traces_[0].cache.skipped));
+            if (!pw->traces_[0].cache.skipped.isEmpty()) drv.fail("the step was left out zoomed in");
+        });
+        drv.then([this]() { w.closeDatasetAt(tabs() - 1); });
+        drv.step([]() { QApplication::processEvents(); return true; });
+    }
+
     void scenarioSnapshots() {
         useFileTab();
         drv.then([this]() {
@@ -524,7 +558,12 @@ int main(int argc, char** argv) {
     {
         MainWindow win;
         win.show();
-        GuiTestAccess t{win, drv, file, list};
+        QString long_file;
+        if (scenario == "plot_whole_trace") {
+            long_file = dir.filePath("long.trs");
+            writeTrs(long_file, 2, 10'000'000, 4);
+        }
+        GuiTestAccess t{win, drv, file, list, long_file};
         double rss_first = 0, rss_last = 0;
 
         t.openTestFile();
@@ -534,6 +573,7 @@ int main(int argc, char** argv) {
             else if (scenario == "fft")          t.scenarioFft();
             else if (scenario == "cpa")          t.scenarioCpa();
             else if (scenario == "cpa_top_curves") t.scenarioCpaTopCurves();
+            else if (scenario == "plot_whole_trace") t.scenarioPlotWholeTrace();
             else if (scenario == "snapshots")    t.scenarioSnapshots();
             else if (scenario == "combined")     t.scenarioCombined();
             else if (scenario == "quit_dialogs") { t.scenarioQuitDialogs(); loops = 1; break; }
