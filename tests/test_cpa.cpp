@@ -3,6 +3,7 @@
 #include "cpa.h"
 #include "trs_file.h"
 #include "processing.h"
+#include "ttest_run.h"   // kTTestMaxThreads
 
 #include <cmath>
 #include <memory>
@@ -328,4 +329,118 @@ TEST(ComputeCpa, DiscardedTraceExcludedFromStats) {
     ASSERT_EQ(res.corr.size(), ref.corr.size());
     for (size_t i = 0; i < res.corr.size(); ++i)
         EXPECT_NEAR(res.corr[i], ref.corr[i], 1e-5f) << "at index " << i;
+}
+
+// ---------------------------------------------------------------------------
+// correlateCpa: blocks, peaks and the strongest curves only
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Noise everywhere, HW leakage at two samples (one strong, one weaker), so
+// curves differ from hypothesis to hypothesis at many samples.
+void buildNoisyDataset(TrsFile& file, std::vector<float>& samples, std::vector<uint8_t>& data,
+                       int nt, int ns, uint8_t key) {
+    samples.assign(static_cast<size_t>(nt) * ns, 0.0f);
+    data.assign(static_cast<size_t>(nt), 0);
+    uint32_t x = 12345;
+    auto rnd = [&]() { x = x * 1664525u + 1013904223u; return static_cast<float>(x >> 8) / 16777216.0f - 0.5f; };
+    for (int t = 0; t < nt; ++t) {
+        const uint8_t p = static_cast<uint8_t>((t * 73 + 5) & 0xFF);
+        data[static_cast<size_t>(t)] = p;
+        const float hw = static_cast<float>(hammingWeight(static_cast<uint8_t>(key ^ p)));
+        for (int s = 0; s < ns; ++s) samples[static_cast<size_t>(t) * ns + s] = 3.0f * rnd() + 100.0f;
+        samples[static_cast<size_t>(t) * ns + ns / 3]     += 2.0f * hw;
+        samples[static_cast<size_t>(t) * ns + 2 * ns / 3] += 0.7f * hw;
+    }
+    file.openFromArray(samples.data(), nt, ns, "noisy", data.data(), 1);
+}
+
+std::vector<float> leakagesFor(TrsFile& file, const std::vector<int32_t>& traces, int m) {
+    std::vector<float> l;
+    std::string err;
+    EXPECT_TRUE(evaluateCpaLeakages(&file, 0, traces, m, hwLeakage, l, nullptr, err)) << err;
+    return l;
+}
+
+}  // namespace
+
+TEST(CorrelateCpa, ManySmallBlocksMatchOneBlock) {
+    const int NT = 300, NS = 1000, M = 32;
+    TrsFile file; std::vector<float> s; std::vector<uint8_t> d;
+    buildNoisyDataset(file, s, d, NT, NS, 0x2C);
+    const auto traces = cpaTraces(NT, {});
+    const auto l = leakagesFor(file, traces, M);
+    for (const auto& pipeline : {std::vector<std::shared_ptr<ITransform>>{},
+                                 std::vector<std::shared_ptr<ITransform>>{std::make_shared<MovingAverageTransform>(8)}}) {
+        CpaResult one, many;
+        std::string err;
+        ASSERT_TRUE(correlateCpa(&file, 0, traces, 0, 0, {}, pipeline, l, M, M, one, nullptr, err)) << err;
+        // About 60 samples per block: 17 blocks, each with its own margin.
+        ASSERT_TRUE(correlateCpa(&file, 0, traces, 0, 0, {}, pipeline, l, M, M, many, nullptr, err,
+                                 60 * (4 * (NT + M) + 16 + 4 * kTTestMaxThreads))) << err;
+        ASSERT_EQ(one.corr.size(), many.corr.size());
+        for (size_t i = 0; i < one.corr.size(); ++i)
+            ASSERT_NEAR(one.corr[i], many.corr[i], 2e-5f) << "at " << i << " with " << pipeline.size() << " stages";
+    }
+}
+
+TEST(CorrelateCpa, PeaksAreEachCurvesLargestMagnitude) {
+    const int NT = 300, NS = 400, M = 64;
+    TrsFile file; std::vector<float> s; std::vector<uint8_t> d;
+    buildNoisyDataset(file, s, d, NT, NS, 0x31);
+    const auto traces = cpaTraces(NT, {});
+    CpaResult r;
+    std::string err;
+    ASSERT_TRUE(correlateCpa(&file, 0, traces, 0, 0, {}, {}, leakagesFor(file, traces, M), M, M, r, nullptr, err));
+    ASSERT_TRUE(r.allCurves());
+    for (int h = 0; h < M; ++h) {
+        const float* row = r.corr.data() + static_cast<size_t>(h) * NS;
+        const int best = static_cast<int>(std::max_element(row, row + NS, [](float a, float b) {
+                             return std::abs(a) < std::abs(b); }) - row);
+        EXPECT_EQ(r.peak_sample[static_cast<size_t>(h)], best) << "h" << h;
+        EXPECT_FLOAT_EQ(r.peak_r[static_cast<size_t>(h)], row[best]) << "h" << h;
+    }
+    EXPECT_EQ(r.peak_sample[0x31], NS / 3);
+}
+
+TEST(CorrelateCpa, StrongestCurvesOnlyMatchTheFullResult) {
+    const int NT = 300, NS = 600, M = 256, K = 5;
+    TrsFile file; std::vector<float> s; std::vector<uint8_t> d;
+    buildNoisyDataset(file, s, d, NT, NS, 0x5E);
+    const auto traces = cpaTraces(NT, {});
+    const auto l = leakagesFor(file, traces, M);
+    CpaResult full, top;
+    std::string err;
+    ASSERT_TRUE(correlateCpa(&file, 0, traces, 0, 0, {}, {}, l, M, M, full, nullptr, err));
+    // Small blocks too, so both passes go through several.
+    ASSERT_TRUE(correlateCpa(&file, 0, traces, 0, 0, {}, {}, l, M, K, top, nullptr, err,
+                             100 * (4 * (NT + M) + 16 + 4 * kTTestMaxThreads)));
+    EXPECT_FALSE(top.allCurves());
+    ASSERT_EQ(top.curve_hyp.size(), static_cast<size_t>(K));
+    ASSERT_EQ(top.corr.size(), static_cast<size_t>(K) * NS);
+    // Peaks of every hypothesis are kept either way.
+    for (int h = 0; h < M; ++h) {
+        EXPECT_NEAR(top.peak_r[static_cast<size_t>(h)], full.peak_r[static_cast<size_t>(h)], 2e-5f);
+        EXPECT_EQ(top.peak_sample[static_cast<size_t>(h)], full.peak_sample[static_cast<size_t>(h)]);
+    }
+    // The curves kept are the K largest peaks, best first, and equal the full
+    // ones. (With a HW model a guess and its complement have exactly opposite
+    // correlations, so peaks come in equal pairs: compare magnitudes, not ids.)
+    std::vector<float> mags(M);
+    for (int h = 0; h < M; ++h) mags[static_cast<size_t>(h)] = std::abs(full.peak_r[static_cast<size_t>(h)]);
+    std::vector<float> sorted = mags;
+    std::sort(sorted.rbegin(), sorted.rend());
+    EXPECT_TRUE(top.curve_hyp[0] == 0x5E || top.curve_hyp[0] == (0x5E ^ 0xFF));
+    for (int j = 0; j < K; ++j) {
+        const int h = top.curve_hyp[static_cast<size_t>(j)];
+        EXPECT_NEAR(mags[static_cast<size_t>(h)], sorted[static_cast<size_t>(j)], 2e-5f) << "rank " << j;
+        for (int i = 0; i < NS; ++i)
+            ASSERT_NEAR(top.corr[static_cast<size_t>(j) * NS + i], full.corr[static_cast<size_t>(h) * NS + i], 2e-5f);
+    }
+}
+
+TEST(CorrelateCpa, EstimateGrowsWithTheCurvesKept) {
+    EXPECT_GT(estimateCpaBytes(1500, 256, 62500000, 256), int64_t(60) << 30);   // every curve: > 60 GB
+    EXPECT_LT(estimateCpaBytes(1500, 256, 62500000, 10), int64_t(4) << 30);     // ten: a few GB
 }

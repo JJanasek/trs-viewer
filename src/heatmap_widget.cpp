@@ -40,9 +40,9 @@ static void gaussianBlur(const float* src, float* dst, int rows, int cols, float
             float acc = 0.0f;
             for (int ki = 0; ki < ksize; ki++) {
                 int c = std::clamp(col + ki - r, 0, cols - 1);
-                acc += src[row * cols + c] * kernel[ki];
+                acc += src[static_cast<size_t>(row) * cols + c] * kernel[ki];
             }
-            tmp[row * cols + col] = acc;
+            tmp[static_cast<size_t>(row) * cols + col] = acc;
         }
     }
 
@@ -53,9 +53,9 @@ static void gaussianBlur(const float* src, float* dst, int rows, int cols, float
             float acc = 0.0f;
             for (int ki = 0; ki < ksize; ki++) {
                 int rr = std::clamp(row + ki - r, 0, rows - 1);
-                acc += tmp[rr * cols + col] * kernel[ki];
+                acc += tmp[static_cast<size_t>(rr) * cols + col] * kernel[ki];
             }
-            dst[row * cols + col] = acc;
+            dst[static_cast<size_t>(row) * cols + col] = acc;
         }
     }
 }
@@ -390,7 +390,7 @@ void HeatmapWidget::applyProcessing() {
     if (rows_ <= 0 || cols_ <= 0 ||
         static_cast<int64_t>(matrix_.size()) < static_cast<int64_t>(rows_) * cols_)
         return;
-    const int sz = static_cast<int>(matrix_.size());
+    const int64_t sz = static_cast<int64_t>(matrix_.size());   // can exceed 2^31 cells
     display_matrix_.resize(matrix_.size());
 
     // Step 1: Gaussian blur
@@ -399,7 +399,7 @@ void HeatmapWidget::applyProcessing() {
     // Step 2: Absolute value — makes negative correlations as visible as positive ones
     if (abs_value_) {
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < sz; i++)
+        for (int64_t i = 0; i < sz; i++)
             display_matrix_[i] = std::abs(display_matrix_[i]);
     }
 
@@ -411,7 +411,7 @@ void HeatmapWidget::applyProcessing() {
     if (power_gamma_ > 1.0f) {
         const float inv_range = (vmax_ != vmin_) ? 1.0f / (vmax_ - vmin_) : 1.0f;
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < sz; i++) {
+        for (int64_t i = 0; i < sz; i++) {
             float t = std::clamp((display_matrix_[i] - vmin_) * inv_range, 0.0f, 1.0f);
             display_matrix_[i] = std::pow(t, power_gamma_) * (vmax_ - vmin_) + vmin_;
         }
@@ -420,7 +420,7 @@ void HeatmapWidget::applyProcessing() {
     // Step 4: Binary threshold
     if (threshold_enabled_) {
 #pragma omp parallel for schedule(static)
-        for (int i = 0; i < sz; i++)
+        for (int64_t i = 0; i < sz; i++)
             display_matrix_[i] = (std::abs(display_matrix_[i]) >= threshold_value_) ? 1.0f : 0.0f;
     }
     invalidatePooled();

@@ -335,6 +335,9 @@ static double fileValueScale(const TrsHeader& h) {
 // Memory free right now: MemAvailable from /proc/meminfo — what can be
 // allocated without pushing other programs into swap. 0 if unknown.
 static int64_t memoryAvailableBytes() {
+    // For tests: pretend this much is free (the soak test's low-memory paths).
+    if (const int mb = qEnvironmentVariableIntValue("TRS_MEMORY_AVAILABLE_MB"); mb > 0)
+        return static_cast<int64_t>(mb) << 20;
     QFile f("/proc/meminfo");
     if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) return 0;
     while (!f.atEnd()) {
@@ -13234,15 +13237,13 @@ void MainWindow::onRunCpa() {
     auto* cfg_bb = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     cfg_bb->button(QDialogButtonBox::Ok)->setText("Run CPA");
     connect(cfg_bb, &QDialogButtonBox::rejected, cfg, &QDialog::reject);
-    // CPA is the one analysis that still blocks. Its leakage model is
-    // evaluated through the embedded CPython interpreter, and that code
-    // holds no GIL of its own — it is only safe because it runs on the
-    // thread that already owns the interpreter. Everything else (t-test,
-    // ...) runs as a background job instead; see JobManager.
+    // The leakage model is Python, evaluated through the embedded CPython
+    // interpreter on this (the GUI) thread, which owns it: only that step
+    // runs here, as M calls over the traces' data bytes. The correlation over
+    // the samples then runs as a background job like every other analysis.
     auto* lbl_blocking = new QLabel(
-        "<i>Note: CPA runs in the foreground and will block the window until "
-        "it finishes — its Python leakage model cannot safely be evaluated on "
-        "a background thread. Other analyses keep running in the background.</i>");
+        "<i>The leakage model runs first, briefly, in the foreground (Python); "
+        "the correlation then runs in the background like other analyses.</i>");
     lbl_blocking->setWordWrap(true);
     lbl_blocking->setTextFormat(Qt::RichText);
 
@@ -13288,17 +13289,14 @@ void MainWindow::onRunCpa() {
 }
 
 // The CPA run itself, from the settings captured in onRunCpa(): the leakage
-// model editor, the correlation (in the foreground — see onRunCpa) and the
-// result window.
+// model editor, the model's leakages (here: Python), the correlation (a
+// background job) and the result window (showCpaResult).
 void MainWindow::runCpa(const CpaRun& run) {
     const int32_t first_trace      = run.first;
     const int32_t num_traces       = run.count;
-    const int32_t eff_first_trace  = run.first;
-    const int32_t eff_num_traces   = run.count;
     const int64_t eff_first_sample = run.s_first;
     const int64_t eff_n_samples    = run.s_count;
     const int32_t n_hypotheses     = run.M;
-    const std::vector<int32_t>& use_shifts = run.shifts;
     // Result columns are raw samples from First sample on, if the pipeline
     // keeps sample positions; otherwise pipeline output indices.
     const int64_t col0 = keepsSamplePositions(run.pipeline) ? run.s_first : 0;
@@ -13335,7 +13333,13 @@ void MainWindow::runCpa(const CpaRun& run) {
         raw_model = owned_model.get();
     }
 
-    // Build the leakage callback that calls Python
+    // ---- Step 4: the model's leakage for every guess and trace ----
+    // On this thread: the model is Python, whose interpreter lives here.
+    const std::vector<int32_t> traces = cpaTraces(run.count, run.shifts);
+    if (traces.size() < 2) {
+        QMessageBox::critical(this, "CPA failed", "Need at least 2 traces after excluding discarded ones.");
+        return;
+    }
     LeakageModel* model_ptr = raw_model;
     LeakageFn leakage_fn = [model_ptr](
         const std::vector<uint8_t>& data, int data_len,
@@ -13344,59 +13348,94 @@ void MainWindow::runCpa(const CpaRun& run) {
     {
         return model_ptr->evaluate(data, data_len, n_tr, hypothesis, out, err);
     };
+    auto leakages = std::make_shared<std::vector<float>>();
+    {
+        QProgressDialog prog("Evaluating the leakage model…", "Cancel", 0, n_hypotheses, this);
+        prog.setWindowModality(Qt::WindowModal);
+        prog.setMinimumDuration(300);
+        std::string err;
+        const bool ok = evaluateCpaLeakages(run.file.get(), first_trace, traces, n_hypotheses,
+                                            leakage_fn, *leakages,
+                                            [&](int32_t done, int32_t total) {
+                                                prog.setMaximum(total);
+                                                prog.setValue(done);
+                                                QApplication::processEvents();
+                                                return !prog.wasCanceled();
+                                            },
+                                            err);
+        if (!ok) {
+            if (!err.empty()) QMessageBox::critical(this, "CPA failed", QString::fromStdString(err));
+            return;
+        }
+    }
 
-    // ---- Step 4: Run CPA ----
-    QProgressDialog prog("Loading traces...", "Cancel", 0, eff_num_traces + n_hypotheses, this);
-    prog.setWindowModality(Qt::WindowModal);
-    prog.setMinimumDuration(0);
-    prog.setValue(0);
-    QApplication::processEvents();
-
-    CpaResult result;
-    std::string err;
-
-    auto progCb = [&](int32_t done, int32_t total) -> bool {
-        if (prog.wasCanceled()) return false;
-        prog.setMaximum(total);
-        prog.setValue(done);
-        if (done <= eff_num_traces)
-            prog.setLabelText(QString("Loading trace %1 / %2...").arg(done).arg(eff_num_traces));
-        else
-            prog.setLabelText(QString("Hypothesis %1 / %2...").arg(done - eff_num_traces).arg(n_hypotheses));
-        QApplication::processEvents();
-        return true;
-    };
-
-    bool ok = computeCpa(run.file.get(), eff_first_trace, eff_num_traces,
-                         eff_first_sample, eff_n_samples,
-                         n_hypotheses, use_shifts,
-                         run.pipeline, leakage_fn, result, progCb, err);
-    prog.setValue(prog.maximum());
-
-    if (!ok) {
-        if (!err.empty())
-            QMessageBox::critical(this, "CPA failed", QString::fromStdString(err));
+    // ---- Step 5: memory — every curve if it fits easily, else the strongest ----
+    const int64_t raw_ns = eff_n_samples == 0
+        ? run.file->header().num_samples - eff_first_sample
+        : std::min<int64_t>(eff_n_samples, run.file->header().num_samples - eff_first_sample);
+    const int64_t ns_out = processedLength(run.pipeline, raw_ns);
+    const int64_t n_tr   = static_cast<int64_t>(traces.size());
+    // All curves: CPA's own, plus the heatmap's copy and its display matrix.
+    const int64_t all_bytes = estimateCpaBytes(n_tr, n_hypotheses, ns_out, n_hypotheses)
+                            + 2 * static_cast<int64_t>(n_hypotheses) * ns_out * 4;
+    const int64_t avail = memoryAvailableBytes();
+    constexpr int32_t kTopCurves = 10;
+    int32_t max_curves = n_hypotheses;
+    if (n_hypotheses > kTopCurves && avail > 0 && all_bytes > avail / 2) {
+        max_curves = kTopCurves;
+        if (!confirmMemory(this, estimateCpaBytes(n_tr, n_hypotheses, ns_out, max_curves)
+                                     + static_cast<int64_t>(max_curves) * ns_out * 4,
+                           "CPA, keeping the 10 strongest curves"))
+            return;
+        statusBar()->showMessage(
+            QString("CPA: all %1 curves would need %2 — keeping the %3 strongest; the table ranks every guess.")
+                .arg(n_hypotheses).arg(gigabytes(all_bytes)).arg(max_curves), 15000);
+    } else if (!confirmMemory(this, all_bytes, "CPA")) {
         return;
     }
 
-    // ---- Step 5: Result window ----
-    const int32_t NS = result.n_samples;
+    // ---- Step 6: the correlation, in the background ----
+    struct CpaOut { CpaResult result; std::string err; };
+    auto out = std::make_shared<CpaOut>();
+    const CpaRun job = run;
+    const QString title = QString("CPA — %1 guesses × %2 traces").arg(n_hypotheses).arg(n_tr);
+    jobs_->submit(title,
+        [job, traces, leakages, max_curves, out](JobContext& ctx) {
+            return correlateCpa(job.file.get(), job.first, traces, job.s_first, job.s_count, job.shifts,
+                                job.pipeline, *leakages, job.M, max_curves, out->result,
+                                [&ctx](int64_t done, int64_t total) {
+                                    ctx.setProgress(done, total);
+                                    return !ctx.cancelled();
+                                },
+                                out->err);
+        },
+        [this, out, col0](bool ok) {
+            if (!ok) {
+                if (!out->err.empty() && out->err != "Cancelled.")
+                    QMessageBox::critical(this, "CPA failed", QString::fromStdString(out->err));
+                return;
+            }
+            showCpaResult(std::make_shared<CpaResult>(std::move(out->result)), col0);
+        });
+}
+
+// The CPA result window: every guess ranked by its peak |r|, and the curves
+// kept — as a guess × sample heatmap when there are all of them, as curves
+// when only the strongest are.
+void MainWindow::showCpaResult(std::shared_ptr<CpaResult> result_ptr, int64_t col0) {
+    const int32_t NS = result_ptr->n_samples;
+    const int32_t n_hypotheses = result_ptr->n_hypotheses;
+    if (n_hypotheses <= 0 || NS <= 0) return;
+    const bool all_curves = result_ptr->allCurves();
 
     // Rank all hypotheses by peak absolute correlation
     struct HypPeak { int32_t hyp; float peak_r; int32_t peak_sample; };
-    std::vector<HypPeak> ranked(result.n_hypotheses);
-    for (int k = 0; k < result.n_hypotheses; k++) {
-        const float* row = result.corr.data() + k * NS;
-        float best = 0; int32_t best_s = 0;
-        for (int s = 0; s < NS; s++) {
-            if (std::abs(row[s]) > best) { best = std::abs(row[s]); best_s = s; }
-        }
-        ranked[k] = {k, best, best_s};
-    }
+    std::vector<HypPeak> ranked(static_cast<size_t>(n_hypotheses));
+    for (int32_t k = 0; k < n_hypotheses; k++)
+        ranked[static_cast<size_t>(k)] = {k, std::abs(result_ptr->peak_r[static_cast<size_t>(k)]),
+                                          result_ptr->peak_sample[static_cast<size_t>(k)]};
     std::sort(ranked.begin(), ranked.end(),
               [](const HypPeak& a, const HypPeak& b){ return a.peak_r > b.peak_r; });
-
-    auto result_ptr = std::make_shared<CpaResult>(std::move(result));
 
     auto* dlg = new QDialog(this);
     dlg->setAttribute(Qt::WA_DeleteOnClose);
@@ -13405,38 +13444,62 @@ void MainWindow::runCpa(const CpaRun& run) {
         .arg(ranked[0].hyp).arg(ranked[0].peak_r, 0, 'f', 4));
     dlg->resize(1100, 720);
 
-    auto* hm = new HeatmapWidget(dlg);
-    hm->setMatrix(result_ptr->corr, result_ptr->n_hypotheses, NS);
-    hm->setColorScheme(ColorScheme::RdBu);
+    // The rows of result_ptr->corr: every guess in order, or the strongest few.
+    const int32_t n_rows = static_cast<int32_t>(result_ptr->curve_hyp.size());
+    auto curve = [result_ptr, NS](int32_t row) {
+        const float* p = result_ptr->corr.data() + static_cast<size_t>(row) * static_cast<size_t>(NS);
+        return std::make_shared<std::vector<float>>(p, p + NS);
+    };
 
-    // Hover label
-    auto* lbl_hover = new QLabel("Hover over heatmap to inspect");
-    connect(hm, &HeatmapWidget::hoverInfo, dlg, [lbl_hover, col0](int row, int col, float val) {
-        if (row >= 0 && col >= 0)
-            lbl_hover->setText(QString("hyp=%1  sample=%2  corr=%3")
-                .arg(row).arg(col0 + col).arg(val, 0, 'g', 5));
-        else
-            lbl_hover->setText("Hover over heatmap to inspect");
-    });
+    auto* lbl_hover = new QLabel;
+    QWidget* view = nullptr;
+    HeatmapWidget* hm = nullptr;
+    if (all_curves) {
+        hm = new HeatmapWidget(dlg);
+        hm->setMatrix(result_ptr->corr, n_hypotheses, NS);
+        hm->setColorScheme(ColorScheme::RdBu);
+        lbl_hover->setText("Hover over heatmap to inspect");
+        connect(hm, &HeatmapWidget::hoverInfo, dlg, [lbl_hover, col0](int row, int col, float val) {
+            if (row >= 0 && col >= 0)
+                lbl_hover->setText(QString("hyp=%1  sample=%2  corr=%3")
+                    .arg(row).arg(col0 + col).arg(val, 0, 'g', 5));
+            else
+                lbl_hover->setText("Hover over heatmap to inspect");
+        });
+        view = hm;
+    } else {
+        // Too many samples to keep every guess's curve: the strongest ones,
+        // drawn as curves (a heatmap of a few rows that long would need
+        // several copies of them).
+        auto* pw = new PlotWidget(dlg);
+        for (int32_t j = 0; j < n_rows; j++) {
+            QColor c = themeTraceColor(j);
+            if (j > 0) c.setAlpha(170);
+            pw->addTrace(curve(j), c, QString("h%1").arg(result_ptr->curve_hyp[static_cast<size_t>(j)]));
+        }
+        pw->setAxisLabels("Sample", "Correlation r");
+        pw->setXScale(1.0, static_cast<double>(col0));
+        pw->resetView();
+        lbl_hover->setText(QString("The %1 strongest of %2 guesses (all %2 would need too much memory "
+                                   "at %3 samples); the table ranks every guess.")
+                               .arg(n_rows).arg(n_hypotheses).arg(NS));
+        lbl_hover->setWordWrap(true);
+        view = pw;
+    }
 
     // Top candidates table
     const int show_n = std::min<int>(static_cast<int>(ranked.size()), 16);
     const bool show_hex = (n_hypotheses <= 256);
-    auto* tbl = new QTableWidget(show_n, show_hex ? 4 : 3, dlg);
+    auto* tbl = new QTableWidget(show_n, show_hex ? 5 : 4, dlg);
     tbl->setEditTriggers(QAbstractItemView::NoEditTriggers);
     tbl->setSelectionBehavior(QAbstractItemView::SelectRows);
-    tbl->setHorizontalHeaderLabels(
-        show_hex ? QStringList{"#", "Hyp", "Hex", "Peak |r|", "Sample"}
-                 : QStringList{"#", "Hyp", "Peak |r|", "Sample"});
     tbl->horizontalHeader()->setStretchLastSection(false);
     tbl->verticalHeader()->hide();
-    tbl->setColumnCount(show_hex ? 5 : 4);
-    // rebuild header with correct count
     tbl->setHorizontalHeaderLabels(
         show_hex ? QStringList{"#", "Hyp", "Hex", "Peak |r|", "Sample"}
                  : QStringList{"#", "Hyp", "Peak |r|", "Sample"});
     for (int r = 0; r < show_n; r++) {
-        const auto& p = ranked[r];
+        const auto& p = ranked[static_cast<size_t>(r)];
         int col = 0;
         auto* rank_item = new QTableWidgetItem(QString::number(r + 1));
         rank_item->setTextAlignment(Qt::AlignCenter);
@@ -13464,59 +13527,73 @@ void MainWindow::runCpa(const CpaRun& run) {
     tbl->setFixedWidth(show_hex ? 280 : 220);
     tbl->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Expanding);
 
-    // Color range controls
-    auto* sp_vmin = new QDoubleSpinBox; sp_vmin->setRange(-1e9, 1e9); sp_vmin->setDecimals(4); sp_vmin->setValue(-1.0);
-    auto* sp_vmax = new QDoubleSpinBox; sp_vmax->setRange(-1e9, 1e9); sp_vmax->setDecimals(4); sp_vmax->setValue(1.0);
-    {
-        float dmin = result_ptr->corr[0], dmax = result_ptr->corr[0];
-        for (float v : result_ptr->corr) { dmin = std::min(dmin, v); dmax = std::max(dmax, v); }
-        float lim = std::max(std::abs(dmin), std::abs(dmax));
-        sp_vmin->setValue(-lim); sp_vmax->setValue(lim);
-        hm->setColorRange(-lim, lim);
-    }
-    connect(sp_vmin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [hm, sp_vmax](double v) { hm->setColorRange(v, sp_vmax->value()); });
-    connect(sp_vmax, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [hm, sp_vmin](double v) { hm->setColorRange(sp_vmin->value(), v); });
-
     // Buttons
     auto* btn_show_key = new QPushButton("Show corr traces...");
     auto* btn_exp_npy  = new QPushButton("Export .npy...");
     auto* btn_close    = new QPushButton("Close");
+    btn_show_key->setVisible(all_curves);   // the plot already is these, otherwise
+    btn_exp_npy->setToolTip(all_curves
+        ? QString("The guess × sample matrix, float32 (%1, %2).").arg(n_hypotheses).arg(NS)
+        : QString("The %1 curves shown, float32 (%1, %2), strongest first (guesses %3).")
+              .arg(n_rows).arg(NS).arg([&]() {
+                  QStringList l;
+                  for (int32_t h : result_ptr->curve_hyp) l << QString::number(h);
+                  return l.join(", ");
+              }()));
 
-    // Color scheme combo
-    auto* combo_scheme = new QComboBox;
-    combo_scheme->addItems({"RdBu", "Grayscale", "Hot", "Viridis", "Plasma"});
-    connect(combo_scheme, QOverload<int>::of(&QComboBox::currentIndexChanged), [hm](int i) {
-        hm->setColorScheme(static_cast<ColorScheme>(i));
-    });
+    // Control row (above the view)
+    auto* ctrl = new QHBoxLayout;
+    ctrl->addWidget(lbl_hover, 1);
+    if (hm) {
+        // Color range, scheme and |r| for the heatmap.
+        auto* sp_vmin = new QDoubleSpinBox; sp_vmin->setRange(-1e9, 1e9); sp_vmin->setDecimals(4); sp_vmin->setValue(-1.0);
+        auto* sp_vmax = new QDoubleSpinBox; sp_vmax->setRange(-1e9, 1e9); sp_vmax->setDecimals(4); sp_vmax->setValue(1.0);
+        {
+            float lim = 0.0f;
+            for (float v : result_ptr->corr) lim = std::max(lim, std::abs(v));
+            sp_vmin->setValue(-lim); sp_vmax->setValue(lim);
+            hm->setColorRange(-lim, lim);
+        }
+        connect(sp_vmin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [hm, sp_vmax](double v) { hm->setColorRange(v, sp_vmax->value()); });
+        connect(sp_vmax, QOverload<double>::of(&QDoubleSpinBox::valueChanged), [hm, sp_vmin](double v) { hm->setColorRange(sp_vmin->value(), v); });
 
-    // Abs value checkbox
-    auto* chk_abs = new QCheckBox("Abs value");
-
-    // A magnitude map wants a sequential colormap, a signed one a diverging
-    // one: follow Abs value between RdBu (0) and Viridis (3) unless the user
-    // picked something else.
-    connect(chk_abs, &QCheckBox::toggled, combo_scheme, [combo_scheme](bool on) {
-        if (on && combo_scheme->currentIndex() == 0)       combo_scheme->setCurrentIndex(3);
-        else if (!on && combo_scheme->currentIndex() == 3) combo_scheme->setCurrentIndex(0);
-    });
-    connect(chk_abs, &QCheckBox::toggled, [hm, sp_vmin, sp_vmax](bool on) {
-        hm->setAbsValue(on);
-        if (on) { sp_vmin->setValue(0); }
-    });
+        auto* combo_scheme = new QComboBox;
+        combo_scheme->addItems({"RdBu", "Grayscale", "Hot", "Viridis", "Plasma"});
+        connect(combo_scheme, QOverload<int>::of(&QComboBox::currentIndexChanged), [hm](int i) {
+            hm->setColorScheme(static_cast<ColorScheme>(i));
+        });
+        auto* chk_abs = new QCheckBox("Abs value");
+        // A magnitude map wants a sequential colormap, a signed one a diverging
+        // one: follow Abs value between RdBu (0) and Viridis (3) unless the user
+        // picked something else.
+        connect(chk_abs, &QCheckBox::toggled, combo_scheme, [combo_scheme](bool on) {
+            if (on && combo_scheme->currentIndex() == 0)       combo_scheme->setCurrentIndex(3);
+            else if (!on && combo_scheme->currentIndex() == 3) combo_scheme->setCurrentIndex(0);
+        });
+        connect(chk_abs, &QCheckBox::toggled, [hm, sp_vmin](bool on) {
+            hm->setAbsValue(on);
+            if (on) { sp_vmin->setValue(0); }
+        });
+        ctrl->addWidget(new QLabel("Min:")); ctrl->addWidget(sp_vmin);
+        ctrl->addWidget(new QLabel("Max:")); ctrl->addWidget(sp_vmax);
+        ctrl->addWidget(combo_scheme);
+        ctrl->addWidget(chk_abs);
+    }
+    ctrl->addWidget(btn_show_key);
+    ctrl->addWidget(btn_exp_npy);
+    ctrl->addWidget(btn_close);
 
     // Show correlation traces for each hypothesis
-    connect(btn_show_key, &QPushButton::clicked, dlg, [this, result_ptr, NS, dlg]() {
+    connect(btn_show_key, &QPushButton::clicked, dlg, [result_ptr, n_rows, curve, dlg]() {
         auto* td = new QDialog(dlg);
         td->setAttribute(Qt::WA_DeleteOnClose);
         td->setWindowTitle("CPA — Correlation traces per hypothesis");
         td->resize(900, 500);
         auto* pw = new PlotWidget(td);
-        const float* mat = result_ptr->corr.data();
-        for (int k = 0; k < result_ptr->n_hypotheses; k++) {
-            auto trace = std::make_shared<std::vector<float>>(mat + k * NS, mat + k * NS + NS);
-            QColor c = themeTraceColor(k);
+        for (int32_t j = 0; j < n_rows; j++) {
+            QColor c = themeTraceColor(j);
             c.setAlpha(180);
-            pw->addTrace(std::move(trace), c, QString("h%1").arg(k));
+            pw->addTrace(curve(j), c, QString("h%1").arg(result_ptr->curve_hyp[static_cast<size_t>(j)]));
         }
         pw->setAxisLabels("Sample index", "Hypothesis");
         auto* vl = new QVBoxLayout(td);
@@ -13525,14 +13602,14 @@ void MainWindow::runCpa(const CpaRun& run) {
     });
 
     // Export .npy
-    connect(btn_exp_npy, &QPushButton::clicked, dlg, [this, result_ptr, NS]() {
+    connect(btn_exp_npy, &QPushButton::clicked, dlg, [this, result_ptr, n_rows, NS]() {
         QString path = QFileDialog::getSaveFileName(this, "Export CPA result", MainWindow::recentDir("npy"), "NumPy (*.npy)");
         if (path.isEmpty()) return;
         MainWindow::updateRecentDir("npy", path);
         QFile f(path);
         if (!f.open(QIODevice::WriteOnly)) return;
-        // Write NPY v1.0 header for float32 array shape (M, NS)
-        QString desc = QString("{'descr': '<f4', 'fortran_order': False, 'shape': (%1, %2), }").arg(result_ptr->n_hypotheses).arg(NS);
+        // Write NPY v1.0 header for float32 array shape (rows, NS)
+        QString desc = QString("{'descr': '<f4', 'fortran_order': False, 'shape': (%1, %2), }").arg(n_rows).arg(NS);
         while ((10 + desc.size()) % 64 != 0) desc += ' ';
         QByteArray hdr;
         hdr.append("\x93NUMPY"); hdr.append('\x01'); hdr.append('\x00');
@@ -13546,24 +13623,12 @@ void MainWindow::runCpa(const CpaRun& run) {
 
     connect(btn_close, &QPushButton::clicked, dlg, &QDialog::close);
 
-    // Control row (above heatmap)
-    auto* ctrl = new QHBoxLayout;
-    ctrl->addWidget(lbl_hover);
-    ctrl->addStretch();
-    ctrl->addWidget(new QLabel("Min:")); ctrl->addWidget(sp_vmin);
-    ctrl->addWidget(new QLabel("Max:")); ctrl->addWidget(sp_vmax);
-    ctrl->addWidget(combo_scheme);
-    ctrl->addWidget(chk_abs);
-    ctrl->addWidget(btn_show_key);
-    ctrl->addWidget(btn_exp_npy);
-    ctrl->addWidget(btn_close);
-
-    // Left side: ctrl + heatmap
+    // Left side: ctrl + view
     auto* left_widget = new QWidget(dlg);
     auto* left_vl = new QVBoxLayout(left_widget);
     left_vl->setContentsMargins(0, 0, 0, 0);
     left_vl->addLayout(ctrl);
-    left_vl->addWidget(hm, 1);
+    left_vl->addWidget(view, 1);
 
     // Right side: top candidates table
     auto* right_widget = new QWidget(dlg);

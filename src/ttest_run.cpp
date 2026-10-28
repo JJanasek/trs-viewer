@@ -65,7 +65,11 @@ TraceLoad loadProcessedTrace(TrsFile* file,
         shift = shifts[static_cast<size_t>(shift_idx)];
         if (shift == kAlignDiscardShift) return TraceLoad::Discarded;
     }
-    if (static_cast<int64_t>(buf.size()) < raw_ns) buf.resize(static_cast<size_t>(raw_ns));
+    // The pipeline works in place, and a stage can put out more than it gets
+    // (STFT): room for the longest of the intermediate lengths.
+    int64_t need = raw_ns, len = raw_ns;
+    for (const auto& t : pipeline) need = std::max(need, len = t->transformedCount(len));
+    if (static_cast<int64_t>(buf.size()) < need) buf.resize(static_cast<size_t>(need));
     const int64_t adj_start = first_sample + shift;
     std::fill(buf.begin(), buf.end(), 0.0f);
     // Clamp to read_lo/read_hi (the whole file untiled, one tile's own

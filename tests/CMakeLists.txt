@@ -123,7 +123,7 @@ gtest_discover_tests(test_heatmap)
 # run_heaptrack.sh run it under the memory tools.
 add_executable(gui_soak gui_soak.cpp)
 target_link_libraries(gui_soak PRIVATE trs-viewer-objs)
-set(GUI_SOAK_SCENARIOS ttest average fft cpa snapshots combined quit_dialogs
+set(GUI_SOAK_SCENARIOS ttest average fft cpa cpa_top_curves snapshots combined quit_dialogs
     crash_quit_xcorr crash_job_during_modal crash_close_tab_drawing crash_nonmodal_other_tab)
 foreach(sc ${GUI_SOAK_SCENARIOS})
     add_test(NAME gui_soak.${sc} COMMAND gui_soak --scenario ${sc} --loops 3)

@@ -161,6 +161,8 @@ bool runTiledAlignment(
     int32_t tile_size, bool is_peak, bool peak_use_abs, float min_correlation,
     AlignResult& out, AlignProgress progress, std::string& error);
 
+struct CpaResult;
+
 class MainWindow : public QMainWindow {
     Q_OBJECT
     // The GUI soak test (tests/gui_soak.cpp) drives the private slots and
@@ -309,6 +311,7 @@ private:
         int32_t outside_alignment = 0;     // traces left out: not covered by the alignment
     };
     void runCpa(const CpaRun& run);
+    void showCpaResult(std::shared_ptr<CpaResult> result, int64_t col0);
     // Shows an opened trace file in a new tab; recent_path (if not empty)
     // goes to Recent files.
     void showTraceSet(std::shared_ptr<TrsFile> f, const QString& display_name,

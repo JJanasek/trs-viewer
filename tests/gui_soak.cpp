@@ -354,6 +354,42 @@ struct GuiTestAccess {
         });
     }
 
+    // CPA with less memory free than every curve would need (pretended):
+    // it keeps the strongest curves and shows them as curves, not a heatmap.
+    void scenarioCpaTopCurves() {
+        drv.then([]() { qputenv("TRS_MEMORY_AVAILABLE_MB", "40"); });
+        drv.onDialog("CPA — Configuration", [](QDialog* d) {
+            for (auto* sp : d->findChildren<QSpinBox*>())
+                if (sp->maximum() == 65536) sp->setValue(256);   // M (remembered from earlier runs)
+            return clickOk(d);
+        });
+        drv.onDialog("CPA — Leakage Model Editor", [](QDialog* d) {
+            return clickButton(d, "Run  Test Model");
+        });
+        drv.onDialog("CPA — Leakage Model Editor", [](QDialog* d) {
+            QAbstractButton* run = button(d, "Run CPA");
+            if (!run || !run->isEnabled()) return false;
+            clickLater(run);
+            return true;
+        });
+        drv.onDialog("CPA  n=", [this](QDialog* d) {
+            const auto plots = d->findChildren<PlotWidget*>();
+            if (plots.isEmpty() || plots[0]->traceCount() != 10)
+                drv.fail(QString("expected the 10 strongest curves, got %1 plot(s)").arg(plots.size()));
+            QMetaObject::invokeMethod(d, "close", Qt::QueuedConnection);
+            return true;
+        });
+        useFileTab();
+        drv.then([this]() { w.onRunCpa(); });
+        drv.step([this]() {
+            if (!drv.dialogsAnswered()) return false;
+            for (QWidget* t : QApplication::topLevelWidgets())
+                if (t->isVisible() && t->windowTitle().startsWith("CPA")) return false;
+            return true;
+        });
+        drv.then([]() { qunsetenv("TRS_MEMORY_AVAILABLE_MB"); });
+    }
+
     void scenarioSnapshots() {
         useFileTab();
         drv.then([this]() {
@@ -497,6 +533,7 @@ int main(int argc, char** argv) {
             else if (scenario == "average")      t.scenarioAverage();
             else if (scenario == "fft")          t.scenarioFft();
             else if (scenario == "cpa")          t.scenarioCpa();
+            else if (scenario == "cpa_top_curves") t.scenarioCpaTopCurves();
             else if (scenario == "snapshots")    t.scenarioSnapshots();
             else if (scenario == "combined")     t.scenarioCombined();
             else if (scenario == "quit_dialogs") { t.scenarioQuitDialogs(); loops = 1; break; }
