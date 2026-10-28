@@ -1637,3 +1637,34 @@ TEST(SpectralLeakageJitter, LongerWindowRecoversDetectionAtTheSameJitter) {
     EXPECT_GT(long_win, short_win)
         << "window 128 -> " << short_win << ", window 1024 -> " << long_win;
 }
+
+// A clone is made from the parameters only — no work buffers or FFT plan
+// copied along (clones are made per plot trace, per thread and per undo
+// snapshot) — and must still compute exactly what the original does, also
+// after the original has run on a long input.
+TEST(Clone, FromParametersComputesTheSame) {
+    std::vector<float> x(100000);
+    for (size_t i = 0; i < x.size(); ++i)
+        x[i] = std::sin(0.3f * static_cast<float>(i)) + 0.2f * std::sin(0.031f * static_cast<float>(i));
+    std::vector<std::shared_ptr<ITransform>> txs = {
+        std::make_shared<FFTMagnitudeTransform>(),
+        std::make_shared<STFTMagnitudeTransform>(256, 128),
+        std::make_shared<SpectralExciseTransform>(std::vector<SpectralBand>{SpectralBand{0.0955, 0.002}}),
+        std::make_shared<PeriodicSubtractTransform>(64.0),
+        std::make_shared<ComplexDemodulateTransform>(0.0955f, 0.01f),
+    };
+    for (const auto& tx : txs) {
+        auto run = [&](ITransform& t) {
+            std::vector<float> b(x);
+            b.resize(std::max<size_t>(x.size(), static_cast<size_t>(t.transformedCount(static_cast<int64_t>(x.size())))));
+            t.reset();
+            b.resize(static_cast<size_t>(t.apply(b.data(), static_cast<int64_t>(x.size()), 0)));
+            return b;
+        };
+        const auto a = run(*tx);          // fills the original's buffers
+        auto c = tx->clone();
+        const auto b = run(*c);
+        ASSERT_EQ(a.size(), b.size()) << tx->name();
+        for (size_t i = 0; i < a.size(); ++i) ASSERT_FLOAT_EQ(a[i], b[i]) << tx->name() << " at " << i;
+    }
+}

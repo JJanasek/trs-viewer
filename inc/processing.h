@@ -298,7 +298,9 @@ public:
     Window window()      const { return window_; }
 
     std::shared_ptr<ITransform> clone() const override {
-        return std::make_shared<FFTMagnitudeTransform>(*this);
+        // From the parameters, without the work buffers and FFT plan: clones
+        // are made per plot trace, per thread and for every undo snapshot.
+        return std::make_shared<FFTMagnitudeTransform>(window_);
     }
 
 private:
@@ -489,7 +491,9 @@ public:
     }
 
     std::shared_ptr<ITransform> clone() const override {
-        return std::make_shared<STFTMagnitudeTransform>(*this);
+        // From the parameters, without the work buffers and FFT plan: clones
+        // are made per plot trace, per thread and for every undo snapshot.
+        return std::make_shared<STFTMagnitudeTransform>(window_size_, hop_size_, window_);
     }
 
 private:
@@ -594,7 +598,9 @@ public:
     PhaseMode phaseMode() const         { return phase_; }
 
     std::shared_ptr<ITransform> clone() const override {
-        return std::make_shared<SpectralExciseTransform>(*this);
+        // From the parameters, without the work buffers and FFT plan: clones
+        // are made per plot trace, per thread and for every undo snapshot.
+        return std::make_shared<SpectralExciseTransform>(bands_, phase_);
     }
 
 private:
@@ -782,7 +788,11 @@ public:
     double lastPeriodUsed() const { return last_period_; }
 
     std::shared_ptr<ITransform> clone() const override {
-        return std::make_shared<PeriodicSubtractTransform>(*this);
+        // From the parameters, without the work buffers and FFT plan: clones
+        // are made per plot trace, per thread and for every undo snapshot.
+        auto c = std::make_shared<PeriodicSubtractTransform>(period_, auto_min_, auto_max_, auto_min_corr_);
+        c->last_period_ = last_period_;
+        return c;
     }
 
 private:
@@ -847,7 +857,9 @@ public:
     Output output()    const { return output_; }
 
     std::shared_ptr<ITransform> clone() const override {
-        return std::make_shared<ComplexDemodulateTransform>(*this);
+        // From the parameters, without the work buffers and FFT plan: clones
+        // are made per plot trace, per thread and for every undo snapshot.
+        return std::make_shared<ComplexDemodulateTransform>(center_, bandwidth_, output_);
     }
 
 private:
