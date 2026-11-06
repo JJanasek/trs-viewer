@@ -5,8 +5,8 @@
 
 | Method | How |
 |---|---|
-| TRS file | **File → Open TRS File…** (Ctrl+O) or command-line argument |
-| Several TRS files as one set | **File → Open Several Files as One…**; reopen with the saved `.trslist` ([details](features/combined.md)) |
+| TRS file | **File → Open File…** (Ctrl+O) or command-line argument |
+| Several files or capture folders as one set | **File → Open Several Files as One…**; reopen with the saved `.trslist` ([details](features/combined.md)) |
 | NPY (2-D trace matrix) | **File → Open NPY/NPZ as Traces…** |
 | NPY with labels | same — `labels.npz` next to it is read as the per-trace data ([details](features/npy-npz.md)) |
 | NPZ archive | same — looks for a `traces` array; the other per-trace arrays become labels |

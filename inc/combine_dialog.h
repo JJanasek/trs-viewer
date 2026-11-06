@@ -1,5 +1,5 @@
 #pragma once
-// "Open as One Dataset" dialog: several TRS files read one after another as
+// "Open as One Dataset" dialog: several trace files read one after another as
 // one trace set (TrsFile::openCombined), optionally saved as a .trslist.
 
 #include <QString>
@@ -24,5 +24,8 @@ bool showCombineDialog(QWidget* parent, const QStringList& paths, const QString&
 
 // A name for the list of these files: their common name without the
 // trailing number ("capture_000.trs", "capture_001.trs" → "capture"),
-// or "combined".
+// the folders' shared name if only those differ ("run_1/traces.npy",
+// "run_2/traces.npy" → "run"), or "combined".
 QString traceListBaseName(const QStringList& paths);
+// The deepest folder holding all of these files: where their list goes.
+QString commonFolder(const QStringList& paths);

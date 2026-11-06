@@ -1,4 +1,5 @@
 #include "combine_dialog.h"
+#include "npz.h"
 #include "theme.h"
 #include "trs_file.h"
 
@@ -37,7 +38,7 @@ Entry readEntry(const QString& path) {
     e.path = path;
     TrsFile f;
     std::string err;
-    if (!f.open(path.toStdString(), err)) {
+    if (!openTraceFile(f, path.toStdString(), err)) {
         e.error = QString::fromStdString(err);
         return e;
     }
@@ -46,11 +47,15 @@ Entry readEntry(const QString& path) {
     return e;
 }
 
+QString shownName(const QString& path) {
+    return QString::fromStdString(traceFileName(path.toStdString()));
+}
+
 void sortByName(std::vector<Entry>& entries) {
     QCollator c;
     c.setNumericMode(true);   // capture_2 before capture_10
     std::stable_sort(entries.begin(), entries.end(), [&c](const Entry& a, const Entry& b) {
-        return c.compare(QFileInfo(a.path).fileName(), QFileInfo(b.path).fileName()) < 0;
+        return c.compare(shownName(a.path), shownName(b.path)) < 0;
     });
 }
 
@@ -58,9 +63,16 @@ void sortByName(std::vector<Entry>& entries) {
 
 QString traceListBaseName(const QStringList& paths) {
     if (paths.isEmpty()) return "combined";
-    QString prefix = QFileInfo(paths.front()).completeBaseName();
+    // Files that differ only by their folder (<name>/traces.npy) are named by it.
+    const bool by_folder = paths.size() > 1 && std::all_of(paths.begin(), paths.end(), [&](const QString& p) {
+        return QFileInfo(p).fileName() == QFileInfo(paths.front()).fileName();
+    });
+    auto nameOf = [by_folder](const QString& p) {
+        return by_folder ? QFileInfo(p).dir().dirName() : QFileInfo(p).completeBaseName();
+    };
+    QString prefix = nameOf(paths.front());
     for (const QString& p : paths) {
-        const QString n = QFileInfo(p).completeBaseName();
+        const QString n = nameOf(p);
         int k = 0;
         while (k < prefix.size() && k < n.size() && prefix[k] == n[k]) k++;
         prefix.truncate(k);
@@ -74,6 +86,19 @@ QString traceListBaseName(const QStringList& paths) {
     trim(true);
     if (prefix.endsWith("part", Qt::CaseInsensitive)) { prefix.chop(4); trim(false); }
     return prefix.isEmpty() ? QString("combined") : prefix;
+}
+
+QString commonFolder(const QStringList& paths) {
+    if (paths.isEmpty()) return {};
+    QStringList common = QFileInfo(paths.front()).absolutePath().split('/');
+    for (const QString& p : paths) {
+        const QStringList parts = QFileInfo(p).absolutePath().split('/');
+        int k = 0;
+        while (k < common.size() && k < parts.size() && common[k] == parts[k]) k++;
+        common = common.mid(0, k);
+    }
+    const QString folder = common.join('/');
+    return folder.isEmpty() ? QString("/") : folder;
 }
 
 bool showCombineDialog(QWidget* parent, const QStringList& paths, const QString& browse_dir,
@@ -90,7 +115,8 @@ bool showCombineDialog(QWidget* parent, const QStringList& paths, const QString&
 
     auto* intro = new QLabel("The traces of these files are read one after another as one trace "
                              "set, without copying anything. Trace numbers run on from file to "
-                             "file; alignment, patterns and every analysis use all of them.");
+                             "file; alignment, patterns and every analysis use all of them. A .npy "
+                             "brings the labels.npz next to it.");
     intro->setWordWrap(true);
     vl->addWidget(intro);
 
@@ -106,13 +132,16 @@ bool showCombineDialog(QWidget* parent, const QStringList& paths, const QString&
     table->horizontalHeader()->setStretchLastSection(true);
 
     auto* btn_add    = new QPushButton("Add Files…");
+    auto* btn_add_dir = new QPushButton("Add Folders…");
+    btn_add_dir->setToolTip("Capture folders (select several with Ctrl or Shift), each with its "
+                            "traces.npy and labels.npz, or a folder that holds them.");
     auto* btn_remove = new QPushButton("Remove");
     auto* btn_up     = new QPushButton("Move Up");
     auto* btn_down   = new QPushButton("Move Down");
     auto* btn_sort   = new QPushButton("Sort by Name");
     btn_sort->setToolTip("Numbers in names in numeric order: capture_2 before capture_10.");
     auto* side = new QVBoxLayout;
-    for (QPushButton* b : {btn_add, btn_remove, btn_up, btn_down, btn_sort}) side->addWidget(b);
+    for (QPushButton* b : {btn_add, btn_add_dir, btn_remove, btn_up, btn_down, btn_sort}) side->addWidget(b);
     side->addStretch();
     auto* mid = new QHBoxLayout;
     mid->addWidget(table, 1);
@@ -172,7 +201,7 @@ bool showCombineDialog(QWidget* parent, const QStringList& paths, const QString&
             if (!bad && ref && &e != ref && (e.h.scale_x != ref->h.scale_x || e.h.scale_y != ref->h.scale_y))
                 note += QString(note.isEmpty() ? "" : " ") + "Different time or value scale than the first file.";
             const int32_t n = bad ? 0 : std::max(0, e.h.num_traces);
-            auto* it_file  = new QTableWidgetItem(QFileInfo(e.path).fileName());
+            auto* it_file  = new QTableWidgetItem(shownName(e.path));
             auto* it_n     = new QTableWidgetItem(bad ? QString("–") : loc.toString(n));
             auto* it_range = new QTableWidgetItem(bad || n == 0 ? QString("–")
                 : QString("%1 – %2").arg(loc.toString(static_cast<qlonglong>(total)),
@@ -193,7 +222,7 @@ bool showCombineDialog(QWidget* parent, const QStringList& paths, const QString&
         }
         if (entries.empty()) {
             lbl_total->setStyleSheet(themeErrorStyle());
-            lbl_total->setText("Add the files to combine.");
+            lbl_total->setText("Add the files or capture folders to combine.");
         } else if (n_bad > 0) {
             lbl_total->setStyleSheet(themeErrorStyle());
             lbl_total->setText(QString("%1 file%2 in red can't be read together with the first one — "
@@ -210,8 +239,7 @@ bool showCombineDialog(QWidget* parent, const QStringList& paths, const QString&
         if (!list_edited && !entries.empty()) {
             QStringList ps;
             for (const Entry& e : entries) ps << e.path;
-            ed_list->setText(QDir(QFileInfo(entries.front().path).absolutePath())
-                                 .filePath(traceListBaseName(ps) + ".trslist"));
+            ed_list->setText(QDir(commonFolder(ps)).filePath(traceListBaseName(ps) + ".trslist"));
         }
     };
 
@@ -248,10 +276,7 @@ bool showCombineDialog(QWidget* parent, const QStringList& paths, const QString&
             entries.erase(entries.begin() + *it);
         refresh();
     });
-    QObject::connect(btn_add, &QPushButton::clicked, &dlg, [&]() {
-        const QString dir = entries.empty() ? browse_dir : QFileInfo(entries.back().path).absolutePath();
-        const QStringList more = QFileDialog::getOpenFileNames(&dlg, "Add TRS files", dir,
-                                                               "TRS files (*.trs);;All files (*)");
+    auto addPaths = [&](const QStringList& more) {
         for (const QString& p : more) {
             const QString abs = QFileInfo(p).absoluteFilePath();
             const bool dup = std::any_of(entries.begin(), entries.end(), [&](const Entry& e) {
@@ -259,7 +284,35 @@ bool showCombineDialog(QWidget* parent, const QStringList& paths, const QString&
             });
             if (!dup) entries.push_back(readEntry(p));
         }
+        sortByName(entries);
         refresh();
+    };
+    QObject::connect(btn_add, &QPushButton::clicked, &dlg, [&]() {
+        const QString dir = entries.empty() ? browse_dir : QFileInfo(entries.back().path).absolutePath();
+        addPaths(QFileDialog::getOpenFileNames(&dlg, "Add trace files", dir,
+                                               "Trace files (*.trs *.npy *.npz);;All files (*)"));
+    });
+    QObject::connect(btn_add_dir, &QPushButton::clicked, &dlg, [&]() {
+        const QString dir = entries.empty() ? browse_dir : QFileInfo(entries.back().path).absolutePath();
+        // Qt's own dialog: the system's can't select several folders.
+        QFileDialog fd(&dlg, "Add capture folders", dir);
+        fd.setFileMode(QFileDialog::Directory);
+        fd.setOptions(QFileDialog::ShowDirsOnly | QFileDialog::DontUseNativeDialog);
+        for (const char* view : {"listView", "treeView"})
+            if (auto* v = fd.findChild<QAbstractItemView*>(view))
+                v->setSelectionMode(QAbstractItemView::ExtendedSelection);
+        if (fd.exec() != QDialog::Accepted) return;
+        QStringList files;
+        QStringList empty;
+        for (const QString& folder : fd.selectedFiles()) {
+            const QStringList found = traceFilesInFolder(folder);
+            if (found.isEmpty()) empty << QDir(folder).dirName();
+            files += found;
+        }
+        addPaths(files);
+        if (!empty.isEmpty())
+            QMessageBox::information(&dlg, "Open as One Dataset",
+                                     "No trace files in: " + empty.join(", "));
     });
     QObject::connect(btn_browse, &QPushButton::clicked, &dlg, [&]() {
         const QString p = QFileDialog::getSaveFileName(&dlg, "Save file list as", ed_list->text(),

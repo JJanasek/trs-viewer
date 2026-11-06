@@ -227,7 +227,7 @@ std::string combineMismatch(const TrsHeader& first, const TrsHeader& h) {
 }
 
 bool TrsFile::openCombined(const std::vector<std::string>& paths, std::string& error,
-                           const std::string& list_path) {
+                           const std::string& list_path, PartOpener open_part) {
     close();
     if (paths.empty()) { error = "No files to combine."; return false; }
     std::vector<std::string> notes;
@@ -235,8 +235,12 @@ bool TrsFile::openCombined(const std::vector<std::string>& paths, std::string& e
     for (const std::string& p : paths) {
         auto part = std::make_unique<TrsFile>();
         std::string e;
-        const std::string name = std::filesystem::path(p).filename().string();
-        if (!part->open(p, e)) { close(); error = name + ": " + e; return false; }
+        const std::string name = traceFileName(p);
+        if (!(open_part ? open_part(*part, p, e) : part->open(p, e))) {
+            close();
+            error = name + ": " + e;
+            return false;
+        }
         if (!parts_.empty()) {
             const std::string why = combineMismatch(parts_.front()->header(), part->header());
             if (!why.empty()) { close(); error = name + ": " + why + "."; return false; }
@@ -475,15 +479,32 @@ bool TrsFile::openNpy(const std::string& path, std::string& error) {
     return true;
 }
 
+bool TrsFile::dataInMemory() const {
+    if (parts_.empty()) return !mem_data_.empty();
+    return std::all_of(parts_.begin(), parts_.end(), [](const auto& p) { return p->dataInMemory(); });
+}
+
+void TrsFile::addNote(const std::string& note) {
+    if (!note.empty()) notes_ += (notes_.empty() ? "" : "\n") + note;
+}
+
+std::string traceFileName(const std::string& path) {
+    namespace fs = std::filesystem;
+    const fs::path p(path);
+    const std::string ext = p.extension().string();
+    const std::string folder = p.parent_path().filename().string();
+    if ((ext == ".npy" || ext == ".npz") && !folder.empty() && folder != "." && folder != "..")
+        return folder + "/" + p.filename().string();
+    return p.filename().string();
+}
+
 void TrsFile::attachData(const uint8_t* data_bytes, int16_t data_length,
-                         const std::map<std::string, TrsTraceParam>& params,
-                         const std::string& note) {
+                         const std::map<std::string, TrsTraceParam>& params) {
     if (!data_bytes || data_length <= 0) return;
     header_.data_length = data_length;
     mem_data_.assign(data_bytes, data_bytes + static_cast<size_t>(header_.num_traces)
                                               * static_cast<size_t>(data_length));
     setParamMap(params);
-    if (!note.empty()) notes_ += (notes_.empty() ? "" : "\n") + note;
 }
 
 void TrsFile::setParamMap(const std::map<std::string, TrsTraceParam>& pm) {

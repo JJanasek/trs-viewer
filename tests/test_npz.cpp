@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 #include "npz.h"
 
+#include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QTemporaryDir>
 
 #include <algorithm>
@@ -189,4 +191,128 @@ TEST(Npz, LabelsNextToAMatrix) {
     EXPECT_EQ(findLabelsNextTo(npy_path), dir.filePath("traces.npz"));
     touch("traces_labels.npz");
     EXPECT_EQ(findLabelsNextTo(npy_path), dir.filePath("traces_labels.npz"));
+}
+
+// ---------------------------------------------------------------------------
+// Captures: <folder>/traces.npy with labels.npz next to it, alone or as one set
+// ---------------------------------------------------------------------------
+
+namespace {
+// 3 traces of 2 int16 samples, starting at `base`; lam = base + trace, per byte.
+void writeCapture(const QDir& dir, int16_t base, bool with_labels = true) {
+    ASSERT_TRUE(QDir().mkpath(dir.path()));
+    const int16_t x[3][2] = {{base, int16_t(base + 1)}, {int16_t(base + 2), int16_t(base + 3)},
+                             {int16_t(base + 4), int16_t(base + 5)}};
+    const auto bytes = npy("<i2", "(3, 2)", x, sizeof x);
+    QFile f(dir.filePath("traces.npy"));
+    ASSERT_TRUE(f.open(QIODevice::WriteOnly));
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<qint64>(bytes.size()));
+    f.close();
+    if (!with_labels) return;
+    uint8_t lam[3][2];
+    for (int t = 0; t < 3; t++) lam[t][0] = lam[t][1] = static_cast<uint8_t>(base + t);
+    QString err;
+    ASSERT_TRUE(saveNpz(dir.filePath("labels.npz"), {{"lam.npy", npy("|u1", "(3, 2)", lam, sizeof lam)}}, err));
+}
+}  // namespace
+
+TEST(Captures, OneOpensWithItsLabels) {
+    QTemporaryDir tmp;
+    const QDir dir(tmp.filePath("run"));
+    writeCapture(dir, 10);
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(openTraceFile(f, dir.filePath("traces.npy").toStdString(), err)) << err;
+    EXPECT_TRUE(f.dataInMemory());
+    EXPECT_EQ(f.readData(2), (std::vector<uint8_t>{12, 12}));
+    EXPECT_FLOAT_EQ(f.readSample(1, 1), 13.0f);
+}
+
+TEST(Captures, SeveralAreOneSetWithEachOnesLabels) {
+    QTemporaryDir tmp;
+    const QDir a(tmp.filePath("run_a")), b(tmp.filePath("run_b"));
+    writeCapture(a, 10);
+    writeCapture(b, 20);
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.openCombined({a.filePath("traces.npy").toStdString(), b.filePath("traces.npy").toStdString()},
+                               err, {}, &openTraceFile)) << err;
+    EXPECT_EQ(f.header().num_traces, 6);
+    EXPECT_EQ(f.header().data_length, 2);
+    EXPECT_EQ(f.header().param_map.count("lam"), 1u);
+    EXPECT_TRUE(f.dataInMemory());
+    EXPECT_EQ(f.readData(2), (std::vector<uint8_t>{12, 12}));
+    EXPECT_EQ(f.readData(3), (std::vector<uint8_t>{20, 20}));
+    EXPECT_FLOAT_EQ(f.readSample(5, 0), 24.0f);
+    EXPECT_EQ(f.parts().at(1).first_trace, 3);
+    EXPECT_TRUE(f.openNotes().empty());
+}
+
+TEST(Captures, OneWithoutLabelsDoesntFitTheOthers) {
+    QTemporaryDir tmp;
+    const QDir a(tmp.filePath("run_a")), b(tmp.filePath("run_b"));
+    writeCapture(a, 10);
+    writeCapture(b, 20, /*with_labels=*/false);
+    TrsFile f;
+    std::string err;
+    EXPECT_FALSE(f.openCombined({a.filePath("traces.npy").toStdString(), b.filePath("traces.npy").toStdString()},
+                                err, {}, &openTraceFile));
+    EXPECT_NE(err.find("run_b/traces.npy"), std::string::npos) << err;
+    EXPECT_NE(err.find("data bytes"), std::string::npos) << err;
+}
+
+TEST(Captures, AnNpzIsOneToo) {
+    QTemporaryDir tmp;
+    const float x[3][2] = {{1, 2}, {3, 4}, {5, 6}};
+    const uint8_t k[3] = {7, 8, 9};
+    QString qerr;
+    ASSERT_TRUE(saveNpz(tmp.filePath("a.npz"), {{"traces.npy", npy("<f4", "(3, 2)", x, sizeof x)},
+                                                {"k.npy", npy("|u1", "(3,)", k, sizeof k)}}, qerr));
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(openTraceFile(f, tmp.filePath("a.npz").toStdString(), err)) << err;
+    EXPECT_FLOAT_EQ(f.readSample(2, 1), 6.0f);
+    EXPECT_EQ(f.readData(1), std::vector<uint8_t>{8});
+    EXPECT_EQ(f.header().param_map.count("k"), 1u);
+
+    TrsFile none;
+    QFile bad(tmp.filePath("b.npz"));
+    ASSERT_TRUE(saveNpz(bad.fileName(), {{"k.npy", npy("|u1", "(3,)", k, sizeof k)}}, qerr));
+    EXPECT_FALSE(openTraceFile(none, bad.fileName().toStdString(), err));
+}
+
+TEST(Captures, TheFilesOfAFolder) {
+    QTemporaryDir tmp;
+    QDir root(tmp.path());
+    auto touch = [&](const QString& rel) {
+        ASSERT_TRUE(QDir().mkpath(QFileInfo(root.filePath(rel)).absolutePath()));
+        QFile f(root.filePath(rel));
+        ASSERT_TRUE(f.open(QIODevice::WriteOnly));
+    };
+    touch("run_1/traces.npy");
+    touch("run_1/labels.npz");
+    touch("run_1/meta.json");
+    touch("run_2/traces.npz");
+    touch("notes/readme.txt");
+    EXPECT_EQ(traceFilesInFolder(root.filePath("run_1")), QStringList{root.filePath("run_1/traces.npy")});
+    EXPECT_EQ(traceFilesInFolder(tmp.path()),
+              (QStringList{root.filePath("run_1/traces.npy"), root.filePath("run_2/traces.npz")}));
+    EXPECT_TRUE(traceFilesInFolder(root.filePath("notes")).isEmpty());
+
+    touch("parts/a_0.trs");
+    touch("parts/a_1.trs");
+    touch("parts/b.npy");
+    touch("parts/b.npz");          // b.npy's labels
+    touch("parts/c_labels.npz");
+    touch("parts/d.npz");
+    EXPECT_EQ(traceFilesInFolder(root.filePath("parts")),
+              (QStringList{root.filePath("parts/a_0.trs"), root.filePath("parts/a_1.trs"),
+                           root.filePath("parts/b.npy"), root.filePath("parts/d.npz")}));
+}
+
+TEST(Captures, NamesKeepTheirFolder) {
+    EXPECT_EQ(traceFileName("/x/run_1/traces.npy"), "run_1/traces.npy");
+    EXPECT_EQ(traceFileName("/x/run_1/a.npz"), "run_1/a.npz");
+    EXPECT_EQ(traceFileName("/x/run_1/a.trs"), "a.trs");
+    EXPECT_EQ(traceFileName("traces.npy"), "traces.npy");
 }

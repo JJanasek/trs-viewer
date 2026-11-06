@@ -84,6 +84,7 @@ generates itself. Each scenario loops:
 | `plot_whole_trace` | a 10M-sample trace with Spectral Excise: left out zoomed out, applied zoomed in |
 | `export_npz` | exports as NPZ through the dialogs and opens it again |
 | `npy_labels` | `traces.npy` with `labels.npz`: t-test on one bit of a label and on every bit (saved and read back), Average per group, SNR, CPA, Export TRS; also no labels, and labels of another length |
+| `combined_npy` | two capture folders opened as one set through **Add Folders…**, then every function in Analyze on it, then reopened from its `.trslist` |
 | `quit_dialogs` | quits with non-modal dialogs still open |
 | `crash_*` | recipes that once crashed: quitting with a Template Match window open, a job finishing during a modal dialog, closing the tab while drawing, Run in a dialog after switching tabs |
 

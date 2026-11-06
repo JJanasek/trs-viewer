@@ -523,7 +523,7 @@ struct GuiTestAccess {
     void useCaptureTab() {
         drv.then([this]() {
             for (int i = 0; i < tabs(); i++)
-                if (w.datasets_[static_cast<size_t>(i)].display_name == "traces.npy") {
+                if (w.datasets_[static_cast<size_t>(i)].display_name.endsWith("traces.npy")) {
                     w.tab_bar_->setCurrentIndex(i);
                     return;
                 }
@@ -544,7 +544,6 @@ struct GuiTestAccess {
             for (const char* name : {"lam", "x0", "ok", "retval", "t_unix", "capture_ms"})
                 if (!h.param_map.count(name)) return drv.fail(QString("no label %1").arg(name));
             if (h.data_length != 32 + 32 + 1 + 4 + 8 + 4) return drv.fail(QString("%1 data bytes").arg(h.data_length));
-            if (f.openNotes().find("labels.npz") == std::string::npos) return drv.fail("no note about the labels");
             if (!w.statusBar()->currentMessage().contains("lam")) return drv.fail("the status bar doesn't say");
             w.updateTraceDataDisplay();
             if (!w.lbl_trace_data_->text().contains("lam")) return drv.fail("the trace data panel doesn't show lam");
@@ -767,7 +766,176 @@ struct GuiTestAccess {
         closeResultTabs();
         drv.then([this]() {
             for (int i = tabs() - 1; i >= 0; --i)
-                if (w.datasets_[static_cast<size_t>(i)].display_name == "traces.npy") w.closeDatasetAt(i);
+                if (w.datasets_[static_cast<size_t>(i)].display_name.endsWith("traces.npy")) w.closeDatasetAt(i);
+        });
+        drv.step([]() { QApplication::processEvents(); return true; });
+    }
+
+    // Two captures, each a folder with traces.npy and labels.npz, opened as one
+    // set from the folder holding them; then everything in the Analyze menu.
+    void scenarioCombinedNpy() {
+        const QString list = capture_dir + "/run.trslist";
+        drv.then([list]() { QFile::remove(list); });
+        drv.onDialog("Open as One Dataset", [](QDialog* d) { return clickButton(d, "Add Folders"); });
+        drv.onDialog("Add capture folders", [this](QDialog* d) {
+            auto* fd = qobject_cast<QFileDialog*>(d);
+            if (!fd) return false;
+            if (auto* name = fd->findChild<QLineEdit*>("fileNameEdit")) name->setText(capture_dir);
+            QMetaObject::invokeMethod(fd, "accept", Qt::QueuedConnection);
+            return true;
+        });
+        drv.onDialog("Open as One Dataset", [this, list](QDialog* d) {
+            auto* tbl = d->findChild<QTableWidget*>();
+            if (!tbl || tbl->rowCount() != 2) return false;   // the folder isn't in yet
+            if (!tbl->item(0, 0)->text().endsWith("run_a/traces.npy")) drv.fail("row: " + tbl->item(0, 0)->text());
+            if (auto* ed = d->findChild<QLineEdit*>(); !ed || ed->text() != list)
+                drv.fail("list: " + (ed ? ed->text() : QString()));
+            return clickOk(d);
+        });
+        drv.then([this]() { w.onOpenCombined(); });
+        drv.step([this]() { return drv.dialogsAnswered() && w.hasActiveDs() && w.activeDs().display_name == "run.trslist"; });
+
+        auto checkSet = [this]() {
+            const TrsFile& f = *w.activeDs().file;
+            if (f.parts().size() != 2 || f.header().num_traces != 800) return drv.fail("not one set of 800 traces");
+            if (!f.header().param_map.count("lam") || !f.dataInMemory()) return drv.fail("the labels didn't come along");
+            if (f.readData(0).empty() || f.readData(799).empty()) drv.fail("no labels for the set's traces");
+            if (f.readData(0) == f.readData(400)) drv.fail("the second capture has the first one's labels");
+        };
+        drv.then([this, checkSet]() {
+            checkSet();
+            if (!w.statusBar()->currentMessage().contains("lam")) drv.fail("the status bar doesn't say");
+            w.spin_data_idx_->setValue(500);
+            w.updateTraceDataDisplay();
+            if (!w.lbl_trace_data_->text().contains("run_b/traces.npy")) drv.fail("the panel doesn't name the part");
+        });
+        const auto useSetTab = [this]() {
+            drv.then([this]() {
+                for (int i = 0; i < tabs(); i++)
+                    if (w.datasets_[static_cast<size_t>(i)].display_name == "run.trslist") {
+                        w.tab_bar_->setCurrentIndex(i);
+                        return;
+                    }
+                drv.fail("the set's tab is gone");
+            });
+        };
+
+        // t-test on one bit
+        drv.onDialog("Welch t-test", [](QDialog* d) {
+            auto* c = d->findChild<QLabel*>("group_counts");
+            return c && pickGroup(d, "lam", 3, "bit 1") && clickOk(d);
+        });
+        drv.then([this]() { w.showTTestDialog(nullptr); });
+        waitJobs();
+        drv.then([this]() {
+            float t = 0;
+            const int at = peakOfActiveCurve(&t);
+            std::fprintf(stderr, "  combined t-test: %s, max |t| %.1f at %d\n", qPrintable(w.activeDs().display_name), t, at);
+            if (!w.activeDs().display_name.contains("800 traces")) drv.fail("not all traces: " + w.activeDs().display_name);
+            if (at != kLabelLeakAt || t < 15.0f) drv.fail(QString("max |t| %1 at %2").arg(t).arg(at));
+        });
+        // ... and on every bit
+        useSetTab();
+        drv.onDialog("Welch t-test", [](QDialog* d) { return pickGroup(d, "lam", 0, "every bit") && clickOk(d); });
+        drv.onDialog("T-test on every bit", [this](QDialog* d) {
+            if (!d->windowTitle().contains("800 traces") || !d->windowTitle().contains("lam[3] bit 1"))
+                drv.fail("every bit: " + d->windowTitle());
+            QMetaObject::invokeMethod(d, "close", Qt::QueuedConnection);
+            return true;
+        });
+        drv.then([this]() { w.showTTestDialog(nullptr); });
+        waitJobs();
+        drv.step([this]() { return drv.dialogsAnswered(); });
+        // Leakage vs Frequency
+        useSetTab();
+        drv.onDialog("Leakage vs Frequency", [](QDialog* d) { return pickGroup(d, "lam", 3, "bit 1") && clickOk(d); });
+        drv.then([this]() { w.onRunSpectralLeakage(); });
+        waitJobs();
+        drv.step([this]() { return drv.dialogsAnswered(); });
+        // Average per group
+        useSetTab();
+        drv.onDialog("Average Trace", [](QDialog* d) {
+            selectItem(d, "Each t-test group separately");
+            return pickGroup(d, "lam", 3, "bit 1") && clickOk(d);
+        });
+        drv.then([this]() { w.onRunAverage(); });
+        waitJobs();
+        drv.then([this]() {
+            if (peakOfActiveCurve() != kLabelLeakAt) drv.fail("the difference of means misses the leak");
+        });
+        // SNR
+        useSetTab();
+        drv.onDialog("SNR — configuration", [](QDialog* d) {
+            selectItem(d, "Hamming weight");
+            return pickGroup(d, "lam", 3, {}) && clickOk(d);
+        });
+        drv.then([this]() { w.onRunSNR(); });
+        waitJobs();
+        drv.step([this]() { return drv.dialogsAnswered(); });
+        // Static SNR
+        useSetTab();
+        drv.onDialog("Static SNR", [](QDialog* d) { return clickOk(d); });
+        drv.then([this]() { w.onRunStaticSNR(); });
+        waitJobs();
+        drv.step([this]() { return drv.dialogsAnswered(); });
+        // CPA, with the model made from the label
+        useSetTab();
+        drv.onDialog("CPA — Configuration", [this](QDialog* d) {
+            auto* m = d->findChild<QComboBox*>("cpa_model");
+            if (!m || m->findText("lam: each bit") < 0) { drv.fail("no model from the label"); return false; }
+            m->setCurrentIndex(m->findText("lam: each bit"));
+            for (auto* sp : d->findChildren<QSpinBox*>())
+                if (sp->maximum() == 65536 && sp->value() != 256) drv.fail("the model didn't set M");
+            return clickOk(d);
+        });
+        drv.onDialog("CPA — Leakage Model Editor", [](QDialog* d) { return clickButton(d, "Run  Test Model"); });
+        drv.onDialog("CPA — Leakage Model Editor", [](QDialog* d) {
+            QAbstractButton* run = button(d, "Run CPA");
+            if (!run || !run->isEnabled()) return false;
+            clickLater(run);
+            return true;
+        });
+        drv.onDialog("CPA  n=", [this](QDialog* d) {
+            if (!d->windowTitle().contains("n=800") || !d->windowTitle().contains("best=h25"))
+                drv.fail("CPA: " + d->windowTitle());
+            QMetaObject::invokeMethod(d, "close", Qt::QueuedConnection);
+            return true;
+        });
+        drv.then([this]() { w.onRunCpa(); });
+        drv.step([this]() {
+            if (!drv.dialogsAnswered()) return false;
+            for (QWidget* t : QApplication::topLevelWidgets())
+                if (t->isVisible() && t->windowTitle().startsWith("CPA")) return false;
+            return true;
+        });
+        // Cross-correlation
+        useSetTab();
+        drv.onDialog("Cross-Correlation — configuration", [](QDialog* d) { return clickOk(d); });
+        drv.then([this]() { w.onRunXCorr(); });
+        drv.step([this]() { return drv.dialogsAnswered() && jobsIdle(); });
+        drv.then([]() {
+            for (QWidget* t : QApplication::topLevelWidgets())
+                if (t->isVisible() && (t->windowTitle().startsWith("Cross") || t->windowTitle().startsWith("Template")))
+                    t->close();
+        });
+        // FFT
+        useSetTab();
+        drv.onDialog("FFT Spectrum — configuration", [](QDialog* d) { return clickOk(d); });
+        drv.then([this]() { w.onRunFFT(); });
+        drv.step([this]() { return drv.dialogsAnswered() && jobsIdle(); });
+
+        closeResultTabs();
+        useSetTab();
+        // Reopened from its list: the same.
+        drv.then([this, list]() {
+            for (int i = tabs() - 1; i >= 0; --i)
+                if (w.datasets_[static_cast<size_t>(i)].display_name == "run.trslist") w.closeDatasetAt(i);
+            w.openAnyFile(list);
+        });
+        drv.then(checkSet);
+        drv.then([this]() {
+            for (int i = tabs() - 1; i >= 0; --i)
+                if (w.datasets_[static_cast<size_t>(i)].display_name == "run.trslist") w.closeDatasetAt(i);
         });
         drv.step([]() { QApplication::processEvents(); return true; });
     }
@@ -978,6 +1146,12 @@ int main(int argc, char** argv) {
             QString err;
             saveNpz(capture_dir + "/other/labels.npz", {{"lam.npy", npyBytes("|u1", "(3,)", three, 3)}}, err);
         }
+        if (scenario == "combined_npy") {
+            capture_dir = dir.filePath("runs");
+            for (const char* sub : {"run_a", "run_b"}) QDir().mkpath(capture_dir + "/" + sub);
+            writeNpyCapture(capture_dir + "/run_a", 400, 2000, 6);
+            writeNpyCapture(capture_dir + "/run_b", 400, 2000, 7);
+        }
         GuiTestAccess t{win, drv, file, list, long_file, capture_dir};
         double rss_first = 0, rss_last = 0;
 
@@ -991,6 +1165,7 @@ int main(int argc, char** argv) {
             else if (scenario == "plot_whole_trace") t.scenarioPlotWholeTrace();
             else if (scenario == "export_npz")   t.scenarioExportNpz();
             else if (scenario == "npy_labels")   t.scenarioNpyLabels();
+            else if (scenario == "combined_npy") t.scenarioCombinedNpy();
             else if (scenario == "snapshots")    t.scenarioSnapshots();
             else if (scenario == "combined")     t.scenarioCombined();
             else if (scenario == "quit_dialogs") { t.scenarioQuitDialogs(); loops = 1; break; }

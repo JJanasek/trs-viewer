@@ -500,6 +500,36 @@ static QString groupNote(const TrsHeader& h, const GroupBy& g) {
     return what + QString(" bit %1").arg(bit);
 }
 
+// Leakage models CPA can start from for a file's byte-array labels.
+struct LabelModel { QString name; int32_t M; QString code; };
+static std::vector<LabelModel> labelModels(const TrsHeader& h) {
+    std::vector<LabelModel> out;
+    if (h.param_map.count("LEGACY_DATA")) return out;
+    std::vector<std::pair<std::string, TrsTraceParam>> params(h.param_map.begin(), h.param_map.end());
+    std::stable_sort(params.begin(), params.end(),
+                     [](const auto& a, const auto& b) { return a.second.offset < b.second.offset; });
+    for (const auto& [std_name, p] : params) {
+        if (p.type != TrsParamType::BYTE || p.length < 2) continue;
+        const QString name = QString::fromStdString(std_name);
+        out.push_back({QString("%1: each bit").arg(name), p.length * 8,
+            QString("import numpy as np\n\n"
+                    "# One hypothesis per bit of %1: key_guess = 8 * byte + bit, so M = %2.\n"
+                    "def get_leakages(plaintexts, ciphertexts, key_guess):\n"
+                    "    %1 = plaintexts[:, %3:%4]\n"
+                    "    return ((%1[:, key_guess // 8] >> (key_guess %% 8)) & 1).astype(np.float32)\n")
+                .arg(name).arg(p.length * 8).arg(p.offset).arg(p.offset + p.length).replace("%%", "%")});
+        out.push_back({QString("%1: Hamming weight of each byte").arg(name), p.length,
+            QString("import numpy as np\n\n"
+                    "HW = np.array([bin(x).count('1') for x in range(256)], dtype=np.float32)\n\n"
+                    "# One hypothesis per byte of %1: key_guess = byte, so M = %2.\n"
+                    "def get_leakages(plaintexts, ciphertexts, key_guess):\n"
+                    "    %1 = plaintexts[:, %3:%4]\n"
+                    "    return HW[%1[:, key_guess]]\n")
+                .arg(name).arg(p.length).arg(p.offset).arg(p.offset + p.length)});
+    }
+    return out;
+}
+
 // For the dialogs that need per-trace data when a file has none.
 static QString noDataBytesText(const TrsFile& f) {
     return QString::fromStdString(f.path()).endsWith(".npy", Qt::CaseInsensitive)
@@ -1410,7 +1440,7 @@ QWidget* MainWindow::buildStartPage() {
     sub->setWordWrap(true);
 
     auto* btns = new QHBoxLayout;
-    auto* b_open   = new QPushButton("Open TRS File…  (Ctrl+O)");
+    auto* b_open   = new QPushButton("Open File…  (Ctrl+O)");
     auto* b_npy    = new QPushButton("Open NPY/NPZ…");
     auto* b_subset = new QPushButton("Import Subset…");
     auto* b_comb   = new QPushButton("Open Several as One…");
@@ -1507,15 +1537,15 @@ void MainWindow::setupMenuBar() {
 
     // ---- File ----
     QMenu* file_menu = addMenu("&File");
-    auto* act_open = new QAction("&Open TRS File…", this);
+    auto* act_open = new QAction("&Open File…", this);
     act_open->setShortcut(QKeySequence::Open);
     connect(act_open, &QAction::triggered, this, &MainWindow::onOpenFile);
     file_menu->addAction(act_open);
     auto* act_open_comb = new QAction("Open Several Files as &One…", this);
     act_open_comb->setToolTip(
-        "Read several TRS files one after another as one trace set — e.g. a capture "
-        "split into parts of 500 traces. Nothing is copied; the list can be saved "
-        "(.trslist) to reopen the set.");
+        "Read several trace files or capture folders one after another as one trace set — "
+        "e.g. a capture split into parts of 500 traces, or several runs with their labels. "
+        "Nothing is copied; the list can be saved (.trslist) to reopen the set.");
     connect(act_open_comb, &QAction::triggered, this, &MainWindow::onOpenCombined);
     file_menu->addAction(act_open_comb);
     auto* act_open_npy = new QAction("Open &NPY/NPZ as Traces…", this);
@@ -1842,7 +1872,7 @@ void MainWindow::updateStateIndicators() {
 
     if (!hasActiveDs()) {
         setWindowTitle("TRS Viewer");
-        if (lbl_state_) lbl_state_->setText("No file open — File › Open TRS File… (Ctrl+O)");
+        if (lbl_state_) lbl_state_->setText("No file open — File › Open File… (Ctrl+O)");
         if (lbl_view_)    lbl_view_->clear();
         if (lbl_measure_) lbl_measure_->setText("–");
         if (grp_trace_)    grp_trace_->setEnabled(false);
@@ -1985,15 +2015,15 @@ void MainWindow::updateRecentDir(const QString& key, const QString& file_path) {
 
 void MainWindow::onOpenFile() {
     QStringList paths = QFileDialog::getOpenFileNames(
-        this, "Open TRS file(s)", recentDir("trs"),
-        "TRS files and trace lists (*.trs *.trslist);;All files (*)");
+        this, "Open trace file(s)", recentDir("trs"),
+        "Trace files (*.trs *.trslist *.npy *.npz);;All files (*)");
     if (paths.isEmpty()) return;
     updateRecentDir("trs", paths.last());
-    // Each becomes its own tab (openFile() already handles that); loaded
+    // Each becomes its own tab; loaded
     // in the order the dialog returns them, mmap-backed so nothing here
     // blocks on file size regardless of how many are picked at once — see
     // openFile()'s own comment (no prefetch here, on-demand page faults only).
-    for (const QString& path : paths) openFile(path);
+    for (const QString& path : paths) openAnyFile(path);
 }
 
 // The file's whole header in a window: basics, description, the trace-set
@@ -2119,25 +2149,27 @@ static bool openTraceSource(TrsFile& f, const QString& path, std::string& err) {
     if (!path.endsWith(".trslist", Qt::CaseInsensitive)) return f.open(path.toStdString(), err);
     std::vector<std::string> parts;
     return readTraceList(path.toStdString(), parts, err)
-        && f.openCombined(parts, err, path.toStdString());
+        && f.openCombined(parts, err, path.toStdString(), &openTraceFile);
 }
 
 void MainWindow::onOpenCombined() {
-    const QStringList paths = QFileDialog::getOpenFileNames(
-        this, "Open as one dataset — choose the files", recentDir("trs"),
-        "TRS files (*.trs);;All files (*)");
-    if (paths.isEmpty()) return;
-    updateRecentDir("trs", paths.last());
     CombineChoice c;
-    if (!showCombineDialog(this, paths, recentDir("trs"), c)) return;
+    if (!showCombineDialog(this, {}, recentDir("trs"), c) || c.paths.empty()) return;
+    updateRecentDir("trs", QString::fromStdString(c.paths.back()));
+    // An .npz is loaded whole (see openNpyTraces()).
+    int64_t npz_bytes = 0;
+    for (const std::string& p : c.paths)
+        if (QString::fromStdString(p).endsWith(".npz", Qt::CaseInsensitive))
+            npz_bytes += 3 * QFileInfo(QString::fromStdString(p)).size();
+    if (!confirmMemory(this, npz_bytes, "Opening these archives")) return;
     auto f = std::make_shared<TrsFile>();
     std::string err;
-    if (!f->openCombined(c.paths, err, c.list_path.toStdString())) {
+    if (!f->openCombined(c.paths, err, c.list_path.toStdString(), &openTraceFile)) {
         QMessageBox::critical(this, "Error opening the files", QString::fromStdString(err));
         return;
     }
     const QString name = !c.list_path.isEmpty() ? QFileInfo(c.list_path).fileName()
-        : QString("%1 + %2 more").arg(QFileInfo(QString::fromStdString(c.paths.front())).fileName())
+        : QString("%1 + %2 more").arg(QString::fromStdString(traceFileName(c.paths.front())))
                                  .arg(c.paths.size() - 1);
     showTraceSet(std::move(f), name, c.list_path);
 }
@@ -2163,6 +2195,13 @@ void MainWindow::showTraceSet(std::shared_ptr<TrsFile> f, const QString& display
     // to always do unconditionally.
 
     const QString notes = QString::fromStdString(f->openNotes());
+    // Labels that came from somewhere other than the file's own header.
+    QString labels_found;
+    if (f->dataInMemory() && !f->header().param_map.empty()) {
+        QStringList names;
+        for (const auto& kv : f->header().param_map) names << QString::fromStdString(kv.first);
+        labels_found = "Labels: " + names.join(", ");
+    }
     Dataset ds;
     ds.file         = std::move(f);
     ds.display_name = display_name;
@@ -2191,6 +2230,7 @@ void MainWindow::showTraceSet(std::shared_ptr<TrsFile> f, const QString& display
     updateFileInfo();
     onApplyTraces();
     updateViewLayout();
+    if (!labels_found.isEmpty()) statusBar()->showMessage(labels_found, 15000);
     if (!notes.isEmpty()) QMessageBox::warning(this, "Opened with notes", notes);
 }
 
@@ -2271,7 +2311,7 @@ void MainWindow::updateTraceDataDisplay() {
     if (const int k = activeDs().file->partOf(ti); k >= 0) {
         const auto p = activeDs().file->parts()[static_cast<size_t>(k)];
         text += QString("File:  %1, trace %2\n")
-            .arg(QString::fromStdString(p.path).section('/', -1)).arg(ti - p.first_trace);
+            .arg(QString::fromStdString(traceFileName(p.path))).arg(ti - p.first_trace);
     }
 
     // Named parameters, in the order they are stored, each decoded by its
@@ -3529,104 +3569,6 @@ static bool saveNpy2D(const QString& path, const float* data,
     if (!fp) { err = "Cannot create: " + path; return false; }
     std::fwrite(bytes.data(), 1, bytes.size(), fp);
     std::fclose(fp);
-    return true;
-}
-
-// Parse a NPY array from an in-memory byte buffer into a flat float32 vector + shape.
-static bool parseNpyBytes(const std::vector<uint8_t>& buf,
-                           std::vector<float>& data,
-                           std::vector<int64_t>& shape,
-                           QString& err)
-{
-    if (buf.size() < 10) { err = "NPY entry too small."; return false; }
-    if (buf[0] != 0x93 || buf[1] != 'N' || buf[2] != 'U' ||
-        buf[3] != 'M'  || buf[4] != 'P' || buf[5] != 'Y') {
-        err = "Entry does not have NPY magic."; return false;
-    }
-    uint8_t ver = buf[6];
-    uint32_t header_len = 0;
-    size_t hdr_start;
-    if (ver == 1) {
-        header_len = static_cast<uint32_t>(buf[8]) | (static_cast<uint32_t>(buf[9]) << 8);
-        hdr_start = 10;
-    } else {
-        if (buf.size() < 12) { err = "NPY v2+ header too short."; return false; }
-        header_len = static_cast<uint32_t>(buf[8])  | (static_cast<uint32_t>(buf[9])  << 8)
-                   | (static_cast<uint32_t>(buf[10]) << 16) | (static_cast<uint32_t>(buf[11]) << 24);
-        hdr_start = 12;
-    }
-    if (hdr_start + header_len > buf.size()) { err = "NPY header truncated."; return false; }
-    std::string hdr(reinterpret_cast<const char*>(buf.data() + hdr_start), header_len);
-
-    // dtype detection
-    bool is_f32 = (hdr.find("'<f4'") != std::string::npos || hdr.find("\"<f4\"") != std::string::npos);
-    bool is_f64 = (hdr.find("'<f8'") != std::string::npos || hdr.find("\"<f8\"") != std::string::npos ||
-                   hdr.find("'float64'") != std::string::npos);
-    bool is_u8  = (hdr.find("'|u1'") != std::string::npos || hdr.find("\"u1\""  ) != std::string::npos ||
-                   hdr.find("'uint8'") != std::string::npos);
-    bool is_i16 = (hdr.find("'<i2'") != std::string::npos || hdr.find("\"<i2\"") != std::string::npos);
-    bool is_i32 = (hdr.find("'<i4'") != std::string::npos || hdr.find("\"<i4\"") != std::string::npos);
-    bool is_i64 = (hdr.find("'<i8'") != std::string::npos || hdr.find("\"<i8\"") != std::string::npos);
-    if (!is_f32 && !is_f64 && !is_u8 && !is_i16 && !is_i32 && !is_i64) {
-        err = "Unsupported dtype. Supported: float32, float64, uint8, int16, int32, int64."; return false;
-    }
-
-    auto sp = hdr.find("'shape'");
-    if (sp == std::string::npos) sp = hdr.find("\"shape\"");
-    if (sp == std::string::npos) { err = "Cannot find shape in NPY header."; return false; }
-    auto lp = hdr.find('(', sp);
-    auto rp = hdr.find(')', lp != std::string::npos ? lp : 0);
-    if (lp == std::string::npos || rp == std::string::npos) { err = "Cannot parse shape."; return false; }
-    std::string shape_str = hdr.substr(lp + 1, rp - lp - 1);
-    shape.clear();
-    size_t pos = 0;
-    while (pos < shape_str.size()) {
-        while (pos < shape_str.size() &&
-               (shape_str[pos] == ' ' || shape_str[pos] == ',')) pos++;
-        if (pos >= shape_str.size() || !std::isdigit(static_cast<unsigned char>(shape_str[pos]))) break;
-        size_t end = pos;
-        while (end < shape_str.size() && std::isdigit(static_cast<unsigned char>(shape_str[end]))) end++;
-        shape.push_back(std::stoll(shape_str.substr(pos, end - pos)));
-        pos = end;
-    }
-    if (shape.empty()) { err = "Empty shape."; return false; }
-
-    int64_t n_elements = 1;
-    for (int64_t d : shape) n_elements *= d;
-
-    size_t data_offset = hdr_start + header_len;
-    size_t elem_bytes = is_f32 ? 4 : is_f64 ? 8 : is_u8 ? 1 : is_i16 ? 2 : is_i32 ? 4 : 8;
-    if (data_offset + static_cast<size_t>(n_elements) * elem_bytes > buf.size()) {
-        err = "NPY data truncated."; return false;
-    }
-    data.resize(static_cast<size_t>(n_elements));
-    const uint8_t* src = buf.data() + data_offset;
-    if (is_f32) {
-        std::memcpy(data.data(), src, static_cast<size_t>(n_elements) * 4);
-    } else if (is_f64) {
-        for (int64_t i = 0; i < n_elements; i++) {
-            double v; std::memcpy(&v, src + i * 8, 8);
-            data[static_cast<size_t>(i)] = static_cast<float>(v);
-        }
-    } else if (is_u8) {
-        for (int64_t i = 0; i < n_elements; i++)
-            data[static_cast<size_t>(i)] = static_cast<float>(src[i]);
-    } else if (is_i16) {
-        for (int64_t i = 0; i < n_elements; i++) {
-            int16_t v; std::memcpy(&v, src + i * 2, 2);
-            data[static_cast<size_t>(i)] = static_cast<float>(v);
-        }
-    } else if (is_i32) {
-        for (int64_t i = 0; i < n_elements; i++) {
-            int32_t v; std::memcpy(&v, src + i * 4, 4);
-            data[static_cast<size_t>(i)] = static_cast<float>(v);
-        }
-    } else { // i64
-        for (int64_t i = 0; i < n_elements; i++) {
-            int64_t v; std::memcpy(&v, src + i * 8, 8);
-            data[static_cast<size_t>(i)] = static_cast<float>(v);
-        }
-    }
     return true;
 }
 
@@ -4922,42 +4864,6 @@ void MainWindow::onLoadSpectrumNpz() {
 // ---------------------------------------------------------------------------
 // Open NPY / NPZ file as a trace set (loads into the main viewer)
 // ---------------------------------------------------------------------------
-// Reads the labels archive beside a trace matrix, if there is one, into the
-// file's per-trace data. Returns what it found, for the status bar.
-static QString attachLabelsNextTo(TrsFile& f, const QString& npy_path, QWidget* parent) {
-    const QString labels_path = findLabelsNextTo(npy_path);
-    if (labels_path.isEmpty()) return {};
-    const QString name = QFileInfo(labels_path).fileName();
-    if (!confirmMemory(parent, 3 * QFileInfo(labels_path).size(), "Reading the labels in " + name,
-                       "Open the traces without them by moving the file away."))
-        return {};
-    std::map<std::string, std::vector<uint8_t>> entries;
-    QString err;
-    if (!loadNpz(labels_path, entries, err)) {
-        QMessageBox::warning(parent, "Labels not loaded",
-                             QString("%1 could not be read: %2\nThe traces open without labels.").arg(name, err));
-        return {};
-    }
-    TraceLabels labels;
-    packTraceLabels(entries, f.header().num_traces, {}, labels);
-    if (labels.params.empty()) {
-        QMessageBox::warning(parent, "Labels not loaded",
-                             QString("%1 has no array with %2 rows (one per trace).\n"
-                                     "The traces open without labels.").arg(name).arg(f.header().num_traces));
-        return {};
-    }
-    QStringList names;
-    for (const auto& kv : labels.params) names << QString::fromStdString(kv.first);
-    QString note = QString("Labels from %1: %2").arg(name, names.join(", "));
-    if (!labels.unusable.empty()) {
-        QStringList left_out;
-        for (const auto& u : labels.unusable) left_out << QString::fromStdString(u);
-        note += QString(" (left out: %1)").arg(left_out.join(", "));
-    }
-    f.attachData(labels.data.data(), labels.data_length, labels.params, note.toStdString());
-    return note;
-}
-
 void MainWindow::onOpenNpyTraces() {
     QString path = QFileDialog::getOpenFileName(
         this, "Open NPY/NPZ as traces",
@@ -4968,11 +4874,6 @@ void MainWindow::onOpenNpyTraces() {
 }
 
 void MainWindow::openNpyTraces(const QString& path) {
-    std::vector<float> traces_flat;
-    int64_t n_traces = 0, n_samples = 0;
-    TraceLabels labels;
-    QString err;
-
     if (path.endsWith(".npz", Qt::CaseInsensitive)) {
         // Loaded whole: the archive's entries, the traces taken from them and
         // the in-memory trace set made from those — about three times the
@@ -4981,41 +4882,13 @@ void MainWindow::openNpyTraces(const QString& path) {
                            "Export fewer traces or a narrower range into the archive, or "
                            "save it as .npy, which is read without loading it whole."))
             return;
-        std::map<std::string, std::vector<uint8_t>> entries;
-        if (!loadNpz(path, entries, err)) {
-            QMessageBox::critical(this, "Load failed", err); return;
-        }
-
-        // --- Find the traces entry (2-D float array) ---
-        auto it = entries.find("traces.npy");
-        if (it == entries.end()) it = entries.find("traces");
-        if (it == entries.end()) {
-            for (auto& kv : entries) {
-                std::vector<int64_t> sh; std::vector<float> tmp;
-                if (parseNpyBytes(kv.second, tmp, sh, err) && sh.size() == 2) {
-                    it = entries.find(kv.first); break;
-                }
-            }
-        }
-        if (it == entries.end()) {
-            QMessageBox::critical(this, "Load failed",
-                "No 2-D traces array found. Expected an entry named 'traces' or 'traces.npy'.");
+        auto f = std::make_shared<TrsFile>();
+        std::string npz_err;
+        if (!openNpzTraces(*f, path.toStdString(), npz_err)) {
+            QMessageBox::critical(this, "Load failed", QString::fromStdString(npz_err));
             return;
         }
-        std::vector<int64_t> sh;
-        if (!parseNpyBytes(it->second, traces_flat, sh, err)) {
-            QMessageBox::critical(this, "Load failed", err); return;
-        }
-        if (sh.size() != 2) {
-            QMessageBox::critical(this, "Load failed",
-                QString("Traces entry is %1-D; expected 2-D.").arg(sh.size()));
-            return;
-        }
-        n_traces = sh[0]; n_samples = sh[1];
-        std::string traces_key = it->first;
-
-        // Everything else with a row per trace is a label.
-        packTraceLabels(entries, n_traces, traces_key, labels);
+        showTraceSet(std::move(f), QString::fromStdString(traceFileName(path.toStdString())), path);
     } else {
         // Plain .npy: memory-map directly rather than reading the whole file into
         // RAM (a copy here plus the copy TrsFile::openFromArray used to make meant
@@ -5026,78 +4899,18 @@ void MainWindow::openNpyTraces(const QString& path) {
             QMessageBox::critical(this, "Load failed", QString::fromStdString(npy_err)); return;
         }
         // No prefetch here — see the matching comment in openFile().
-        const QString labels_note = attachLabelsNextTo(*f, path, this);
-
-        Dataset ds;
-        ds.file         = std::move(f);
-        ds.display_name = QFileInfo(path).fileName();
-        ds.plot_widget  = createPlotWidgetForTab();
-        datasets_.push_back(std::move(ds));
-        active_idx_ = static_cast<int>(datasets_.size()) - 1;
-
-        tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
-        tab_bar_->setCurrentIndex(active_idx_);
-        addRecentFile(path);
-
-        rebuildTransformList();
-        plotWidget()->setTransforms(activeDs().pipeline);
-
-        int n = activeDs().file->header().num_traces;
-        spin_first_->setMaximum(std::max(0, n - 1));
-        spin_first_->setValue(0);
-        spin_count_->setMaximum(n);
-        spin_count_->setValue(1);
-
-        updateFileInfo();
-        onApplyTraces();
-        updateViewLayout();
-        if (!labels_note.isEmpty()) statusBar()->showMessage(labels_note, 15000);
-        return;
+        const QString labels_path = findLabelsNextTo(path);
+        QString note, problem;
+        if (!labels_path.isEmpty()
+            && confirmMemory(this, 3 * QFileInfo(labels_path).size(),
+                             "Reading the labels in " + QFileInfo(labels_path).fileName(),
+                             "Open the traces without them by moving the file away."))
+            attachLabelsNextTo(*f, path, note, problem);
+        showTraceSet(std::move(f), QString::fromStdString(traceFileName(path.toStdString())), path);
+        if (!note.isEmpty()) statusBar()->showMessage(note, 15000);
+        if (!problem.isEmpty())
+            QMessageBox::warning(this, "Labels not loaded", problem + "\nThe traces open without labels.");
     }
-
-    if (n_traces < 1 || n_samples < 1) {
-        QMessageBox::critical(this, "Load failed", "Empty array."); return;
-    }
-
-    // Build the in-memory TrsFile
-    auto f = std::make_shared<TrsFile>();
-    f->openFromArray(traces_flat.data(),
-                     static_cast<int32_t>(n_traces),
-                     static_cast<int32_t>(n_samples),
-                     path.toStdString(),
-                     labels.data.empty() ? nullptr : labels.data.data(),
-                     labels.data_length);
-    if (!labels.params.empty())
-        f->setParamMap(labels.params);
-
-    Dataset ds;
-    ds.file         = std::move(f);
-    ds.display_name = QFileInfo(path).fileName();
-    ds.plot_widget  = createPlotWidgetForTab();
-    datasets_.push_back(std::move(ds));
-    active_idx_ = static_cast<int>(datasets_.size()) - 1;
-
-    tab_bar_->addTab(datasets_[static_cast<size_t>(active_idx_)].display_name);
-    tab_bar_->setCurrentIndex(active_idx_);
-    addRecentFile(path);
-
-    rebuildTransformList();
-    plotWidget()->setTransforms(activeDs().pipeline);
-    {
-        const TrsHeader& fh = activeDs().file->header();
-        plotWidget()->setAxisMeta(fileSampleInterval(fh), 0, fileValueScale(fh),
-                                  QString::fromStdString(fh.label_y));
-    }
-
-    int n = activeDs().file->header().num_traces;
-    spin_first_->setMaximum(std::max(0, n - 1));
-    spin_first_->setValue(0);
-    spin_count_->setMaximum(n);
-    spin_count_->setValue(1);
-
-    updateFileInfo();
-    onApplyTraces();
-    updateViewLayout();
 }
 
 // ---------------------------------------------------------------------------
@@ -13064,7 +12877,7 @@ void MainWindow::onRunCpa() {
     const TrsHeader& h = activeDs().file->header();
     if (h.data_length <= 0) {
         QMessageBox::warning(this, "CPA",
-            "This trace set has no per-trace data (data_length = 0).\n"
+            noDataBytesText(*activeDs().file) + "\n"
             "CPA requires plaintext/ciphertext data stored in each trace.");
         return;
     }
@@ -13135,6 +12948,18 @@ void MainWindow::onRunCpa() {
     sp_m->setValue(256);
     sp_m->setToolTip("Number of model evaluations (0 to M-1). 256 for a full AES key byte.");
     fl_hyp->addRow("M:", sp_m);
+    const std::vector<LabelModel> label_models = labelModels(h);
+    auto* cmb_model = new QComboBox;
+    cmb_model->setObjectName("cpa_model");
+    cmb_model->addItem("AES S-box, key byte (a template to edit)");
+    for (const LabelModel& lm : label_models) cmb_model->addItem(lm.name);
+    cmb_model->setToolTip("What the next step's editor starts from; it sets M to match. "
+                          "You can change the code there, or load a saved model.");
+    cmb_model->setVisible(!label_models.empty());
+    if (!label_models.empty()) fl_hyp->addRow("Model:", cmb_model);
+    connect(cmb_model, QOverload<int>::of(&QComboBox::currentIndexChanged), cfg, [=](int i) {
+        if (i > 0) sp_m->setValue(label_models[static_cast<size_t>(i - 1)].M);
+    });
     auto* mem = new DialogMemory("cpa");
     mem->bind(sp_m, "hypotheses");
     connect(cfg, &QObject::destroyed, cfg, [mem]() { delete mem; });
@@ -13216,6 +13041,8 @@ void MainWindow::onRunCpa() {
         run.count   = static_cast<int32_t>(std::min(sp_count->value(), n_total - sp_first->value()));
         run.s_first = sp_s_first->value();
         run.s_count = sp_s_count->value();
+        if (cmb_model->currentIndex() > 0)
+            run.model_code = label_models[static_cast<size_t>(cmb_model->currentIndex() - 1)].code;
         run.M       = static_cast<int32_t>(sp_m->value());
         // Shifts for exactly these traces, by absolute index; traces the
         // alignment doesn't cover are left out (as discarded ones are).
@@ -13263,6 +13090,7 @@ void MainWindow::runCpa(const CpaRun& run) {
     // ---- Step 3: Leakage model editor dialog ----
     LeakageModelDialog model_dlg(run.file.get(), first_trace,
                                  std::min(5, num_traces), this);
+    if (!run.model_code.isEmpty()) model_dlg.setCode(run.model_code);
     if (model_dlg.exec() != QDialog::Accepted) return;
 
     // Get the compiled model (re-compile if user didn't click Test first)

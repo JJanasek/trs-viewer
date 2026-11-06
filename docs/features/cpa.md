@@ -16,6 +16,7 @@ read once for all guesses, so the range can be as long as the traces, even
   select mode: drag the region to analyse and it fills in *First sample* and
   *Count* (the dialog stays open meanwhile).
 - **M (hypotheses)** — number of key guesses to test (1–65536); for AES key byte attacks use 256, for direct data correlation set M to the data field length
+- **Model** (files with named labels) — start the editor from a ready model of a byte-array label, and set M to match: **each bit** (M = 8 × bytes, `key_guess` = 8 × byte + bit) or **Hamming weight of each byte** (M = bytes). Otherwise the editor starts from the AES template.
 - **Alignment** — apply stored alignment shifts. Ticking it fills in the
   aligned traces and samples as a starting point; both ranges stay editable,
   so you can run on any part of the aligned set (each trace uses its own
@@ -51,7 +52,7 @@ def get_leakages(plaintexts, ciphertexts, key_guess):
 
 For LEGACY_DATA files (PT+CT in 32 bytes), correlate against plaintext byte `b` by setting M = 16 and indexing into the first half; for the ciphertext, add 16 to the index.
 
-If the file has named labels ([a `.npy` with `labels.npz`](npy-npz.md), TRS v2 parameters), the editor lists where each one is, e.g. `lam = plaintexts[:, 8:40]`. To scan every bit of a 32-byte label in one run, set M = 256:
+If the file has named labels ([a `.npy` with `labels.npz`](npy-npz.md), TRS v2 parameters), the editor lists where each one is, e.g. `lam = plaintexts[:, 8:40]`. The **each bit** model looks like this (M = 256 for a 32-byte label at data byte 8):
 ```python
 def get_leakages(plaintexts, ciphertexts, key_guess):
     byte, bit = key_guess // 8, key_guess % 8

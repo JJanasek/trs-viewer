@@ -8,6 +8,7 @@
 #include "trs_file.h"
 
 #include <QString>
+#include <QStringList>
 
 #include <cstdint>
 #include <map>
@@ -56,6 +57,27 @@ struct TraceLabels {
 // dtype (the low byte) — files made for byte-indexed tools expect that.
 void packTraceLabels(const std::map<std::string, std::vector<uint8_t>>& entries,
                      int64_t n_traces, const std::string& skip_entry, TraceLabels& out);
+
+// A NPY array from memory as a flat float32 vector + shape.
+bool parseNpyBytes(const std::vector<uint8_t>& buf, std::vector<float>& data,
+                   std::vector<int64_t>& shape, QString& err);
+
+// Loads an .npz whole as a trace set: the entry named traces, or the first 2-D
+// array, with the other per-trace arrays as labels.
+bool openNpzTraces(TrsFile& f, const std::string& path, std::string& error);
+
+// Reads the labels archive beside an opened .npy into its per-trace data.
+// note: what was found. problem: why an archive that exists wasn't used.
+void attachLabelsNextTo(TrsFile& f, const QString& npy_path, QString& note, QString& problem);
+
+// Any kind of trace file: .npy with its labels, .npz, or TRS. For a .npy,
+// labels that couldn't be used are a note on the file. A TrsFile::PartOpener.
+bool openTraceFile(TrsFile& f, const std::string& path, std::string& error);
+
+// The trace files of a capture folder: its traces.npy or traces.npz if it has
+// one, otherwise its .trs and .npy files and the .npz files that aren't labels.
+// A folder with none of those: the same for each folder directly inside it.
+QStringList traceFilesInFolder(const QString& folder);
 
 // The labels archive beside a trace matrix "<dir>/<stem>.npy": the first of
 // <stem>_labels.npz, <stem>-labels.npz, <stem>.labels.npz, <stem>.npz and

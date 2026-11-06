@@ -243,6 +243,10 @@ LeakageModelDialog::LeakageModelDialog(TrsFile* file, int32_t first_trace,
     connect(btn_cancel,     &QPushButton::clicked, this, &QDialog::reject);
 }
 
+void LeakageModelDialog::setCode(const QString& code) {
+    editor_->setPlainText(code);
+}
+
 QString LeakageModelDialog::code() const {
     return editor_->toPlainText();
 }

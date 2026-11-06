@@ -36,6 +36,7 @@ public:
                                 int32_t n_preview, QWidget* parent = nullptr);
 
     QString      code() const;
+    void         setCode(const QString& code);
     LeakageModel* compiledModel() { return model_.get(); }
 
 private slots:

@@ -237,6 +237,104 @@ bool loadNpz(const QString& path,
     std::fclose(fp);
     return true;
 }
+// Parse a NPY array from an in-memory byte buffer into a flat float32 vector + shape.
+bool parseNpyBytes(const std::vector<uint8_t>& buf,
+                   std::vector<float>& data,
+                   std::vector<int64_t>& shape,
+                   QString& err)
+{
+    if (buf.size() < 10) { err = "NPY entry too small."; return false; }
+    if (buf[0] != 0x93 || buf[1] != 'N' || buf[2] != 'U' ||
+        buf[3] != 'M'  || buf[4] != 'P' || buf[5] != 'Y') {
+        err = "Entry does not have NPY magic."; return false;
+    }
+    uint8_t ver = buf[6];
+    uint32_t header_len = 0;
+    size_t hdr_start;
+    if (ver == 1) {
+        header_len = static_cast<uint32_t>(buf[8]) | (static_cast<uint32_t>(buf[9]) << 8);
+        hdr_start = 10;
+    } else {
+        if (buf.size() < 12) { err = "NPY v2+ header too short."; return false; }
+        header_len = static_cast<uint32_t>(buf[8])  | (static_cast<uint32_t>(buf[9])  << 8)
+                   | (static_cast<uint32_t>(buf[10]) << 16) | (static_cast<uint32_t>(buf[11]) << 24);
+        hdr_start = 12;
+    }
+    if (hdr_start + header_len > buf.size()) { err = "NPY header truncated."; return false; }
+    std::string hdr(reinterpret_cast<const char*>(buf.data() + hdr_start), header_len);
+
+    // dtype detection
+    bool is_f32 = (hdr.find("'<f4'") != std::string::npos || hdr.find("\"<f4\"") != std::string::npos);
+    bool is_f64 = (hdr.find("'<f8'") != std::string::npos || hdr.find("\"<f8\"") != std::string::npos ||
+                   hdr.find("'float64'") != std::string::npos);
+    bool is_u8  = (hdr.find("'|u1'") != std::string::npos || hdr.find("\"u1\""  ) != std::string::npos ||
+                   hdr.find("'uint8'") != std::string::npos);
+    bool is_i16 = (hdr.find("'<i2'") != std::string::npos || hdr.find("\"<i2\"") != std::string::npos);
+    bool is_i32 = (hdr.find("'<i4'") != std::string::npos || hdr.find("\"<i4\"") != std::string::npos);
+    bool is_i64 = (hdr.find("'<i8'") != std::string::npos || hdr.find("\"<i8\"") != std::string::npos);
+    if (!is_f32 && !is_f64 && !is_u8 && !is_i16 && !is_i32 && !is_i64) {
+        err = "Unsupported dtype. Supported: float32, float64, uint8, int16, int32, int64."; return false;
+    }
+
+    auto sp = hdr.find("'shape'");
+    if (sp == std::string::npos) sp = hdr.find("\"shape\"");
+    if (sp == std::string::npos) { err = "Cannot find shape in NPY header."; return false; }
+    auto lp = hdr.find('(', sp);
+    auto rp = hdr.find(')', lp != std::string::npos ? lp : 0);
+    if (lp == std::string::npos || rp == std::string::npos) { err = "Cannot parse shape."; return false; }
+    std::string shape_str = hdr.substr(lp + 1, rp - lp - 1);
+    shape.clear();
+    size_t pos = 0;
+    while (pos < shape_str.size()) {
+        while (pos < shape_str.size() &&
+               (shape_str[pos] == ' ' || shape_str[pos] == ',')) pos++;
+        if (pos >= shape_str.size() || !std::isdigit(static_cast<unsigned char>(shape_str[pos]))) break;
+        size_t end = pos;
+        while (end < shape_str.size() && std::isdigit(static_cast<unsigned char>(shape_str[end]))) end++;
+        shape.push_back(std::stoll(shape_str.substr(pos, end - pos)));
+        pos = end;
+    }
+    if (shape.empty()) { err = "Empty shape."; return false; }
+
+    int64_t n_elements = 1;
+    for (int64_t d : shape) n_elements *= d;
+
+    size_t data_offset = hdr_start + header_len;
+    size_t elem_bytes = is_f32 ? 4 : is_f64 ? 8 : is_u8 ? 1 : is_i16 ? 2 : is_i32 ? 4 : 8;
+    if (data_offset + static_cast<size_t>(n_elements) * elem_bytes > buf.size()) {
+        err = "NPY data truncated."; return false;
+    }
+    data.resize(static_cast<size_t>(n_elements));
+    const uint8_t* src = buf.data() + data_offset;
+    if (is_f32) {
+        std::memcpy(data.data(), src, static_cast<size_t>(n_elements) * 4);
+    } else if (is_f64) {
+        for (int64_t i = 0; i < n_elements; i++) {
+            double v; std::memcpy(&v, src + i * 8, 8);
+            data[static_cast<size_t>(i)] = static_cast<float>(v);
+        }
+    } else if (is_u8) {
+        for (int64_t i = 0; i < n_elements; i++)
+            data[static_cast<size_t>(i)] = static_cast<float>(src[i]);
+    } else if (is_i16) {
+        for (int64_t i = 0; i < n_elements; i++) {
+            int16_t v; std::memcpy(&v, src + i * 2, 2);
+            data[static_cast<size_t>(i)] = static_cast<float>(v);
+        }
+    } else if (is_i32) {
+        for (int64_t i = 0; i < n_elements; i++) {
+            int32_t v; std::memcpy(&v, src + i * 4, 4);
+            data[static_cast<size_t>(i)] = static_cast<float>(v);
+        }
+    } else { // i64
+        for (int64_t i = 0; i < n_elements; i++) {
+            int64_t v; std::memcpy(&v, src + i * 8, 8);
+            data[static_cast<size_t>(i)] = static_cast<float>(v);
+        }
+    }
+    return true;
+}
+
 bool parseNpyArray(const std::vector<uint8_t>& buf, NpyArray& out, QString& err)
 {
     out = NpyArray{};
@@ -426,4 +524,101 @@ QString findLabelsNextTo(const QString& npy_path) {
         if (QFileInfo::exists(candidate)) return candidate;
     }
     return {};
+}
+
+bool openNpzTraces(TrsFile& f, const std::string& path, std::string& error) {
+    std::map<std::string, std::vector<uint8_t>> entries;
+    QString err;
+    if (!loadNpz(QString::fromStdString(path), entries, err)) { error = err.toStdString(); return false; }
+
+    auto it = entries.find("traces.npy");
+    if (it == entries.end()) it = entries.find("traces");
+    if (it == entries.end()) {
+        for (auto kv = entries.begin(); kv != entries.end(); ++kv) {
+            std::vector<int64_t> sh;
+            std::vector<float> tmp;
+            if (parseNpyBytes(kv->second, tmp, sh, err) && sh.size() == 2) { it = kv; break; }
+        }
+    }
+    if (it == entries.end()) {
+        error = "No 2-D traces array found. Expected an entry named 'traces' or 'traces.npy'.";
+        return false;
+    }
+    std::vector<float> traces;
+    std::vector<int64_t> sh;
+    if (!parseNpyBytes(it->second, traces, sh, err)) { error = err.toStdString(); return false; }
+    if (sh.size() != 2) {
+        error = "Traces entry is " + std::to_string(sh.size()) + "-D; expected 2-D.";
+        return false;
+    }
+    if (sh[0] < 1 || sh[1] < 1) { error = "Empty array."; return false; }
+
+    TraceLabels labels;
+    packTraceLabels(entries, sh[0], it->first, labels);
+    f.openFromArray(traces.data(), static_cast<int32_t>(sh[0]), static_cast<int32_t>(sh[1]), path,
+                    labels.data.empty() ? nullptr : labels.data.data(), labels.data_length);
+    if (!labels.params.empty()) f.setParamMap(labels.params);
+    return true;
+}
+
+void attachLabelsNextTo(TrsFile& f, const QString& npy_path, QString& note, QString& problem) {
+    note.clear();
+    problem.clear();
+    const QString labels_path = findLabelsNextTo(npy_path);
+    if (labels_path.isEmpty()) return;
+    const QString name = QFileInfo(labels_path).fileName();
+    std::map<std::string, std::vector<uint8_t>> entries;
+    QString err;
+    if (!loadNpz(labels_path, entries, err)) {
+        problem = QString("%1 could not be read: %2").arg(name, err);
+        return;
+    }
+    TraceLabels labels;
+    packTraceLabels(entries, f.header().num_traces, {}, labels);
+    if (labels.params.empty()) {
+        problem = QString("%1 has no array with %2 rows (one per trace).").arg(name).arg(f.header().num_traces);
+        return;
+    }
+    QStringList names;
+    for (const auto& kv : labels.params) names << QString::fromStdString(kv.first);
+    note = QString("Labels from %1: %2").arg(name, names.join(", "));
+    if (!labels.unusable.empty()) {
+        QStringList left_out;
+        for (const auto& u : labels.unusable) left_out << QString::fromStdString(u);
+        note += QString(" (left out: %1)").arg(left_out.join(", "));
+    }
+    f.attachData(labels.data.data(), labels.data_length, labels.params);
+}
+
+bool openTraceFile(TrsFile& f, const std::string& path, std::string& error) {
+    const QString qpath = QString::fromStdString(path);
+    if (qpath.endsWith(".npz", Qt::CaseInsensitive)) return openNpzTraces(f, path, error);
+    if (!qpath.endsWith(".npy", Qt::CaseInsensitive)) return f.open(path, error);
+    if (!f.openNpy(path, error)) return false;
+    QString note, problem;
+    attachLabelsNextTo(f, qpath, note, problem);
+    f.addNote(problem.toStdString());
+    return true;
+}
+
+QStringList traceFilesInFolder(const QString& folder) {
+    const QDir dir(folder);
+    for (const char* name : {"traces.npy", "traces.npz"})
+        if (dir.exists(name)) return {dir.filePath(name)};
+    QStringList found;
+    const QStringList files = dir.entryList({"*.trs", "*.npy", "*.npz"}, QDir::Files, QDir::Name);
+    for (const QString& f : files) {
+        if (f.endsWith(".npz", Qt::CaseInsensitive)
+            && (f.contains("label", Qt::CaseInsensitive)
+                || dir.exists(QFileInfo(f).completeBaseName() + ".npy")))
+            continue;
+        found << dir.filePath(f);
+    }
+    if (!found.isEmpty()) return found;
+    for (const QString& sub : dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name)) {
+        const QDir subdir(dir.filePath(sub));
+        for (const char* name : {"traces.npy", "traces.npz"})
+            if (subdir.exists(name)) { found << subdir.filePath(name); break; }
+    }
+    return found;
 }

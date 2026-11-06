@@ -93,20 +93,22 @@ public:
     // They must agree on what combineMismatch() checks. The header is the
     // first file's, with num_traces the total. path() is `list_path` if
     // given (the .trslist they came from), else the first file's.
+    // open_part opens each file (default: open(), TRS only).
+    using PartOpener = bool (*)(TrsFile&, const std::string&, std::string&);
     bool openCombined(const std::vector<std::string>& paths, std::string& error,
-                      const std::string& list_path = {});
+                      const std::string& list_path = {}, PartOpener open_part = nullptr);
     // Memory-maps a plain 2-D float32 (.npy) trace matrix directly — no full-file
     // read and no in-RAM copy, so files far larger than available RAM work fine.
     bool openNpy(const std::string& path, std::string& error);
     // Gives a matrix opened with openNpy() its per-trace data, kept in memory
     // (data_bytes[ti*data_length+bi]) while the samples stay mapped. For right
-    // after opening, before anything else reads the file. `note` is added to
-    // openNotes().
+    // after opening, before anything else reads the file.
     void attachData(const uint8_t* data_bytes, int16_t data_length,
-                    const std::map<std::string, TrsTraceParam>& params,
-                    const std::string& note = {});
-    // The data bytes are in memory, so reading all of them is instant.
-    bool dataInMemory() const { return !mem_data_.empty(); }
+                    const std::map<std::string, TrsTraceParam>& params);
+    // The data bytes are in memory (in every file of a combined set), so
+    // reading all of them is instant.
+    bool dataInMemory() const;
+    void addNote(const std::string& note);
     // Load an in-memory float32 trace matrix (row-major: samples[ti*n_samples+si]).
     // Optionally supply data_bytes[ti*data_length+bi] for per-trace auxiliary data.
     // After this call all SCA / xcorr code works on the in-memory data transparently.
@@ -197,6 +199,10 @@ private:
 // per trace, sample coding, data bytes per trace and named parameters must
 // match.
 std::string combineMismatch(const TrsHeader& first, const TrsHeader& h);
+
+// What to call a trace file to the user. Captures are often <name>/traces.npy,
+// all alike but for their folder, so a .npy or .npz keeps it: "<name>/traces.npy".
+std::string traceFileName(const std::string& path);
 
 // A trace list (.trslist): the files of a combined set, one path per line,
 // relative to the list's own folder or absolute; blank lines and lines

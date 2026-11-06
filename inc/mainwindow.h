@@ -309,6 +309,7 @@ private:
         int64_t s_first = 0, s_count = 0;  // raw samples (0 = to the end)
         int32_t M = 256;
         std::vector<int32_t> shifts;       // per trace of the run; empty = none
+        QString model_code;                // what the model editor starts from; empty = its template
         int32_t outside_alignment = 0;     // traces left out: not covered by the alignment
     };
     void runCpa(const CpaRun& run);

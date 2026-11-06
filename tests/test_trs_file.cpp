@@ -594,12 +594,11 @@ TEST(TrsFile, AttachedDataLeavesTheMappedSamplesAlone) {
     const uint8_t data[2 * 4] = {10, 11, 12, 13, 20, 21, 22, 23};
     TrsTraceParam p;
     p.offset = 1; p.length = 2; p.count = 2; p.type = TrsParamType::BYTE;
-    f.attachData(data, 4, {{"k", p}}, "from a test");
+    f.attachData(data, 4, {{"k", p}});
 
     EXPECT_TRUE(f.dataInMemory());
     EXPECT_EQ(f.header().data_length, 4);
     EXPECT_EQ(f.header().param_map.at("k").offset, 1);
-    EXPECT_NE(f.openNotes().find("from a test"), std::string::npos);
     EXPECT_EQ(f.readData(1), (std::vector<uint8_t>{20, 21, 22, 23}));
     EXPECT_TRUE(f.readData(2).empty());
 
