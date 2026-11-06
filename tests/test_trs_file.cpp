@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <map>
 #include <numeric>
 #include <string>
 #include <vector>
@@ -557,4 +558,119 @@ TEST(TrsFile, FormatsParameterValues) {
     EXPECT_EQ(formatTrsParam(TrsParamType::STRING, reinterpret_cast<const uint8_t*>(str), 6), "abc");
     EXPECT_EQ(trsParamElemSize(TrsParamType::DOUBLE), 8);
     EXPECT_STREQ(trsParamTypeName(TrsParamType::FLOAT), "float");
+}
+
+// ---------------------------------------------------------------------------
+// attachData — labels for a memory-mapped .npy matrix
+// ---------------------------------------------------------------------------
+
+namespace {
+// A 2 × 3 int16 matrix as numpy writes it, returning the path.
+std::string writeSmallNpy(const std::string& name) {
+    const std::string path = ::testing::TempDir() + name;
+    std::string dict = "{'descr': '<i2', 'fortran_order': False, 'shape': (2, 3), }";
+    dict.resize(((dict.size() + 11 + 63) / 64) * 64 - 11, ' ');
+    dict += '\n';
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    const uint8_t head[10] = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0,
+                              static_cast<uint8_t>(dict.size()), static_cast<uint8_t>(dict.size() >> 8)};
+    std::fwrite(head, 1, sizeof head, fp);
+    std::fwrite(dict.data(), 1, dict.size(), fp);
+    const int16_t samples[6] = {1, 2, 3, -4, -5, -6};
+    std::fwrite(samples, 2, 6, fp);
+    std::fclose(fp);
+    return path;
+}
+}  // namespace
+
+TEST(TrsFile, AttachedDataLeavesTheMappedSamplesAlone) {
+    const std::string path = writeSmallNpy("attach.npy");
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.openNpy(path, err)) << err;
+    EXPECT_FALSE(f.dataInMemory());
+    EXPECT_TRUE(f.readData(0).empty());
+
+    const uint8_t data[2 * 4] = {10, 11, 12, 13, 20, 21, 22, 23};
+    TrsTraceParam p;
+    p.offset = 1; p.length = 2; p.count = 2; p.type = TrsParamType::BYTE;
+    f.attachData(data, 4, {{"k", p}}, "from a test");
+
+    EXPECT_TRUE(f.dataInMemory());
+    EXPECT_EQ(f.header().data_length, 4);
+    EXPECT_EQ(f.header().param_map.at("k").offset, 1);
+    EXPECT_NE(f.openNotes().find("from a test"), std::string::npos);
+    EXPECT_EQ(f.readData(1), (std::vector<uint8_t>{20, 21, 22, 23}));
+    EXPECT_TRUE(f.readData(2).empty());
+
+    // The samples are where they were: the data isn't in the file.
+    float buf[3];
+    ASSERT_EQ(f.readSamples(1, 0, 3, buf), 3);
+    EXPECT_FLOAT_EQ(buf[0], -4.0f);
+    EXPECT_FLOAT_EQ(buf[2], -6.0f);
+    ASSERT_EQ(f.readSamples(0, 2, 1, buf), 1);
+    EXPECT_FLOAT_EQ(buf[0], 3.0f);
+    f.willNeed(1, 0, 3);
+    std::remove(path.c_str());
+}
+
+TEST(TrsFile, ClosingForgetsAttachedData) {
+    const std::string path = writeSmallNpy("attach_close.npy");
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.openNpy(path, err)) << err;
+    const uint8_t data[2] = {1, 2};
+    f.attachData(data, 1, {});
+    ASSERT_TRUE(f.openNpy(path, err)) << err;
+    EXPECT_FALSE(f.dataInMemory());
+    EXPECT_EQ(f.header().data_length, 0);
+    float v = 0;
+    ASSERT_EQ(f.readSamples(1, 1, 1, &v), 1);
+    EXPECT_FLOAT_EQ(v, -5.0f);
+    std::remove(path.c_str());
+}
+
+TEST(TrsFile, ParameterMapIsWrittenAsTheHeaderReadsIt) {
+    std::map<std::string, TrsTraceParam> params;
+    TrsTraceParam lam;  lam.offset = 8;  lam.length = 32; lam.count = 32; lam.type = TrsParamType::BYTE;
+    TrsTraceParam when; when.offset = 0; when.length = 8; when.count = 1; when.type = TrsParamType::DOUBLE;
+    params["lam"] = lam;
+    params["t_unix"] = when;
+
+    const std::vector<float> samples(2, 0.0f);
+    const std::vector<uint8_t> data(40, 0);
+    TrsFile src;
+    src.openFromArray(samples.data(), 1, 2, "src", data.data(), 40);
+    src.setParamMap(params);
+    const std::vector<uint8_t>& defs = src.header().raw_param_defs;
+
+    // A one-trace TRS file carrying those definitions.
+    const std::string path = ::testing::TempDir() + "param_defs.trs";
+    FILE* fp = std::fopen(path.c_str(), "wb");
+    auto tag = [&](uint8_t t, const void* v, size_t n) {
+        std::fputc(t, fp);
+        std::fputc(static_cast<int>(n), fp);
+        std::fwrite(v, 1, n, fp);
+    };
+    const int32_t one = 1, two = 2;
+    const int16_t dl = 40;
+    const uint8_t coding = 0x14, version = 2;
+    tag(0x41, &one, 4);
+    tag(0x42, &two, 4);
+    tag(0x43, &coding, 1);
+    tag(0x44, &dl, 2);
+    tag(0x4F, &version, 1);
+    ASSERT_LT(defs.size(), 128u);
+    tag(0x77, defs.data(), defs.size());
+    std::fputc(0x5F, fp);
+    std::fputc(0, fp);
+    std::fwrite(data.data(), 1, data.size(), fp);
+    std::fwrite(samples.data(), 4, 2, fp);
+    std::fclose(fp);
+
+    TrsFile f;
+    std::string err;
+    ASSERT_TRUE(f.open(path, err)) << err;
+    EXPECT_EQ(f.header().param_map, params);
+    std::remove(path.c_str());
 }

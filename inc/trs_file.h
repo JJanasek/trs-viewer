@@ -98,6 +98,15 @@ public:
     // Memory-maps a plain 2-D float32 (.npy) trace matrix directly — no full-file
     // read and no in-RAM copy, so files far larger than available RAM work fine.
     bool openNpy(const std::string& path, std::string& error);
+    // Gives a matrix opened with openNpy() its per-trace data, kept in memory
+    // (data_bytes[ti*data_length+bi]) while the samples stay mapped. For right
+    // after opening, before anything else reads the file. `note` is added to
+    // openNotes().
+    void attachData(const uint8_t* data_bytes, int16_t data_length,
+                    const std::map<std::string, TrsTraceParam>& params,
+                    const std::string& note = {});
+    // The data bytes are in memory, so reading all of them is instant.
+    bool dataInMemory() const { return !mem_data_.empty(); }
     // Load an in-memory float32 trace matrix (row-major: samples[ti*n_samples+si]).
     // Optionally supply data_bytes[ti*data_length+bi] for per-trace auxiliary data.
     // After this call all SCA / xcorr code works on the in-memory data transparently.
@@ -109,7 +118,8 @@ public:
     bool isOpen() const { return mmap_ptr_ != nullptr || !mem_samples_.empty() || !parts_.empty(); }
     const TrsHeader& header() const { return header_; }
     const std::string& path() const { return path_; }
-    void setParamMap(const std::map<std::string, TrsTraceParam>& pm) { header_.param_map = pm; }
+    // Also what Export TRS writes, so the names survive an export.
+    void setParamMap(const std::map<std::string, TrsTraceParam>& pm);
     // Anything worth telling the user after opening (cut-off files, files
     // with a different scale); empty if nothing.
     const std::string& openNotes() const { return notes_; }
@@ -158,6 +168,9 @@ private:
     // in it; nullptr if out of range.
     const TrsFile* locate(int32_t trace_idx, int32_t& local) const;
     int64_t traceByteOffset(int32_t trace_idx) const;
+    // Data bytes stored before each trace's samples in the mapped file (none
+    // when they were attached instead).
+    int64_t dataBytesInFile() const { return mem_data_.empty() ? header_.data_length : 0; }
 
     void*       mmap_ptr_           = nullptr;
     size_t      mmap_size_          = 0;

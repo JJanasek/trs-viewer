@@ -63,7 +63,7 @@ int64_t estimateBivariateBytes(int64_t rows, int64_t cols, int threads);
 // TTestOptions). Returns false with err == "Cancelled." on cancel.
 bool computeBivariateTTest(TrsFile* file,
                            const std::vector<std::shared_ptr<ITransform>>& pipeline,
-                           int32_t first_trace, int32_t trace_count, int32_t byte_idx,
+                           int32_t first_trace, int32_t trace_count, GroupBy groups,
                            const BivariateWindow& a, const BivariateWindow& b,
                            int64_t read_lo, int64_t read_hi,
                            bool sanity_split, bool abs_value,
@@ -110,7 +110,7 @@ int64_t estimateLagBytes(int64_t len, int64_t n_lags, int64_t lag_hi, int thread
 
 bool computeLagTTest(TrsFile* file,
                      const std::vector<std::shared_ptr<ITransform>>& pipeline,
-                     int32_t first_trace, int32_t trace_count, int32_t byte_idx,
+                     int32_t first_trace, int32_t trace_count, GroupBy groups,
                      const BivariateWindow& w, const std::vector<int32_t>& lags,
                      int64_t read_lo, int64_t read_hi,
                      bool sanity_split, bool abs_value,

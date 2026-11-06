@@ -2,7 +2,14 @@
 
 **Analyze → Welch t-test (TVLA)…**
 
-Computes the per-sample Welch t-statistic between two trace groups. No special header fields are required — group assignment is configured in the dialog by choosing which data byte to use as the group label (0 = group 0, non-zero = group 1). If the file's parameter map contains a `ttest` entry, its `offset` field is used automatically and the byte selector is hidden.
+Computes the per-sample Welch t-statistic between two trace groups. No special header fields are required — group assignment is configured in the dialog under **Group by**. If the file's parameter map contains a `ttest` entry, its `offset` field is used automatically and the selector is hidden.
+
+**Group by** picks a data byte, through the file's named labels if it has any, and a bit of it:
+
+- **any bit (byte ≠ 0)**: zero is group 0, anything else group 1. For a byte that flags fixed vs random.
+- **bit 0 … bit 7**: traces with that bit set are group 1, the others group 0. For a random value such as a key or a blinding factor, where almost no byte is 0.
+
+When the data is in memory (a `.npy` with [labels](npy-npz.md), an `.npz`), the dialog shows how many traces each group gets, says so if a group is empty, and starts on bit 0 when "≠ 0" would leave one group nearly empty. The result tab's title names the split, e.g. `Welch t-test · lam[3] bit 1`.
 
 **First sample** and **Sample count** pick the part of the traces to test. Press **Draw on plot →** and drag across the region on the main plot to set both. While you drag, the dialog stays open but no longer blocks the main window; pressing the button again cancels, and **Run t-test** runs straight away with the drawn range. With an alignment applied, the plot shows aligned traces and the drawn range is in the same samples the test uses.
 

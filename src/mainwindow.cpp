@@ -1,7 +1,6 @@
 #include "mainwindow.h"
 #include "crash_handler.h"
 #include "spectral.h"
-#include <zlib.h>
 #include "heatmap_widget.h"
 #include "ttest.h"
 #include "ttest_run.h"
@@ -21,6 +20,7 @@
 #include "chain.h"
 #include "flow_layout.h"
 #include "job_manager.h"
+#include "npz.h"
 #include <QDockWidget>
 #include <QProgressBar>
 #include <set>
@@ -320,7 +320,162 @@ private:
     QString prefix_;
     std::vector<Field> fields_;
 };
+
+// Chooses what splits the traces into two groups: a data byte, found through
+// the file's named labels if it has any, and optionally one bit of it. When
+// the data is in memory it also says how many traces each group would get.
+class GroupPicker : public QWidget {
+public:
+    explicit GroupPicker(const std::shared_ptr<TrsFile>& file, bool with_bit = true)
+        : file_(file), with_bit_(with_bit) {
+        const TrsHeader& h = file->header();
+        for (const auto& kv : h.param_map) {
+            const uint8_t type = kv.second.type;
+            if (kv.first != "LEGACY_DATA" && kv.second.length > 0 && type != TrsParamType::FLOAT
+                && type != TrsParamType::DOUBLE && type != TrsParamType::STRING)
+                fields_.push_back(kv);
+        }
+        std::stable_sort(fields_.begin(), fields_.end(),
+                         [](const auto& a, const auto& b) { return a.second.offset < b.second.offset; });
+
+        cmb_field_ = new QComboBox;
+        cmb_field_->setObjectName("group_field");
+        cmb_field_->setToolTip("The label to use, from the file's named per-trace data.");
+        for (const auto& [name, p] : fields_)
+            cmb_field_->addItem(p.length > 1 ? QString("%1 (%2 bytes)").arg(QString::fromStdString(name)).arg(p.length)
+                                             : QString::fromStdString(name));
+        cmb_field_->setVisible(!fields_.empty());
+        lbl_byte_ = new QLabel("byte");
+        sp_byte_ = new QSpinBox;
+        sp_byte_->setObjectName("group_byte");
+        sp_byte_->setRange(0, std::max(0, static_cast<int>(h.data_length) - 1));
+        sp_byte_->setToolTip(fields_.empty() ? "Index of the data byte used." : "Byte of the label, from 0.");
+
+        auto* row = new QHBoxLayout;
+        row->setContentsMargins(0, 0, 0, 0);
+        row->addWidget(cmb_field_, 1);
+        row->addWidget(lbl_byte_);
+        row->addWidget(sp_byte_);
+        if (with_bit_) {
+            cmb_bit_ = new QComboBox;
+            cmb_bit_->setObjectName("group_bit");
+            cmb_bit_->addItem("any bit (byte ≠ 0)");
+            for (int b = 0; b < 8; b++)
+                cmb_bit_->addItem(QString("bit %1%2").arg(b).arg(b == 0 ? " (LSB)" : b == 7 ? " (MSB)" : ""));
+            cmb_bit_->setToolTip("Group 1: the traces where this bit of the byte is set, group 0: the "
+                                 "others.\n\"any bit\" (zero or not) is for a byte that flags fixed vs "
+                                 "random. For a random value such as a key, split on one bit.");
+            row->addWidget(new QLabel("bit"));
+            row->addWidget(cmb_bit_);
+        }
+        auto* vl = new QVBoxLayout(this);
+        vl->setContentsMargins(0, 0, 0, 0);
+        vl->addLayout(row);
+        if (with_bit_ && file->dataInMemory() && h.num_traces <= kMaxTracesToCount) {
+            lbl_counts_ = new QLabel;
+            lbl_counts_->setObjectName("group_counts");
+            lbl_counts_->setWordWrap(true);
+            vl->addWidget(lbl_counts_);
+        }
+
+        connect(cmb_field_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() { syncField(); });
+        connect(sp_byte_, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { updateCounts(); });
+        if (cmb_bit_)
+            connect(cmb_bit_, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this]() { updateCounts(); });
+        syncField();
+    }
+
+    void selectField(const std::string& name) {
+        for (size_t i = 0; i < fields_.size(); i++)
+            if (fields_[i].first == name) cmb_field_->setCurrentIndex(static_cast<int>(i));
+    }
+    int32_t byteIndex() const {
+        const int i = cmb_field_->currentIndex();
+        return (i >= 0 ? fields_[static_cast<size_t>(i)].second.offset : 0) + sp_byte_->value();
+    }
+    GroupBy groupBy() const {
+        const int bit = cmb_bit_ ? cmb_bit_->currentIndex() - 1 : -1;
+        return GroupBy(byteIndex(), bit < 0 ? uint8_t(0xFF) : static_cast<uint8_t>(1u << bit));
+    }
+    // In this order, so the restored byte fits the restored label's range.
+    void remember(DialogMemory& mem, const QString& byte_key = "group_byte") {
+        mem.bind(cmb_field_, "group_field");
+        mem.bind(sp_byte_, byte_key);
+        mem.bind(cmb_bit_, "group_bit");
+    }
+
+private:
+    static constexpr int32_t kMaxTracesToCount = 1'000'000;
+
+    void countGroups(const GroupBy& g, int64_t& n0, int64_t& n1) const {
+        n0 = n1 = 0;
+        for (int32_t t = 0; t < file_->header().num_traces; t++) {
+            const int group = g.groupOf(file_->readData(t));
+            if (group == 0) n0++;
+            else if (group == 1) n1++;
+        }
+    }
+    void syncField() {
+        const int i = cmb_field_->currentIndex();
+        if (i >= 0) {
+            const int len = fields_[static_cast<size_t>(i)].second.length;
+            sp_byte_->setRange(0, len - 1);
+            lbl_byte_->setVisible(len > 1);
+            sp_byte_->setVisible(len > 1);
+        }
+        // Zero or not only makes sense for a flag: on a random byte nearly
+        // every trace lands in group 1.
+        if (lbl_counts_ && cmb_bit_->currentIndex() == 0) {
+            int64_t n0, n1;
+            countGroups(GroupBy(byteIndex()), n0, n1);
+            if (std::min(n0, n1) * 10 < n0 + n1) cmb_bit_->setCurrentIndex(1);
+        }
+        updateCounts();
+    }
+    void updateCounts() {
+        if (!lbl_counts_) return;
+        int64_t n0, n1;
+        countGroups(groupBy(), n0, n1);
+        lbl_counts_->setText(QString("Of all traces: group 0 has %1, group 1 has %2.%3").arg(n0).arg(n1)
+            .arg(n0 == 0 || n1 == 0 ? QString(" One group is empty: this never changes, pick another.") : QString()));
+    }
+
+    std::shared_ptr<TrsFile> file_;
+    bool with_bit_;
+    std::vector<std::pair<std::string, TrsTraceParam>> fields_;
+    QComboBox* cmb_field_ = nullptr;
+    QComboBox* cmb_bit_   = nullptr;
+    QLabel*    lbl_byte_  = nullptr;
+    QLabel*    lbl_counts_ = nullptr;
+    QSpinBox*  sp_byte_   = nullptr;
+};
 }  // namespace
+
+// What a split is, for result titles: "lam[3] bit 1", "ok", "byte 2 bit 0".
+// Empty for the usual flag byte of a file without names.
+static QString groupNote(const TrsHeader& h, const GroupBy& g) {
+    QString what;
+    for (const auto& [name, p] : h.param_map) {
+        if (name == "LEGACY_DATA" || g.byte < p.offset || g.byte >= p.offset + p.length) continue;
+        if (name == "ttest") return {};
+        what = QString::fromStdString(name);
+        if (p.length > 1) what += QString("[%1]").arg(g.byte - p.offset);
+        break;
+    }
+    if (g.mask == 0xFF) return what;
+    if (what.isEmpty()) what = QString("byte %1").arg(g.byte);
+    int bit = 0;
+    while (bit < 7 && !((g.mask >> bit) & 1)) bit++;
+    return what + QString(" bit %1").arg(bit);
+}
+
+// For the dialogs that need per-trace data when a file has none.
+static QString noDataBytesText(const TrsFile& f) {
+    return QString::fromStdString(f.path()).endsWith(".npy", Qt::CaseInsensitive)
+        ? QString("This file has no per-trace data bytes.\n"
+                  "To give a .npy labels, put them next to it in labels.npz and open it again.")
+        : QString("This TRS file has no per-trace data bytes.");
+}
 
 
 // Physical axis metadata from a TRS header, for figure export: seconds per
@@ -3346,235 +3501,6 @@ static bool saveNpy2D(const QString& path, const float* data,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Minimal uncompressed NPZ writer (ZIP STORE method, no compression).
-// Entries is a list of (filename, raw_bytes) pairs.
-// ---------------------------------------------------------------------------
-
-static uint32_t zip_crc32(const uint8_t* data, size_t len)
-{
-    uint32_t crc = 0xFFFFFFFFu;
-    for (size_t i = 0; i < len; i++) {
-        crc ^= data[i];
-        for (int j = 0; j < 8; j++)
-            crc = (crc >> 1) ^ (0xEDB88320u & ~((crc & 1u) - 1u));
-    }
-    return ~crc;
-}
-
-static void zip_write_u16(std::vector<uint8_t>& v, uint16_t x) {
-    v.push_back(uint8_t(x));      v.push_back(uint8_t(x >> 8));
-}
-static void zip_write_u32(std::vector<uint8_t>& v, uint32_t x) {
-    v.push_back(uint8_t(x));      v.push_back(uint8_t(x >> 8));
-    v.push_back(uint8_t(x >> 16)); v.push_back(uint8_t(x >> 24));
-}
-
-static bool saveNpz(const QString& path,
-                     const std::vector<std::pair<std::string, std::vector<uint8_t>>>& entries,
-                     QString& err)
-{
-    // Plain ZIP (no ZIP64): sizes and offsets are 32-bit, so the archive must
-    // stay under 4 GiB — past that it would be silently corrupt.
-    uint64_t total = 22;
-    for (const auto& [name, data] : entries) total += 30 + 46 + 2 * name.size() + data.size();
-    if (total >= 0xFFFFFFFFull || entries.size() > 0xFFFF) {
-        err = QString("The archive would be %1 GB; .npz files written here hold at most 4 GB. "
-                      "Export as .npy instead, or fewer traces or samples.")
-                  .arg(static_cast<double>(total) / (1024.0 * 1024 * 1024), 0, 'f', 1);
-        return false;
-    }
-
-    FILE* fp = std::fopen(path.toLocal8Bit().constData(), "wb");
-    if (!fp) { err = "Cannot create: " + path; return false; }
-
-    struct CDEntry {
-        std::string name;
-        uint32_t crc, size, offset;
-    };
-    std::vector<CDEntry> cd;
-    std::vector<uint8_t> buf;   // one header at a time; the data goes straight to the file
-    uint32_t off = 0;
-    bool ok = true;
-
-    for (const auto& [name, data] : entries) {
-        uint32_t crc  = zip_crc32(data.data(), data.size());
-        uint32_t sz   = static_cast<uint32_t>(data.size());
-        cd.push_back({name, crc, sz, off});
-
-        // Local file header
-        buf.clear();
-        zip_write_u32(buf, 0x04034b50u); // signature
-        zip_write_u16(buf, 20);          // version needed: 2.0
-        zip_write_u16(buf, 0);           // flags
-        zip_write_u16(buf, 0);           // compression: store
-        zip_write_u16(buf, 0);           // mod time
-        zip_write_u16(buf, 0);           // mod date
-        zip_write_u32(buf, crc);
-        zip_write_u32(buf, sz);          // compressed size
-        zip_write_u32(buf, sz);          // uncompressed size
-        zip_write_u16(buf, static_cast<uint16_t>(name.size()));
-        zip_write_u16(buf, 0);           // extra field length
-        buf.insert(buf.end(), name.begin(), name.end());
-        ok = ok && std::fwrite(buf.data(), 1, buf.size(), fp) == buf.size()
-                && std::fwrite(data.data(), 1, data.size(), fp) == data.size();
-        off += static_cast<uint32_t>(buf.size() + data.size());
-    }
-
-    const uint32_t cd_offset = off;
-    buf.clear();
-    for (const auto& e : cd) {
-        zip_write_u32(buf, 0x02014b50u); // central dir signature
-        zip_write_u16(buf, 20);          // version made by
-        zip_write_u16(buf, 20);          // version needed
-        zip_write_u16(buf, 0);           // flags
-        zip_write_u16(buf, 0);           // compression: store
-        zip_write_u16(buf, 0);           // mod time
-        zip_write_u16(buf, 0);           // mod date
-        zip_write_u32(buf, e.crc);
-        zip_write_u32(buf, e.size);
-        zip_write_u32(buf, e.size);
-        zip_write_u16(buf, static_cast<uint16_t>(e.name.size()));
-        zip_write_u16(buf, 0);  zip_write_u16(buf, 0);
-        zip_write_u16(buf, 0);  zip_write_u16(buf, 0);
-        zip_write_u32(buf, 0);  zip_write_u32(buf, e.offset);
-        buf.insert(buf.end(), e.name.begin(), e.name.end());
-    }
-
-    const uint32_t cd_size = static_cast<uint32_t>(buf.size());
-    const uint16_t n_entries = static_cast<uint16_t>(cd.size());
-
-    // End of central directory
-    zip_write_u32(buf, 0x06054b50u);
-    zip_write_u16(buf, 0);  zip_write_u16(buf, 0);
-    zip_write_u16(buf, n_entries); zip_write_u16(buf, n_entries);
-    zip_write_u32(buf, cd_size);
-    zip_write_u32(buf, cd_offset);
-    zip_write_u16(buf, 0);  // comment length
-
-    ok = ok && std::fwrite(buf.data(), 1, buf.size(), fp) == buf.size();
-    ok = (std::fclose(fp) == 0) && ok;
-    if (!ok) {
-        QFile::remove(path);
-        err = "Writing " + path + " failed (disk full?).";
-        return false;
-    }
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Minimal NPZ reader: returns named entries as raw byte vectors.
-// Supports STORE (method 0) and DEFLATE (method 8) compression.
-// ---------------------------------------------------------------------------
-
-static bool loadNpz(const QString& path,
-                     std::map<std::string, std::vector<uint8_t>>& entries,
-                     QString& err)
-{
-    FILE* fp = std::fopen(path.toLocal8Bit().constData(), "rb");
-    if (!fp) { err = "Cannot open: " + path; return false; }
-
-    // Find end-of-central-directory by scanning backwards
-    std::fseek(fp, 0, SEEK_END);
-    long file_size = std::ftell(fp);
-    if (file_size < 22) { std::fclose(fp); err = "File too small to be NPZ."; return false; }
-
-    const int max_search = std::min((long)65558, file_size);
-    std::vector<uint8_t> tail(static_cast<size_t>(max_search));
-    std::fseek(fp, file_size - max_search, SEEK_SET);
-    std::fread(tail.data(), 1, tail.size(), fp);
-
-    int eocd_off = -1;
-    for (int i = static_cast<int>(tail.size()) - 22; i >= 0; i--) {
-        if (tail[i] == 0x50 && tail[i+1] == 0x4B && tail[i+2] == 0x05 && tail[i+3] == 0x06) {
-            eocd_off = i;
-            break;
-        }
-    }
-    if (eocd_off < 0) { std::fclose(fp); err = "No EOCD found; not a valid ZIP/NPZ."; return false; }
-
-    const uint8_t* eocd = tail.data() + eocd_off;
-    uint16_t n_entries  = static_cast<uint16_t>(eocd[8])  | (static_cast<uint16_t>(eocd[9])  << 8);
-    uint32_t cd_size    = static_cast<uint32_t>(eocd[12]) | (static_cast<uint32_t>(eocd[13]) << 8)
-                        | (static_cast<uint32_t>(eocd[14]) << 16) | (static_cast<uint32_t>(eocd[15]) << 24);
-    uint32_t cd_offset  = static_cast<uint32_t>(eocd[16]) | (static_cast<uint32_t>(eocd[17]) << 8)
-                        | (static_cast<uint32_t>(eocd[18]) << 16) | (static_cast<uint32_t>(eocd[19]) << 24);
-
-    std::vector<uint8_t> cd(cd_size);
-    std::fseek(fp, static_cast<long>(cd_offset), SEEK_SET);
-    if (std::fread(cd.data(), 1, cd_size, fp) != cd_size) {
-        std::fclose(fp); err = "Cannot read central directory."; return false;
-    }
-
-    size_t pos = 0;
-    for (uint16_t ei = 0; ei < n_entries; ei++) {
-        if (pos + 46 > cd.size()) break;
-        if (cd[pos] != 0x50 || cd[pos+1] != 0x4B || cd[pos+2] != 0x01 || cd[pos+3] != 0x02) break;
-        uint16_t method   = static_cast<uint16_t>(cd[pos+10]) | (static_cast<uint16_t>(cd[pos+11]) << 8);
-        uint32_t comp_sz  = static_cast<uint32_t>(cd[pos+20]) | (static_cast<uint32_t>(cd[pos+21]) << 8)
-                          | (static_cast<uint32_t>(cd[pos+22]) << 16) | (static_cast<uint32_t>(cd[pos+23]) << 24);
-        uint32_t uncomp_sz= static_cast<uint32_t>(cd[pos+24]) | (static_cast<uint32_t>(cd[pos+25]) << 8)
-                          | (static_cast<uint32_t>(cd[pos+26]) << 16) | (static_cast<uint32_t>(cd[pos+27]) << 24);
-        uint16_t fname_len= static_cast<uint16_t>(cd[pos+28]) | (static_cast<uint16_t>(cd[pos+29]) << 8);
-        uint16_t extra_len= static_cast<uint16_t>(cd[pos+30]) | (static_cast<uint16_t>(cd[pos+31]) << 8);
-        uint16_t comm_len = static_cast<uint16_t>(cd[pos+32]) | (static_cast<uint16_t>(cd[pos+33]) << 8);
-        uint32_t lh_offset= static_cast<uint32_t>(cd[pos+42]) | (static_cast<uint32_t>(cd[pos+43]) << 8)
-                          | (static_cast<uint32_t>(cd[pos+44]) << 16) | (static_cast<uint32_t>(cd[pos+45]) << 24);
-        std::string fname(reinterpret_cast<const char*>(cd.data() + pos + 46), fname_len);
-        pos += 46 + fname_len + extra_len + comm_len;
-
-        if (method != 0 && method != 8) {
-            err = QString("Entry '%1' uses compression method %2; only STORE (0) and DEFLATE (8) are supported.")
-                      .arg(QString::fromStdString(fname)).arg(method);
-            std::fclose(fp); return false;
-        }
-
-        // Read local file header to find data offset
-        std::fseek(fp, static_cast<long>(lh_offset) + 26, SEEK_SET);
-        uint8_t lh_extra[4] = {};
-        std::fread(lh_extra, 1, 4, fp);
-        uint16_t lh_fname_len = static_cast<uint16_t>(lh_extra[0]) | (static_cast<uint16_t>(lh_extra[1]) << 8);
-        uint16_t lh_extra_len = static_cast<uint16_t>(lh_extra[2]) | (static_cast<uint16_t>(lh_extra[3]) << 8);
-        long data_off = static_cast<long>(lh_offset) + 30 + lh_fname_len + lh_extra_len;
-        std::fseek(fp, data_off, SEEK_SET);
-
-        std::vector<uint8_t> data(uncomp_sz);
-        if (method == 0) {
-            // STORE — raw bytes
-            if (std::fread(data.data(), 1, uncomp_sz, fp) != uncomp_sz) {
-                err = QString("Truncated data for entry '%1'.").arg(QString::fromStdString(fname));
-                std::fclose(fp); return false;
-            }
-        } else {
-            // DEFLATE (raw, no zlib wrapper) — inflate with -MAX_WBITS
-            std::vector<uint8_t> comp(comp_sz);
-            if (std::fread(comp.data(), 1, comp_sz, fp) != comp_sz) {
-                err = QString("Truncated compressed data for entry '%1'.").arg(QString::fromStdString(fname));
-                std::fclose(fp); return false;
-            }
-            z_stream zs{};
-            if (inflateInit2(&zs, -MAX_WBITS) != Z_OK) {
-                err = "zlib inflateInit2 failed."; std::fclose(fp); return false;
-            }
-            zs.next_in  = comp.data();
-            zs.avail_in = static_cast<uInt>(comp_sz);
-            zs.next_out = data.data();
-            zs.avail_out= static_cast<uInt>(uncomp_sz);
-            int zret = inflate(&zs, Z_FINISH);
-            inflateEnd(&zs);
-            if (zret != Z_STREAM_END) {
-                err = QString("DEFLATE decompression failed for entry '%1' (zlib code %2).")
-                          .arg(QString::fromStdString(fname)).arg(zret);
-                std::fclose(fp); return false;
-            }
-        }
-        entries[fname] = std::move(data);
-    }
-
-    std::fclose(fp);
-    return true;
-}
-
 // Parse a NPY array from an in-memory byte buffer into a flat float32 vector + shape.
 static bool parseNpyBytes(const std::vector<uint8_t>& buf,
                            std::vector<float>& data,
@@ -3670,73 +3596,6 @@ static bool parseNpyBytes(const std::vector<uint8_t>& buf,
             data[static_cast<size_t>(i)] = static_cast<float>(v);
         }
     }
-    return true;
-}
-
-// Parse NPY bytes without converting to float — returns shape, elem_size, and raw data payload.
-// Supports: |u1 |i1 <u2 <i2 <u4 <i4 <u8 <i8 <f4 <f8
-static bool parseNpyRaw(const std::vector<uint8_t>& buf,
-                        std::vector<int64_t>& shape,
-                        int& elem_size,
-                        std::vector<uint8_t>& payload,
-                        QString& err)
-{
-    if (buf.size() < 10 || buf[0] != 0x93 || buf[1] != 'N' || buf[2] != 'U' ||
-        buf[3] != 'M'  || buf[4] != 'P' || buf[5] != 'Y') {
-        err = "Not a valid NPY entry."; return false;
-    }
-    uint8_t ver = buf[6];
-    uint32_t hlen = 0;
-    size_t hstart;
-    if (ver == 1) {
-        hlen = static_cast<uint32_t>(buf[8]) | (static_cast<uint32_t>(buf[9]) << 8);
-        hstart = 10;
-    } else {
-        if (buf.size() < 12) { err = "NPY v2 header too short."; return false; }
-        hlen = static_cast<uint32_t>(buf[8])  | (static_cast<uint32_t>(buf[9])  << 8)
-             | (static_cast<uint32_t>(buf[10]) << 16) | (static_cast<uint32_t>(buf[11]) << 24);
-        hstart = 12;
-    }
-    if (hstart + hlen > buf.size()) { err = "NPY header truncated."; return false; }
-    std::string hdr(reinterpret_cast<const char*>(buf.data() + hstart), hlen);
-
-    // elem_size from dtype
-    struct { const char* token; int sz; } dtypes[] = {
-        {"|u1",1},{"|i1",1},{"'u1'",1},{"'i1'",1},
-        {"<u2",2},{"<i2",2},{"<u4",4},{"<i4",4},
-        {"<u8",8},{"<i8",8},{"<f4",4},{"<f8",8},
-        {nullptr,0}
-    };
-    elem_size = 0;
-    for (auto& d : dtypes) {
-        if (!d.token) break;
-        if (hdr.find(d.token) != std::string::npos) { elem_size = d.sz; break; }
-    }
-    if (elem_size == 0) { err = "Unsupported dtype in NPY entry."; return false; }
-
-    // shape
-    auto sp = hdr.find("'shape'");
-    if (sp == std::string::npos) sp = hdr.find("\"shape\"");
-    if (sp == std::string::npos) { err = "Cannot find shape."; return false; }
-    auto lp = hdr.find('(', sp);
-    auto rp = hdr.find(')', lp != std::string::npos ? lp : 0);
-    if (lp == std::string::npos || rp == std::string::npos) { err = "Cannot parse shape."; return false; }
-    std::string shape_str = hdr.substr(lp + 1, rp - lp - 1);
-    shape.clear();
-    size_t pos = 0;
-    while (pos < shape_str.size()) {
-        while (pos < shape_str.size() && (shape_str[pos] == ' ' || shape_str[pos] == ',')) pos++;
-        if (pos >= shape_str.size()) break;
-        char* end = nullptr;
-        long long v = std::strtoll(shape_str.c_str() + pos, &end, 10);
-        if (end == shape_str.c_str() + pos) break;
-        shape.push_back(static_cast<int64_t>(v));
-        pos = static_cast<size_t>(end - shape_str.c_str());
-    }
-
-    size_t data_start = hstart + hlen;
-    size_t data_bytes = buf.size() - data_start;
-    payload.assign(buf.data() + data_start, buf.data() + data_start + data_bytes);
     return true;
 }
 
@@ -5032,6 +4891,42 @@ void MainWindow::onLoadSpectrumNpz() {
 // ---------------------------------------------------------------------------
 // Open NPY / NPZ file as a trace set (loads into the main viewer)
 // ---------------------------------------------------------------------------
+// Reads the labels archive beside a trace matrix, if there is one, into the
+// file's per-trace data. Returns what it found, for the status bar.
+static QString attachLabelsNextTo(TrsFile& f, const QString& npy_path, QWidget* parent) {
+    const QString labels_path = findLabelsNextTo(npy_path);
+    if (labels_path.isEmpty()) return {};
+    const QString name = QFileInfo(labels_path).fileName();
+    if (!confirmMemory(parent, 3 * QFileInfo(labels_path).size(), "Reading the labels in " + name,
+                       "Open the traces without them by moving the file away."))
+        return {};
+    std::map<std::string, std::vector<uint8_t>> entries;
+    QString err;
+    if (!loadNpz(labels_path, entries, err)) {
+        QMessageBox::warning(parent, "Labels not loaded",
+                             QString("%1 could not be read: %2\nThe traces open without labels.").arg(name, err));
+        return {};
+    }
+    TraceLabels labels;
+    packTraceLabels(entries, f.header().num_traces, {}, labels);
+    if (labels.params.empty()) {
+        QMessageBox::warning(parent, "Labels not loaded",
+                             QString("%1 has no array with %2 rows (one per trace).\n"
+                                     "The traces open without labels.").arg(name).arg(f.header().num_traces));
+        return {};
+    }
+    QStringList names;
+    for (const auto& kv : labels.params) names << QString::fromStdString(kv.first);
+    QString note = QString("Labels from %1: %2").arg(name, names.join(", "));
+    if (!labels.unusable.empty()) {
+        QStringList left_out;
+        for (const auto& u : labels.unusable) left_out << QString::fromStdString(u);
+        note += QString(" (left out: %1)").arg(left_out.join(", "));
+    }
+    f.attachData(labels.data.data(), labels.data_length, labels.params, note.toStdString());
+    return note;
+}
+
 void MainWindow::onOpenNpyTraces() {
     QString path = QFileDialog::getOpenFileName(
         this, "Open NPY/NPZ as traces",
@@ -5043,13 +4938,9 @@ void MainWindow::onOpenNpyTraces() {
 
 void MainWindow::openNpyTraces(const QString& path) {
     std::vector<float> traces_flat;
-    std::vector<float> data_flat;
     int64_t n_traces = 0, n_samples = 0;
-    int64_t data_cols = 0;
+    TraceLabels labels;
     QString err;
-
-    struct NamedCol { std::string name; int elem_size; std::vector<uint8_t> payload; };
-    std::vector<NamedCol> named_cols;
 
     if (path.endsWith(".npz", Qt::CaseInsensitive)) {
         // Loaded whole: the archive's entries, the traces taken from them and
@@ -5092,44 +4983,8 @@ void MainWindow::openNpyTraces(const QString& path) {
         n_traces = sh[0]; n_samples = sh[1];
         std::string traces_key = it->first;
 
-        // --- Also check for legacy 2-D data array ---
-        for (const char* dname : {"data.npy","data","labels.npy","labels","textin.npy","textin","plaintext.npy","plaintext"}) {
-            auto di = entries.find(dname);
-            if (di == entries.end() || di->first == traces_key) continue;
-            std::vector<int64_t> dsh;
-            if (parseNpyBytes(di->second, data_flat, dsh, err) && dsh.size() == 2 && dsh[0] == n_traces) {
-                data_cols = dsh[1];
-                break;
-            }
-        }
-
-        // --- Scan all remaining entries for 1-D arrays matching n_traces ---
-        static const char* legacy_names[] = {
-            "data.npy","data","labels.npy","labels",
-            "textin.npy","textin","plaintext.npy","plaintext", nullptr
-        };
-        for (auto& kv : entries) {
-            if (kv.first == traces_key) continue;
-            // skip if already picked up as 2-D data
-            bool skip = false;
-            if (data_cols > 0) {
-                for (int li = 0; legacy_names[li]; li++)
-                    if (kv.first == legacy_names[li]) { skip = true; break; }
-            }
-            if (skip) continue;
-
-            std::vector<int64_t> csh; int esz; std::vector<uint8_t> cpayload; QString cerr;
-            if (!parseNpyRaw(kv.second, csh, esz, cpayload, cerr)) continue;
-            if (csh.size() != 1 || csh[0] != n_traces) continue;
-            if (static_cast<int64_t>(cpayload.size()) < n_traces * esz) continue;
-
-            // strip ".npy" suffix from name
-            std::string colname = kv.first;
-            if (colname.size() > 4 && colname.substr(colname.size()-4) == ".npy")
-                colname = colname.substr(0, colname.size()-4);
-
-            named_cols.push_back({colname, esz, std::move(cpayload)});
-        }
+        // Everything else with a row per trace is a label.
+        packTraceLabels(entries, n_traces, traces_key, labels);
     } else {
         // Plain .npy: memory-map directly rather than reading the whole file into
         // RAM (a copy here plus the copy TrsFile::openFromArray used to make meant
@@ -5140,6 +4995,7 @@ void MainWindow::openNpyTraces(const QString& path) {
             QMessageBox::critical(this, "Load failed", QString::fromStdString(npy_err)); return;
         }
         // No prefetch here — see the matching comment in openFile().
+        const QString labels_note = attachLabelsNextTo(*f, path, this);
 
         Dataset ds;
         ds.file         = std::move(f);
@@ -5164,6 +5020,7 @@ void MainWindow::openNpyTraces(const QString& path) {
         updateFileInfo();
         onApplyTraces();
         updateViewLayout();
+        if (!labels_note.isEmpty()) statusBar()->showMessage(labels_note, 15000);
         return;
     }
 
@@ -5173,63 +5030,14 @@ void MainWindow::openNpyTraces(const QString& path) {
 
     // Build the in-memory TrsFile
     auto f = std::make_shared<TrsFile>();
-    std::vector<uint8_t> data_bytes;
-    int16_t data_length = 0;
-    std::map<std::string, TrsTraceParam> param_map;
-
-    if (!named_cols.empty()) {
-        // Pack named 1-D columns as raw bytes; build param_map
-        uint16_t offset = 0;
-        for (auto& col : named_cols) {
-            if (offset + col.elem_size > 32767) break; // safety cap
-            TrsTraceParam p;
-            p.offset = offset;
-            p.length = static_cast<uint16_t>(col.elem_size);
-            // type field: 1=u8/i8, 2=i16, 4=i32, 8=i64
-            switch (col.elem_size) {
-                case 1: p.type = 1; break;
-                case 2: p.type = 2; break;
-                case 4: p.type = 4; break;
-                case 8: p.type = 8; break;
-                default: p.type = 0; break;
-            }
-            param_map[col.name] = p;
-            offset += static_cast<uint16_t>(col.elem_size);
-        }
-        data_length = static_cast<int16_t>(offset);
-        data_bytes.resize(static_cast<size_t>(n_traces) * static_cast<size_t>(data_length), 0);
-        for (auto& col : named_cols) {
-            auto pit = param_map.find(col.name);
-            if (pit == param_map.end()) continue;
-            uint16_t off = pit->second.offset;
-            int esz = col.elem_size;
-            for (int64_t ti = 0; ti < n_traces; ti++) {
-                const uint8_t* src = col.payload.data() + static_cast<size_t>(ti) * esz;
-                uint8_t* dst = data_bytes.data() + static_cast<size_t>(ti) * data_length + off;
-                std::memcpy(dst, src, esz);
-            }
-        }
-    } else if (data_cols > 0) {
-        data_length = static_cast<int16_t>(std::min(data_cols, (int64_t)32767));
-        data_bytes.resize(static_cast<size_t>(n_traces) * static_cast<size_t>(data_length));
-        for (int64_t ti = 0; ti < n_traces; ti++) {
-            for (int16_t bi = 0; bi < data_length; bi++) {
-                float v = data_flat[static_cast<size_t>(ti) * static_cast<size_t>(data_cols)
-                                  + static_cast<size_t>(bi)];
-                data_bytes[static_cast<size_t>(ti) * static_cast<size_t>(data_length)
-                         + static_cast<size_t>(bi)] = static_cast<uint8_t>(
-                    static_cast<int>(v) & 0xFF);
-            }
-        }
-    }
     f->openFromArray(traces_flat.data(),
                      static_cast<int32_t>(n_traces),
                      static_cast<int32_t>(n_samples),
                      path.toStdString(),
-                     data_bytes.empty() ? nullptr : data_bytes.data(),
-                     data_length);
-    if (!param_map.empty())
-        f->setParamMap(param_map);
+                     labels.data.empty() ? nullptr : labels.data.data(),
+                     labels.data_length);
+    if (!labels.params.empty())
+        f->setParamMap(labels.params);
 
     Dataset ds;
     ds.file         = std::move(f);
@@ -6182,11 +5990,10 @@ void MainWindow::onRunAverage() {
     cmb_mode->setToolTip("Per group: the mean of group 0 and of group 1 (from the group data "
                          "byte, as in the t-test), and optionally their difference.");
     const bool have_ttest_param = h.param_map.count("ttest") > 0;
-    auto* sp_byte = new QSpinBox;
-    sp_byte->setRange(0, std::max(0, static_cast<int>(h.data_length) - 1));
-    sp_byte->setValue(have_ttest_param ? h.param_map.at("ttest").offset : 0);
-    sp_byte->setToolTip(have_ttest_param ? QString("From the file's \"ttest\" field.")
-                                         : QString("Data byte holding the group (0 or not 0)."));
+    const std::shared_ptr<TrsFile> run_file = activeDs().file;
+    auto* picker = new GroupPicker(run_file);
+    if (have_ttest_param) picker->selectField("ttest");
+    else                  picker->remember(mem);
     auto* chk_std  = mem.bind(new QCheckBox("Show ± 1 standard deviation"), "std");
     chk_std->setChecked(true);
     auto* chk_diff = mem.bind(new QCheckBox("Also the difference of the group means (G1 − G0)"), "diff");
@@ -6194,12 +6001,12 @@ void MainWindow::onRunAverage() {
     chk_diff->setToolTip("In its own tab: where the groups' average power differs (a "
                          "difference-of-means view; the t-test adds the noise to this).");
     fl->addRow("Average:", cmb_mode);
-    fl->addRow("Group byte:", sp_byte);
+    fl->addRow("Group by:", picker);
     fl->addRow(chk_std);
     fl->addRow(chk_diff);
     auto syncMode = [=]() {
         const bool groups = cmb_mode->currentIndex() == 1;
-        sp_byte->setEnabled(groups && h.data_length > 0);
+        picker->setEnabled(groups && h.data_length > 0);
         chk_diff->setEnabled(groups);
     };
     if (h.data_length <= 0) {
@@ -6219,7 +6026,6 @@ void MainWindow::onRunAverage() {
     syncMode();
     // A job finishing while the dialog is open can make its result tab the
     // active one: carry on with the file the dialog was opened for.
-    const std::shared_ptr<TrsFile> run_file = activeDs().file;
     if (cfg.exec() != QDialog::Accepted || !returnToFile(run_file, this)) return;
     mem.save();
 
@@ -6228,7 +6034,7 @@ void MainWindow::onRunAverage() {
     const int64_t s_first = sp_s_first->value();
     const int64_t s_count = sp_s_count->value();
     const bool groups  = cmb_mode->currentIndex() == 1 && h.data_length > 0;
-    const int32_t byte_idx = groups ? sp_byte->value() : -1;
+    const GroupBy group_by = groups ? picker->groupBy() : GroupBy();
     const bool show_std  = chk_std->isChecked();
     const bool show_diff = groups && chk_diff->isChecked();
     const ResolvedAlignment resolved = resolveAlignmentTile(activeDs(), sp_tile ? sp_tile->value() : 0);
@@ -6260,7 +6066,7 @@ void MainWindow::onRunAverage() {
     jobs_->submit(QString("Average — %1 traces of %2").arg(count).arg(fname),
         [=](JobContext& ctx) {
             return computeMeanTraces(job_file.get(), job_pipeline, first, count, s_first, s_count,
-                                     byte_idx, shifts, shifts_first, read_lo, read_hi,
+                                     group_by, shifts, shifts_first, read_lo, read_hi,
                                      [&ctx](int64_t done, int64_t total) {
                                          ctx.setProgress(done, total);
                                          return !ctx.cancelled();
@@ -6343,8 +6149,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     const TrsHeader& h = run_file->header();
     if (h.data_length <= 0) {
         QMessageBox::critical(this, "T-test",
-            "This TRS file has no per-trace data bytes.\n"
-            "Group assignment requires at least 1 data byte per trace.");
+            noDataBytesText(*run_file) + "\nGroup assignment requires at least 1 data byte per trace.");
         return;
     }
 
@@ -6499,7 +6304,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         syncPatternMode(grp_pat->isChecked());
     }
 
-    QSpinBox* sp_byte = nullptr;
+    GroupPicker* picker = nullptr;
     if (have_ttest_param) {
         auto* lbl = new QLabel(
             QString("Group assignment: <b>ttest</b> parameter (data byte offset %1)")
@@ -6507,16 +6312,12 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         lbl->setTextFormat(Qt::RichText);
         fl->addRow(lbl);
     } else {
-        sp_byte = new QSpinBox;
-        sp_byte->setRange(0, h.data_length - 1);
-        sp_byte->setValue(0);
-        sp_byte->setToolTip("Index of the data byte used to assign groups.\n"
-                            "0 → group 0,  non-zero → group 1.");
-        fl->addRow("Group byte index:", sp_byte);
+        picker = new GroupPicker(run_file);
+        fl->addRow("Group by:", picker);
     }
 
     DialogMemory mem("ttest");
-    mem.bind(sp_byte, "group_byte");   // null when the file carries a ttest param
+    if (picker) picker->remember(mem);   // none when the file carries a ttest param
     auto* chk_abs = mem.bind(new QCheckBox("Absolute value |t|"), "abs");
     chk_abs->setToolTip("Report |t| instead of the signed t-statistic — only magnitude "
                         "matters against the significance threshold, so this makes peaks "
@@ -6913,8 +6714,8 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
 
     int32_t first    = static_cast<int32_t>(sp_first->value());
     int32_t count    = static_cast<int32_t>(sp_count->value());
-    int32_t byte_idx = have_ttest_param ? auto_byte_idx
-                                        : static_cast<int32_t>(sp_byte->value());
+    const GroupBy group_by = have_ttest_param ? GroupBy(auto_byte_idx) : picker->groupBy();
+    const QString group_note = groupNote(h, group_by);
 
     TTestOptions topt;
     topt.order        = cmb_order->currentIndex() == 1 ? 2 : 1;
@@ -6922,7 +6723,9 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     topt.sanity_split = chk_sanity->isChecked();
     const bool show_first = topt.order == 2 && chk_first->isChecked();
     // "Welch t-test", plus what kind of run it was.
-    const QString run_kind = QString("Welch t-test%1%2%3")
+    const QString group_suffix = group_note.isEmpty() ? QString() : " · " + group_note;
+    const QString run_kind = QString("Welch t-test%1%2%3%4")
+        .arg(group_suffix)
         .arg(topt.order == 2 ? QString(" 2nd order") : QString())
         .arg(topt.order == 2 && topt.integrate > 1 ? QString(" (window %1)").arg(topt.integrate) : QString())
         .arg(topt.sanity_split ? QString(" · SANITY SPLIT") : QString());
@@ -6997,7 +6800,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         std::shared_ptr<TrsFile> job_file = activeDs().file;
         std::vector<std::shared_ptr<ITransform>> job_pipeline;
         for (const auto& t : activeDs().pipeline) job_pipeline.push_back(t->clone());
-        const QString fname = activeDs().display_name;
+        const QString fname = activeDs().display_name + group_suffix;
         struct DcOut {
             std::vector<DcorCurveResult> curves;   // per sample: one per range
             DcorWindowResult windows;              // per window
@@ -7008,7 +6811,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         jobs_->submit(QString("Distance correlation%1 — %2").arg(per_window ? " (windows)" : "").arg(fname),
             [=](JobContext& ctx) {
                 if (per_window)
-                    return computeWindowDcor(job_file.get(), job_pipeline, first, count, ranges, byte_idx,
+                    return computeWindowDcor(job_file.get(), job_pipeline, first, count, ranges, group_by,
                                              read_lo, read_hi, sanity, standardize,
                                              [&ctx](int64_t done, int64_t total) {
                                                  ctx.setProgress(done, total);
@@ -7023,7 +6826,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                                         static_cast<int64_t>(ranges.size()) * total);
                         return !ctx.cancelled();
                     };
-                    if (!computeDcorCurve(job_file.get(), job_pipeline, first, count, ranges[k], byte_idx,
+                    if (!computeDcorCurve(job_file.get(), job_pipeline, first, count, ranges[k], group_by,
                                           read_lo, read_hi, sanity, prog, out->curves[k], warn, out->err)) {
                         if (out->err != "Cancelled." && pat_mode)
                             out->err = QString("Pattern \"%1\": %2").arg(ranges[k].name, out->err);
@@ -7169,7 +6972,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         const bool sanity    = chk_sanity->isChecked();
         struct BiOut { BivariateResult r; QString warn, err; };
         auto out = std::make_shared<BiOut>();
-        const QString fname = activeDs().display_name;
+        const QString fname = activeDs().display_name + group_suffix;
 
         if (lag_mode) {
             struct LagOut { LagResult r; QString warn, err; };
@@ -7180,7 +6983,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                         ctx.setProgress(done, total);
                         return !ctx.cancelled();
                     };
-                    return computeLagTTest(job_file.get(), job_pipeline, first, count, byte_idx,
+                    return computeLagTTest(job_file.get(), job_pipeline, first, count, group_by,
                                            wa, lags, read_lo, read_hi, sanity, abs_value, prog,
                                            lout->r, lout->warn, lout->err);
                 },
@@ -7202,7 +7005,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                     ctx.setProgress(done, total);
                     return !ctx.cancelled();
                 };
-                return computeBivariateTTest(job_file.get(), job_pipeline, first, count, byte_idx,
+                return computeBivariateTTest(job_file.get(), job_pipeline, first, count, group_by,
                                              wa, wb, read_lo, read_hi, sanity, abs_value, prog,
                                              out->r, out->warn, out->err);
             },
@@ -7225,7 +7028,8 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
             st.kind               = ChainStep::Kind::RunTTest;
             st.first_trace        = first;
             st.trace_count        = count;
-            st.ttest_byte_idx     = byte_idx;
+            st.ttest_byte_idx     = group_by.byte;
+            st.ttest_bit_mask     = group_by.mask;
             st.ttest_abs          = chk_abs->isChecked();
             st.ttest_use_patterns = true;
             st.ttest_order        = topt.order;
@@ -7263,7 +7067,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         out->acc.resize(pats.size()); out->t.resize(pats.size()); out->t1.resize(pats.size());
         out->n0.resize(pats.size()); out->n1.resize(pats.size());
         const int64_t ns = h.num_samples;
-        const QString fname = activeDs().display_name;
+        const QString fname = activeDs().display_name + group_suffix;
 
         jobs_->submit(QString("T-test — %1 patterns of %2").arg(pats.size()).arg(fname),
             [=](JobContext& ctx) {
@@ -7277,7 +7081,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                     };
                     if (!computeTTest(job_file.get(), job_pipeline, first, count,
                                       p.def.raw_start, p.def.raw_end - p.def.raw_start,
-                                      byte_idx, p.res.shifts, p.res.first_trace,
+                                      group_by, p.res.shifts, p.res.first_trace,
                                       0, ns, abs_value, topt, prog,
                                       out->acc[k], out->t[k], out->n0[k], out->n1[k],
                                       warn, err, nullptr, show_first ? &out->t1[k] : nullptr)) {
@@ -7331,7 +7135,8 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         s.use_last_alignment      = use_alignment;
         s.ttest_first_sample        = eff_first_sample;
         s.ttest_n_samples             = eff_n_samples;
-        s.ttest_byte_idx                = byte_idx;
+        s.ttest_byte_idx                = group_by.byte;
+        s.ttest_bit_mask                = group_by.mask;
         s.ttest_abs                       = abs_value;
         s.ttest_order                     = topt.order;
         s.ttest_integrate                 = topt.integrate;
@@ -7409,7 +7214,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         [=](JobContext& ctx) {
             return computeTTest(job_file.get(), job_pipeline,
                                 eff_first, eff_count, eff_first_sample, eff_n_samples,
-                                byte_idx, use_shifts, shifts_first_trace,
+                                group_by, use_shifts, shifts_first_trace,
                                 read_lo, read_hi, abs_value, topt,
                                 [&ctx](int64_t done, int64_t total) {
                                     ctx.setProgress(done, total);
@@ -7433,7 +7238,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
                 [](const QString& l) { return l.startsWith("Stopped early"); }), warn.end());
             if (!warn.isEmpty()) QMessageBox::warning(this, "T-test", warn.join('\n'));
             const int32_t n_used = live ? static_cast<int32_t>(live->processed) : eff_count;
-            const QString title = (topt.order == 1 && !topt.sanity_split) ? QString()
+            const QString title = (topt.order == 1 && !topt.sanity_split && group_note.isEmpty()) ? QString()
                 : QString("%1 — %2 traces (G0:%3  G1:%4)%5").arg(run_kind).arg(n_used)
                       .arg(out->n0).arg(out->n1).arg(abs_value ? QString(" |t|") : QString());
             buildTTestResultTab(out->acc, std::move(out->tstat), out->n0, out->n1,
@@ -9828,7 +9633,7 @@ bool computeSpectralLeakageCore(
     const std::vector<std::shared_ptr<ITransform>>& pipeline,
     int32_t first, int32_t count,
     int64_t eff_first_sample, int64_t raw_ns,
-    int32_t byte_idx, int stft_window, int stft_hop, int win_fn,
+    GroupBy group_by, int stft_window, int stft_hop, int win_fn,
     const std::vector<int32_t>& shifts, int32_t shifts_first_trace,
     int64_t read_lo, int64_t read_hi,
     const std::function<bool(int64_t, int64_t)>& progress,
@@ -9862,8 +9667,8 @@ bool computeSpectralLeakageCore(
 
         const int32_t src_idx = first + ti;
         auto data_bytes = file->readData(src_idx);
-        if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { out.skipped++; continue; }
-        const int group = (data_bytes[static_cast<size_t>(byte_idx)] != 0) ? 1 : 0;
+        const int group = group_by.groupOf(data_bytes);
+        if (group < 0) { out.skipped++; continue; }
 
         // Per-trace alignment shift, looked up by the trace's position in the
         // *alignment's own* range rather than by ti — `first` may start
@@ -9951,7 +9756,7 @@ void MainWindow::onRunSpectralLeakage() {
     const TrsHeader& h = activeDs().file->header();
     if (h.data_length <= 0) {
         QMessageBox::critical(this, "Leakage vs Frequency",
-            "This TRS file has no per-trace data bytes.\n"
+            noDataBytesText(*activeDs().file) + "\n"
             "A fixed-vs-random group label is needed, exactly as for the t-test.");
         return;
     }
@@ -9985,14 +9790,10 @@ void MainWindow::onRunSpectralLeakage() {
     fl->addRow("Sample count (0=all):", sp_s_count);
 
     const bool have_param = h.param_map.count("ttest") > 0;
-    auto* sp_byte = new QSpinBox;
-    sp_byte->setRange(0, std::max(0, h.data_length - 1));
-    sp_byte->setValue(have_param
-        ? static_cast<int>(h.param_map.at("ttest").offset) : 0);
-    sp_byte->setEnabled(!have_param);
-    sp_byte->setToolTip("Group label byte: zero means group 0, anything else group 1 "
-                         "— the same rule the t-test uses.");
-    fl->addRow(have_param ? "Group byte (from \"ttest\" param):" : "Group byte:", sp_byte);
+    auto* picker = new GroupPicker(activeDs().file);
+    if (have_param) picker->selectField("ttest");
+    picker->setEnabled(!have_param);
+    fl->addRow(have_param ? "Group (from \"ttest\" param):" : "Group by:", picker);
 
     auto* sp_win = new QSpinBox;
     sp_win->setRange(8, 65536);
@@ -10051,7 +9852,7 @@ void MainWindow::onRunSpectralLeakage() {
     fl->addRow(jitter_note);
 
     DialogMemory mem("leakage_freq");
-    mem.bind(sp_byte, "group_byte");
+    if (!have_param) picker->remember(mem);
     mem.bind(sp_win, "stft_window");
     mem.bind(sp_ov, "overlap");
     mem.bind(cmb_fn, "window_fn");
@@ -10086,7 +9887,7 @@ void MainWindow::onRunSpectralLeakage() {
 
     const int32_t first  = sp_first->value();
     const int32_t count  = sp_count->value();
-    const int32_t byte_i = sp_byte->value();
+    const GroupBy group_by = picker->groupBy();
     const int     wlen   = sp_win->value();
     const int     hop    = std::max(1, static_cast<int>(
                               std::llround(wlen * (1.0 - sp_ov->value()))));
@@ -10124,7 +9925,7 @@ void MainWindow::onRunSpectralLeakage() {
         [=](JobContext& ctx) {
             return computeSpectralLeakageCore(
                 job_file.get(), job_pipeline, first, count,
-                eff_first_sample, raw_ns, byte_i, wlen, hop, win_fn,
+                eff_first_sample, raw_ns, group_by, wlen, hop, win_fn,
                 use_shifts, shifts_first_trace, read_lo, read_hi,
                 [&ctx](int64_t done, int64_t total) {
                     ctx.setProgress(done, total);
@@ -12393,14 +12194,15 @@ bool MainWindow::runAlignPatternsChainStep(const ChainStep& step, QWidget* msg_p
 bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, QString& err) {
     const TrsHeader& h = activeDs().file->header();
     if (h.data_length <= 0) {
-        err = "This TRS file has no per-trace data bytes.";
+        err = noDataBytesText(*activeDs().file);
         return false;
     }
 
     bool have_ttest_param = h.param_map.count("ttest") > 0;
-    int32_t byte_idx = have_ttest_param
-        ? static_cast<int32_t>(h.param_map.at("ttest").offset)
-        : step.ttest_byte_idx;
+    const GroupBy group_by = have_ttest_param
+        ? GroupBy(static_cast<int32_t>(h.param_map.at("ttest").offset))
+        : GroupBy(step.ttest_byte_idx, step.ttest_bit_mask);
+    const QString group_note = groupNote(h, group_by);
 
     const int32_t eff_first = step.first_trace;
     const int32_t eff_count = step.trace_count;
@@ -12413,7 +12215,8 @@ bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, Q
     topt.integrate    = std::max(1, step.ttest_integrate);
     topt.sanity_split = step.ttest_sanity;
     const bool show_first = topt.order == 2 && step.ttest_show_first;
-    const QString run_kind = QString("Welch t-test%1%2%3")
+    const QString run_kind = QString("Welch t-test%1%2%3%4")
+        .arg(group_note.isEmpty() ? QString() : " · " + group_note)
         .arg(topt.order == 2 ? QString(" 2nd order") : QString())
         .arg(topt.order == 2 && topt.integrate > 1 ? QString(" (window %1)").arg(topt.integrate) : QString())
         .arg(topt.sanity_split ? QString(" · SANITY SPLIT") : QString());
@@ -12443,7 +12246,7 @@ bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, Q
                                   .arg(QString::fromStdString(p.def.name)));
             QString w;
             if (!computeTTest(activeDs().file.get(), activeDs().pipeline, eff_first, eff_count,
-                              p.def.raw_start, p.def.raw_end - p.def.raw_start, byte_idx,
+                              p.def.raw_start, p.def.raw_end - p.def.raw_start, group_by,
                               p.res.shifts, p.res.first_trace, 0, h.num_samples,
                               step.ttest_abs, topt, progressFor(prog),
                               accs[k], ts[k], n0s[k], n1s[k], w, err, nullptr,
@@ -12493,7 +12296,7 @@ bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, Q
     QString warn;
     if (!computeTTest(activeDs().file.get(), activeDs().pipeline,
                       eff_first, eff_count, step.ttest_first_sample, step.ttest_n_samples,
-                      byte_idx, use_shifts, shifts_first_trace, read_lo, read_hi,
+                      group_by, use_shifts, shifts_first_trace, read_lo, read_hi,
                       step.ttest_abs, topt, progressFor(prog),
                       acc_ptr, tstat, n0, n1, warn, err, nullptr,
                       show_first ? &tstat1 : nullptr))
@@ -12501,7 +12304,7 @@ bool MainWindow::runTTestChainStep(const ChainStep& step, QWidget* msg_parent, Q
     prog.setValue(prog.maximum());
     if (!warn.isEmpty()) QMessageBox::warning(msg_parent, "T-test", warn);
 
-    const QString title = (topt.order == 1 && !topt.sanity_split) ? QString()
+    const QString title = (topt.order == 1 && !topt.sanity_split && group_note.isEmpty()) ? QString()
         : QString("%1 — %2 traces (G0:%3  G1:%4)%5").arg(run_kind).arg(eff_count).arg(n0).arg(n1)
               .arg(step.ttest_abs ? QString(" |t|") : QString());
     buildTTestResultTab(acc_ptr, std::move(tstat), n0, n1, eff_count, step.ttest_abs,
@@ -13774,7 +13577,7 @@ void MainWindow::onRunSNR() {
     const TrsHeader& h = activeDs().file->header();
     if (h.data_length <= 0) {
         QMessageBox::critical(this, "SNR",
-            "This TRS file has no per-trace data bytes.\n"
+            noDataBytesText(*activeDs().file) + "\n"
             "SNR requires at least 1 data byte per trace for class labels.");
         return;
     }
@@ -13797,11 +13600,9 @@ void MainWindow::onRunSNR() {
     fl->addRow("First sample:",           sp_s_first);
     fl->addRow("Sample count (0=all):",   sp_s_count);
 
-    auto* sp_byte = new QSpinBox;
-    sp_byte->setRange(0, h.data_length - 1);
-    sp_byte->setValue(0);
-    sp_byte->setToolTip("Data byte used to derive the class label.");
-    fl->addRow("Data byte index:", sp_byte);
+    auto* picker = new GroupPicker(activeDs().file, false);
+    picker->setToolTip("Data byte used to derive the class label.");
+    fl->addRow("Data byte:", picker);
 
     auto* cmb_mode = new QComboBox;
     cmb_mode->addItem("Raw byte value  (256 classes, 0–255)");
@@ -13822,7 +13623,7 @@ void MainWindow::onRunSNR() {
     });
 
     DialogMemory mem("snr");
-    mem.bind(sp_byte, "data_byte");
+    picker->remember(mem, "data_byte");
     mem.bind(cmb_mode, "class_mode");
     mem.bind(sp_key, "key_byte");
 
@@ -13840,7 +13641,7 @@ void MainWindow::onRunSNR() {
 
     const int32_t first    = sp_first->value();
     const int32_t count    = sp_count->value();
-    const int32_t byte_idx = sp_byte->value();
+    const int32_t byte_idx = picker->byteIndex();
     const int     mode     = cmb_mode->currentIndex();
     const uint8_t key_byte = static_cast<uint8_t>(sp_key->value());
     const bool    use_hw   = (mode == 1 || mode == 3);

@@ -8,7 +8,8 @@
 | TRS file | **File → Open TRS File…** (Ctrl+O) or command-line argument |
 | Several TRS files as one set | **File → Open Several Files as One…**; reopen with the saved `.trslist` ([details](features/combined.md)) |
 | NPY (2-D trace matrix) | **File → Open NPY/NPZ as Traces…** |
-| NPZ archive | same — looks for `traces` array + optional `data` array |
+| NPY with labels | same — `labels.npz` next to it is read as the per-trace data ([details](features/npy-npz.md)) |
+| NPZ archive | same — looks for a `traces` array; the other per-trace arrays become labels |
 | Any of the above | Drag the file onto the window |
 | A file you opened before | **File → Open Recent**, or click it on the start page |
 

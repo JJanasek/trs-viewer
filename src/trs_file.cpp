@@ -475,6 +475,36 @@ bool TrsFile::openNpy(const std::string& path, std::string& error) {
     return true;
 }
 
+void TrsFile::attachData(const uint8_t* data_bytes, int16_t data_length,
+                         const std::map<std::string, TrsTraceParam>& params,
+                         const std::string& note) {
+    if (!data_bytes || data_length <= 0) return;
+    header_.data_length = data_length;
+    mem_data_.assign(data_bytes, data_bytes + static_cast<size_t>(header_.num_traces)
+                                              * static_cast<size_t>(data_length));
+    setParamMap(params);
+    if (!note.empty()) notes_ += (notes_.empty() ? "" : "\n") + note;
+}
+
+void TrsFile::setParamMap(const std::map<std::string, TrsTraceParam>& pm) {
+    header_.param_map = pm;
+    // TRACE_PARAMETER_DEFINITIONS as parseHeader() reads it
+    auto& raw = header_.raw_param_defs;
+    raw.clear();
+    auto le16 = [&raw](size_t v) {
+        raw.push_back(static_cast<uint8_t>(v));
+        raw.push_back(static_cast<uint8_t>(v >> 8));
+    };
+    le16(pm.size());
+    for (const auto& [name, p] : pm) {
+        le16(name.size());
+        raw.insert(raw.end(), name.begin(), name.end());
+        raw.push_back(p.type);
+        le16(p.count);
+        le16(p.offset);
+    }
+}
+
 bool TrsFile::parseHeader(const uint8_t* data, size_t size, std::string& error) {
     // Helper lambdas for little-endian reads
     auto le16 = [](const uint8_t* p) -> int16_t {
@@ -684,7 +714,7 @@ int64_t TrsFile::readSamples(int32_t trace_idx, int64_t sample_offset,
 
     int64_t byte_off = traceByteOffset(trace_idx)
                      + header_.title_space
-                     + header_.data_length
+                     + dataBytesInFile()
                      + sample_offset * header_.sample_size;
 
     if (byte_off < 0 ||
@@ -731,8 +761,8 @@ float TrsFile::readSample(int32_t trace_idx, int64_t sample_idx) const {
 }
 
 std::vector<uint8_t> TrsFile::readData(int32_t trace_idx) const {
-    // In-memory mode
-    if (!mem_samples_.empty()) {
+    // In-memory mode, or data attached to a mapped matrix
+    if (!mem_samples_.empty() || !mem_data_.empty()) {
         if (trace_idx < 0 || trace_idx >= header_.num_traces
                 || header_.data_length <= 0 || mem_data_.empty())
             return {};
@@ -802,7 +832,7 @@ void TrsFile::willNeed(int32_t trace_idx, int64_t sample_offset, int64_t count) 
     count = std::min<int64_t>(count, header_.num_samples - sample_offset);
     if (count <= 0) return;
     const int64_t data_off = traceByteOffset(trace_idx) + header_.title_space;
-    const int64_t win_off  = data_off + header_.data_length + sample_offset * header_.sample_size;
+    const int64_t win_off  = data_off + dataBytesInFile() + sample_offset * header_.sample_size;
     const int64_t win_end  = std::min<int64_t>(win_off + count * header_.sample_size,
                                                static_cast<int64_t>(mmap_size_));
     const int64_t page = sysconf(_SC_PAGESIZE);
@@ -817,7 +847,7 @@ void TrsFile::willNeed(int32_t trace_idx, int64_t sample_offset, int64_t count) 
     if (win_off - data_off <= 64 * 1024) {
         advise(data_off, win_end);
     } else {
-        advise(data_off, data_off + std::max<int64_t>(1, header_.data_length));
+        advise(data_off, data_off + std::max<int64_t>(1, dataBytesInFile()));
         advise(win_off, win_end);
     }
 }

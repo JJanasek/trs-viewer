@@ -174,6 +174,18 @@ LeakageModelDialog::LeakageModelDialog(TrsFile* file, int32_t first_trace,
         const auto& h = file_->header();
         info = QString("Traces: %1   Data bytes: %2   Samples: %3   Preview: first %4 traces")
                .arg(h.num_traces).arg(h.data_length).arg(h.num_samples).arg(n_preview_);
+        // The named labels and where the model finds them.
+        if (!h.param_map.empty() && !h.param_map.count("LEGACY_DATA")) {
+            std::vector<std::pair<std::string, TrsTraceParam>> params(h.param_map.begin(), h.param_map.end());
+            std::stable_sort(params.begin(), params.end(),
+                             [](const auto& a, const auto& b) { return a.second.offset < b.second.offset; });
+            QStringList where;
+            for (const auto& [name, p] : params)
+                where << (p.length == 1
+                    ? QString("%1 = plaintexts[:, %2]").arg(QString::fromStdString(name)).arg(p.offset)
+                    : QString("%1 = plaintexts[:, %2:%3]").arg(QString::fromStdString(name)).arg(p.offset).arg(p.offset + p.length));
+            info += "\n" + where.join(",  ");
+        }
     } else {
         info = "(no file loaded)";
     }

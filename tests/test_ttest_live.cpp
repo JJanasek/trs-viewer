@@ -193,3 +193,51 @@ TEST(TTestLive, CancelWhilePausedIsReportedAsCancelled) {
     EXPECT_FALSE(r.ok);
     EXPECT_EQ(r.err, QString("Cancelled."));
 }
+
+// ---------------------------------------------------------------------------
+// GroupBy — splitting on one bit of a label
+// ---------------------------------------------------------------------------
+
+TEST(GroupBy, ByteAndBit) {
+    const std::vector<uint8_t> data = {0x00, 0x04, 0xFB};
+    EXPECT_EQ(GroupBy(0).groupOf(data), 0);
+    EXPECT_EQ(GroupBy(1).groupOf(data), 1);
+    EXPECT_EQ(GroupBy(1, 0x04).groupOf(data), 1);
+    EXPECT_EQ(GroupBy(1, 0x02).groupOf(data), 0);
+    EXPECT_EQ(GroupBy(2, 0x04).groupOf(data), 0);
+    EXPECT_EQ(GroupBy(2, 0x08).groupOf(data), 1);
+    EXPECT_EQ(GroupBy(3).groupOf(data), -1);   // past the data
+    EXPECT_EQ(GroupBy().groupOf(data), -1);    // no groups
+}
+
+TEST(GroupBy, TheTTestSplitsOnOneBitOfARandomByte) {
+    // Byte 1 is random except that bit 2 is what the trace leaks; a split on
+    // "not 0" would see almost nothing in group 0.
+    constexpr int kN = 400;
+    std::vector<float> samples(static_cast<size_t>(kN) * kNS);
+    std::vector<uint8_t> data(static_cast<size_t>(kN) * 2);
+    int64_t expect_n1 = 0;
+    for (int t = 0; t < kN; t++) {
+        const int g = (t * 7 + (t >> 3)) & 1;
+        const uint8_t other = static_cast<uint8_t>((t * 37 + 11) & ~0x04);
+        data[static_cast<size_t>(t) * 2 + 1] = static_cast<uint8_t>(other | (g << 2));
+        expect_n1 += g;
+        for (int s = 0; s < kNS; s++)
+            samples[static_cast<size_t>(t) * kNS + s] = noise(t, s) + (g && s == kLeakAt ? 0.4f : 0.0f);
+    }
+    TrsFile f;
+    f.openFromArray(samples.data(), kN, kNS, "bit", data.data(), 2);
+
+    Result r;
+    std::shared_ptr<TTestAccumulator> acc;
+    ASSERT_TRUE(computeTTestCore(&f, {}, 0, kN, 0, 0, GroupBy(1, 0x04), {}, 0, 0, kNS, false, {},
+                                 acc, r.t, r.n0, r.n1, r.warn, r.err)) << r.err.toStdString();
+    EXPECT_EQ(r.n1, expect_n1);
+    EXPECT_EQ(r.n0 + r.n1, kN);
+    ASSERT_EQ(r.t.size(), static_cast<size_t>(kNS));
+    int peak = 0;
+    for (int s = 0; s < kNS; s++)
+        if (std::fabs(r.t[s]) > std::fabs(r.t[peak])) peak = s;
+    EXPECT_EQ(peak, kLeakAt);
+    EXPECT_GT(std::fabs(r.t[kLeakAt]), 10.0f);
+}

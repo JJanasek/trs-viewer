@@ -101,6 +101,8 @@ set(SOURCES
     inc/crash_handler.h
     src/mainwindow.cpp
     src/trs_file.cpp
+    src/npz.cpp
+    inc/npz.h
     src/processing.cpp
     src/plot_widget.cpp
     src/theme.cpp

@@ -470,6 +470,17 @@ TEST(ChainPatterns, RunTTestKeepsOrderAndPatternOptions) {
     EXPECT_TRUE(out.summary().contains("patterns"));
 }
 
+TEST(ChainPatterns, RunTTestKeepsTheBitToSplitOn) {
+    ChainStep in;
+    in.kind           = ChainStep::Kind::RunTTest;
+    in.trace_count    = 100;
+    in.ttest_byte_idx = 11;
+    in.ttest_bit_mask = 0x02;
+    const ChainStep out = roundTrip(in);
+    EXPECT_EQ(out.ttest_byte_idx, 11);
+    EXPECT_EQ(out.ttest_bit_mask, 0x02);
+}
+
 TEST(ChainPatterns, OlderRunTTestStepDefaultsToFirstOrder) {
     ChainStep in;
     in.kind = ChainStep::Kind::RunTTest;
@@ -492,4 +503,5 @@ TEST(ChainPatterns, OlderRunTTestStepDefaultsToFirstOrder) {
     EXPECT_EQ(out[0].ttest_order, 1);
     EXPECT_EQ(out[0].ttest_integrate, 1);
     EXPECT_FALSE(out[0].ttest_use_patterns);
+    EXPECT_EQ(out[0].ttest_bit_mask, 0xFF);   // "the byte isn't 0", as it was then
 }

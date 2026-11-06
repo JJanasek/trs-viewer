@@ -72,7 +72,7 @@ namespace {
 using ProductFn = std::function<void(const float* ca, const float* cb, int32_t lo, int32_t hi, float* y)>;
 
 bool centredProductPasses(TrsFile* file, const std::vector<std::shared_ptr<ITransform>>& pipeline,
-                          int32_t first_trace, int32_t trace_count, int32_t byte_idx,
+                          int32_t first_trace, int32_t trace_count, GroupBy groups,
                           const BivariateWindow& a, const BivariateWindow& b, bool sym,
                           int64_t read_lo, int64_t read_hi, bool sanity_split,
                           const std::function<bool(int64_t, int64_t)>& progress,
@@ -107,7 +107,7 @@ bool centredProductPasses(TrsFile* file, const std::vector<std::shared_ptr<ITran
             int64_t n0 = 0, n1 = 0;
             QString w_warn;
             if (!computeTTestCore(file, pipeline, first_trace, trace_count, w.raw_start, w.raw_len,
-                                  byte_idx, w.shifts, w.shifts_first_trace, read_lo, read_hi, false,
+                                  groups, w.shifts, w.shifts_first_trace, read_lo, read_hi, false,
                                   stage(base, 1), acc1, t, n0, n1, w_warn, err, nullptr, &hooks)) {
                 if (err != "Cancelled.") err = QString("Window %1: %2").arg(w.name, err);
                 return false;
@@ -168,9 +168,9 @@ bool centredProductPasses(TrsFile* file, const std::vector<std::shared_ptr<ITran
 #endif
             batch_group[static_cast<size_t>(k)] = -1;
             const int32_t src = first_trace + chunk + k;
-            const auto data = file->readData(src);
-            if (byte_idx >= static_cast<int32_t>(data.size())) { thread_skipped[tid]++; continue; }
-            const int group = hooks.group_map(data[static_cast<size_t>(byte_idx)] != 0 ? 1 : 0, src);
+            const int in_group = groups.groupOf(file->readData(src));
+            if (in_group < 0) { thread_skipped[tid]++; continue; }
+            const int group = hooks.group_map(in_group, src);
             if (group < 0) continue;
             if (!loadCentred(tid, a, src, rows, group ? ma1 : ma0, ca_of(k))
                 || (!sym && !loadCentred(tid, b, src, cols, group ? mb1 : mb0, cb_of(k)))) {
@@ -205,7 +205,7 @@ QString passWarnings(int32_t trace_count, int64_t n0, int64_t n1, int32_t skippe
 
 bool computeBivariateTTest(TrsFile* file,
                            const std::vector<std::shared_ptr<ITransform>>& pipeline,
-                           int32_t first_trace, int32_t trace_count, int32_t byte_idx,
+                           int32_t first_trace, int32_t trace_count, GroupBy groups,
                            const BivariateWindow& a, const BivariateWindow& b,
                            int64_t read_lo, int64_t read_hi,
                            bool sanity_split, bool abs_value,
@@ -243,7 +243,7 @@ bool computeBivariateTTest(TrsFile* file,
     TTestAccumulator acc(pairs);
     int n_threads = 1;
     int32_t skipped = 0;
-    if (!centredProductPasses(file, pipeline, first_trace, trace_count, byte_idx, a, b, sym,
+    if (!centredProductPasses(file, pipeline, first_trace, trace_count, groups, a, b, sym,
                               read_lo, read_hi, sanity_split, progress, pairs, product,
                               acc, n_threads, skipped, err))
         return false;
@@ -301,7 +301,7 @@ int64_t estimateLagBytes(int64_t len, int64_t n_lags, int64_t lag_hi, int thread
 
 bool computeLagTTest(TrsFile* file,
                      const std::vector<std::shared_ptr<ITransform>>& pipeline,
-                     int32_t first_trace, int32_t trace_count, int32_t byte_idx,
+                     int32_t first_trace, int32_t trace_count, GroupBy groups,
                      const BivariateWindow& w, const std::vector<int32_t>& lags,
                      int64_t read_lo, int64_t read_hi,
                      bool sanity_split, bool abs_value,
@@ -347,7 +347,7 @@ bool computeLagTTest(TrsFile* file,
     TTestAccumulator acc(static_cast<int32_t>(cells));
     int n_threads = 1;
     int32_t skipped = 0;
-    if (!centredProductPasses(file, pipeline, first_trace, trace_count, byte_idx, ext, ext, true,
+    if (!centredProductPasses(file, pipeline, first_trace, trace_count, groups, ext, ext, true,
                               read_lo, read_hi, sanity_split, progress, cells, product,
                               acc, n_threads, skipped, err))
         return false;

@@ -120,6 +120,7 @@ struct ChainStep {
     int64_t ttest_first_sample = 0;
     int64_t ttest_n_samples    = 0;  // 0 = all
     int32_t ttest_byte_idx     = 0;  // ignored when the file has a "ttest" param
+    uint8_t ttest_bit_mask     = 0xFF;  // group 1: the byte has one of these bits (GroupBy)
     bool    ttest_abs          = false; // report |t| instead of the signed t-statistic
 
     // One-line label for the Chain Editor's step list.

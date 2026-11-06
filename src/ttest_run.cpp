@@ -92,7 +92,7 @@ bool computeTTestCore(TrsFile* file,
                       const std::vector<std::shared_ptr<ITransform>>& pipeline,
                       int32_t eff_first, int32_t eff_count,
                       int64_t eff_first_sample, int64_t eff_n_samples,
-                      int32_t byte_idx, const std::vector<int32_t>& shifts,
+                      GroupBy groups, const std::vector<int32_t>& shifts,
                       int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
                       bool abs_value,
                       const std::function<bool(int64_t, int64_t)>& progress,
@@ -257,11 +257,10 @@ bool computeTTestCore(TrsFile* file,
                 slot_group[static_cast<size_t>(k)] = -1;
 
                 int32_t src_idx = trace_at(ti);
-                int group = 0;   // byte_idx < 0: no groups, every trace in group 0
-                if (byte_idx >= 0) {
-                    auto data_bytes = file->readData(src_idx);
-                    if (byte_idx >= static_cast<int32_t>(data_bytes.size())) { thread_skipped[tid]++; continue; }
-                    group = (data_bytes[static_cast<size_t>(byte_idx)] != 0) ? 1 : 0;
+                int group = 0;   // no groups: every trace in group 0
+                if (groups.byte >= 0) {
+                    group = groups.groupOf(file->readData(src_idx));
+                    if (group < 0) { thread_skipped[tid]++; continue; }
                 }
                 if (hooks && hooks->group_map) {
                     group = hooks->group_map(group, src_idx);
@@ -385,7 +384,7 @@ bool computeTTest(TrsFile* file,
                   const std::vector<std::shared_ptr<ITransform>>& pipeline,
                   int32_t eff_first, int32_t eff_count,
                   int64_t eff_first_sample, int64_t eff_n_samples,
-                  int32_t byte_idx, const std::vector<int32_t>& shifts,
+                  GroupBy groups, const std::vector<int32_t>& shifts,
                   int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
                   bool abs_value, const TTestOptions& opt,
                   const std::function<bool(int64_t, int64_t)>& progress,
@@ -401,7 +400,7 @@ bool computeTTest(TrsFile* file,
 
     if (opt.order <= 1) {
         return computeTTestCore(file, pipeline, eff_first, eff_count, eff_first_sample,
-                                eff_n_samples, byte_idx, shifts, shifts_first_trace,
+                                eff_n_samples, groups, shifts, shifts_first_trace,
                                 read_lo, read_hi, abs_value, progress, acc_out, tstat_out,
                                 n0_out, n1_out, warn_out, err, live, &hooks);
     }
@@ -417,7 +416,7 @@ bool computeTTest(TrsFile* file,
     int64_t a0 = 0, a1 = 0;
     QString w1;
     if (!computeTTestCore(file, pipeline, eff_first, eff_count, eff_first_sample,
-                          eff_n_samples, byte_idx, shifts, shifts_first_trace,
+                          eff_n_samples, groups, shifts, shifts_first_trace,
                           read_lo, read_hi, /*abs=*/false, half(0), acc1, t1, a0, a1, w1, err,
                           nullptr, &hooks))
         return false;
@@ -473,7 +472,7 @@ bool computeTTest(TrsFile* file,
         }
     };
     if (!computeTTestCore(file, pipeline, eff_first, eff_count, eff_first_sample,
-                          eff_n_samples, byte_idx, shifts, shifts_first_trace,
+                          eff_n_samples, groups, shifts, shifts_first_trace,
                           read_lo, read_hi, abs_value, half(1), acc_out, tstat_out,
                           n0_out, n1_out, warn_out, err, live, &hooks))
         return false;
@@ -484,7 +483,7 @@ bool computeMeanTraces(TrsFile* file,
                        const std::vector<std::shared_ptr<ITransform>>& pipeline,
                        int32_t first, int32_t count,
                        int64_t first_sample, int64_t n_samples,
-                       int32_t byte_idx, const std::vector<int32_t>& shifts,
+                       GroupBy groups, const std::vector<int32_t>& shifts,
                        int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
                        const std::function<bool(int64_t, int64_t)>& progress,
                        MeanTraceResult& out, QString& warn, QString& err)
@@ -494,7 +493,7 @@ bool computeMeanTraces(TrsFile* file,
     hooks.accumulate_only = true;
     std::shared_ptr<TTestAccumulator> acc;
     std::vector<float> unused;
-    if (!computeTTestCore(file, pipeline, first, count, first_sample, n_samples, byte_idx, shifts,
+    if (!computeTTestCore(file, pipeline, first, count, first_sample, n_samples, groups, shifts,
                           shifts_first_trace, read_lo, read_hi, false, progress, acc, unused,
                           out.n[0], out.n[1], warn, err, nullptr, &hooks))
         return false;

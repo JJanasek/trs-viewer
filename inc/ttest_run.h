@@ -92,14 +92,14 @@ TraceLoad loadProcessedTrace(TrsFile* file,
                              std::vector<float>& buf, int64_t& n_out);
 
 // shifts empty => no alignment; shift == kAlignDiscardShift excludes that
-// trace. byte_idx < 0: no group byte, every trace is in group 0. Returns
+// trace. No groups (groups.byte < 0): every trace is in group 0. Returns
 // false on failure: err == "Cancelled." for a user cancel,
 // otherwise a real failure message from TTestAccumulator::compute().
 bool computeTTestCore(TrsFile* file,
                       const std::vector<std::shared_ptr<ITransform>>& pipeline,
                       int32_t eff_first, int32_t eff_count,
                       int64_t eff_first_sample, int64_t eff_n_samples,
-                      int32_t byte_idx, const std::vector<int32_t>& shifts,
+                      GroupBy groups, const std::vector<int32_t>& shifts,
                       int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
                       bool abs_value,
                       const std::function<bool(int64_t, int64_t)>& progress,
@@ -148,7 +148,7 @@ bool computeTTest(TrsFile* file,
                   const std::vector<std::shared_ptr<ITransform>>& pipeline,
                   int32_t eff_first, int32_t eff_count,
                   int64_t eff_first_sample, int64_t eff_n_samples,
-                  int32_t byte_idx, const std::vector<int32_t>& shifts,
+                  GroupBy groups, const std::vector<int32_t>& shifts,
                   int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
                   bool abs_value, const TTestOptions& opt,
                   const std::function<bool(int64_t, int64_t)>& progress,
@@ -161,7 +161,7 @@ bool computeTTest(TrsFile* file,
 // ---------------------------------------------------------------------------
 // Mean traces: the per-sample mean and standard deviation over a range of
 // traces, read exactly as the t-test reads them (alignment shifts, read
-// bounds, pipeline, parallel). byte_idx < 0: all traces as one set (in
+// bounds, pipeline, parallel). No groups: all traces as one set (in
 // [0]); otherwise per t-test group, [0] and [1].
 // ---------------------------------------------------------------------------
 struct MeanTraceResult {
@@ -172,7 +172,7 @@ bool computeMeanTraces(TrsFile* file,
                        const std::vector<std::shared_ptr<ITransform>>& pipeline,
                        int32_t first, int32_t count,
                        int64_t first_sample, int64_t n_samples,
-                       int32_t byte_idx, const std::vector<int32_t>& shifts,
+                       GroupBy groups, const std::vector<int32_t>& shifts,
                        int32_t shifts_first_trace, int64_t read_lo, int64_t read_hi,
                        const std::function<bool(int64_t, int64_t)>& progress,
                        MeanTraceResult& out, QString& warn, QString& err);

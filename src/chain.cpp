@@ -366,6 +366,7 @@ bool saveChain(const QString& path, const std::vector<ChainStep>& steps, QString
             o["ttest_first_sample"] = static_cast<double>(s.ttest_first_sample);
             o["ttest_n_samples"]    = static_cast<double>(s.ttest_n_samples);
             o["ttest_byte_idx"]     = s.ttest_byte_idx;
+            o["ttest_bit_mask"]     = s.ttest_bit_mask;
             o["ttest_abs"]          = s.ttest_abs;
             o["tile_idx"]            = s.tile_idx;
             o["ttest_order"]        = s.ttest_order;
@@ -501,6 +502,7 @@ bool loadChain(const QString& path, std::vector<ChainStep>& steps, QString& err)
             s.ttest_first_sample = static_cast<int64_t>(o.value("ttest_first_sample").toDouble());
             s.ttest_n_samples    = static_cast<int64_t>(o.value("ttest_n_samples").toDouble());
             s.ttest_byte_idx     = o.value("ttest_byte_idx").toInt();
+            s.ttest_bit_mask     = static_cast<uint8_t>(o.value("ttest_bit_mask").toInt(0xFF));
             s.ttest_abs          = o.value("ttest_abs").toBool(false);
             s.tile_idx           = o.value("tile_idx").toInt(-1);
             s.ttest_order        = o.value("ttest_order").toInt(1);

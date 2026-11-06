@@ -7,6 +7,22 @@
 // Online Welch t-test accumulator (per-sample).
 // Memory: 4 × num_samples × sizeof(double) bytes.
 // Call addTrace() once per trace, then compute().
+
+// How a trace's data bytes put it in a group: group 1 if byte `byte` has any
+// bit of `mask` set, otherwise group 0. The default mask is "the byte isn't 0",
+// for a fixed/random flag; one bit splits on that bit of a label such as a key.
+// byte < 0: no groups. Converts from a plain byte index.
+struct GroupBy {
+    int32_t byte = -1;
+    uint8_t mask = 0xFF;
+    GroupBy(int32_t byte_idx = -1, uint8_t bit_mask = 0xFF) : byte(byte_idx), mask(bit_mask) {}
+    // The trace's group, or -1 if there are no groups or its data doesn't reach the byte.
+    int groupOf(const std::vector<uint8_t>& data) const {
+        if (byte < 0 || byte >= static_cast<int32_t>(data.size())) return -1;
+        return (data[static_cast<size_t>(byte)] & mask) != 0 ? 1 : 0;
+    }
+};
+
 class TTestAccumulator {
 public:
     explicit TTestAccumulator(int32_t num_samples);

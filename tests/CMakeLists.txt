@@ -29,6 +29,7 @@ include(GoogleTest)
 # ---------------------------------------------------------------------------
 add_library(trs-core-test OBJECT
     ${CMAKE_SOURCE_DIR}/src/trs_file.cpp
+    ${CMAKE_SOURCE_DIR}/src/npz.cpp
     ${CMAKE_SOURCE_DIR}/src/processing.cpp
     ${CMAKE_SOURCE_DIR}/src/snr.cpp
     ${CMAKE_SOURCE_DIR}/src/ttest.cpp
@@ -82,6 +83,7 @@ add_trs_test(test_ttest_bivariate)
 add_trs_test(test_dcor)
 add_trs_test(test_pattern_align)
 add_trs_test(test_trs_file)
+add_trs_test(test_npz)
 add_trs_test(test_cpa)
 add_trs_test(test_align)
 add_trs_test(test_xcorr)
@@ -123,7 +125,7 @@ gtest_discover_tests(test_heatmap)
 # run_heaptrack.sh run it under the memory tools.
 add_executable(gui_soak gui_soak.cpp)
 target_link_libraries(gui_soak PRIVATE trs-viewer-objs)
-set(GUI_SOAK_SCENARIOS ttest average fft cpa cpa_top_curves plot_whole_trace export_npz snapshots combined quit_dialogs sigterm_during_job
+set(GUI_SOAK_SCENARIOS ttest average fft cpa cpa_top_curves plot_whole_trace export_npz npy_labels snapshots combined quit_dialogs sigterm_during_job
     crash_quit_xcorr crash_job_during_modal crash_close_tab_drawing crash_nonmodal_other_tab)
 foreach(sc ${GUI_SOAK_SCENARIOS})
     add_test(NAME gui_soak.${sc} COMMAND gui_soak --scenario ${sc} --loops 3)

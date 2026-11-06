@@ -39,7 +39,7 @@ struct DcorCurveResult {
 bool computeDcorCurve(TrsFile* file,
                       const std::vector<std::shared_ptr<ITransform>>& pipeline,
                       int32_t first_trace, int32_t trace_count,
-                      const BivariateWindow& range, int32_t byte_idx,
+                      const BivariateWindow& range, GroupBy groups,
                       int64_t read_lo, int64_t read_hi, bool sanity_split,
                       const std::function<bool(int64_t, int64_t)>& progress,
                       DcorCurveResult& out, QString& warn, QString& err,
@@ -60,7 +60,7 @@ int64_t maxDcorWindow(int64_t n_traces);
 bool computeWindowDcor(TrsFile* file,
                        const std::vector<std::shared_ptr<ITransform>>& pipeline,
                        int32_t first_trace, int32_t trace_count,
-                       const std::vector<BivariateWindow>& windows, int32_t byte_idx,
+                       const std::vector<BivariateWindow>& windows, GroupBy groups,
                        int64_t read_lo, int64_t read_hi, bool sanity_split, bool standardize,
                        const std::function<bool(int64_t, int64_t)>& progress,
                        DcorWindowResult& out, QString& warn, QString& err);

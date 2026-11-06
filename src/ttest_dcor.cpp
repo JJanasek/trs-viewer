@@ -47,14 +47,13 @@ struct Classes {
     int32_t no_shift = 0;     // no usable shift in this window
 };
 
-Classes classify(TrsFile* file, int32_t first, int32_t count, int32_t byte_idx,
+Classes classify(TrsFile* file, int32_t first, int32_t count, GroupBy groups,
                  bool sanity_split, const BivariateWindow& w) {
     Classes c;
     for (int32_t t = first; t < first + count; t++) {
         if (!usable(w, t)) { c.no_shift++; continue; }
-        const auto data = file->readData(t);
-        if (byte_idx < 0 || byte_idx >= static_cast<int32_t>(data.size())) { c.no_byte++; continue; }
-        int g = data[static_cast<size_t>(byte_idx)] != 0 ? 1 : 0;
+        int g = groups.groupOf(file->readData(t));
+        if (g < 0) { c.no_byte++; continue; }
         if (sanity_split) g = sanitySplitGroup(g, t);
         if (g < 0) continue;
         c.traces.push_back(t);
@@ -134,14 +133,14 @@ bool enoughTraces(const Classes& c, const QString& where, QString& err) {
 bool computeDcorCurve(TrsFile* file,
                       const std::vector<std::shared_ptr<ITransform>>& pipeline,
                       int32_t first_trace, int32_t trace_count,
-                      const BivariateWindow& range, int32_t byte_idx,
+                      const BivariateWindow& range, GroupBy groups,
                       int64_t read_lo, int64_t read_hi, bool sanity_split,
                       const std::function<bool(int64_t, int64_t)>& progress,
                       DcorCurveResult& out, QString& warn, QString& err,
                       int64_t memory_bytes)
 {
     out = DcorCurveResult{};
-    const Classes c = classify(file, first_trace, trace_count, byte_idx, sanity_split, range);
+    const Classes c = classify(file, first_trace, trace_count, groups, sanity_split, range);
     if (!enoughTraces(c, QString(), err)) return false;
     const int64_t n = static_cast<int64_t>(c.traces.size());
     const int64_t L = processedLength(pipeline, range.raw_len);
@@ -230,7 +229,7 @@ int64_t maxDcorWindow(int64_t n_traces) {
 bool computeWindowDcor(TrsFile* file,
                        const std::vector<std::shared_ptr<ITransform>>& pipeline,
                        int32_t first_trace, int32_t trace_count,
-                       const std::vector<BivariateWindow>& windows, int32_t byte_idx,
+                       const std::vector<BivariateWindow>& windows, GroupBy groups,
                        int64_t read_lo, int64_t read_hi, bool sanity_split, bool standardize,
                        const std::function<bool(int64_t, int64_t)>& progress,
                        DcorWindowResult& out, QString& warn, QString& err)
@@ -243,7 +242,7 @@ bool computeWindowDcor(TrsFile* file,
     std::vector<float> mat;
     for (int64_t wi = 0; wi < nw; wi++) {
         const BivariateWindow& w = windows[static_cast<size_t>(wi)];
-        const Classes c = classify(file, first_trace, trace_count, byte_idx, sanity_split, w);
+        const Classes c = classify(file, first_trace, trace_count, groups, sanity_split, w);
         if (!enoughTraces(c, w.name, err)) return false;
         const int64_t n = static_cast<int64_t>(c.traces.size());
         const int64_t len = processedLength(pipeline, w.raw_len);

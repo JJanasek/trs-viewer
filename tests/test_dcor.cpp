@@ -348,3 +348,23 @@ TEST(DcorRun, SanitySplitFindsNothing) {
                                  true, {}, r, warn, err)) << err.toStdString();
     EXPECT_LT(*std::max_element(r.z.begin(), r.z.end()), 4.5f);
 }
+
+TEST(DcorRun, SplitsOnOneBitLikeOnAFlag) {
+    // The same traces with the class in bit 2 of a byte that is never 0.
+    Fixture flag(600);
+    std::vector<uint8_t> in_bit(flag.d.size());
+    for (size_t t = 0; t < flag.d.size(); t++)
+        in_bit[t] = static_cast<uint8_t>(0x91 | (flag.d[t] << 2));
+    TrsFile bit_file;
+    bit_file.openFromArray(flag.x.data(), 600, Fixture::kNS, "bit", in_bit.data(), 1);
+
+    DcorCurveResult a, b;
+    QString warn, err;
+    ASSERT_TRUE(computeDcorCurve(&flag.file, {}, 0, 600, rangeOf(0, Fixture::kNS), 0, 0, Fixture::kNS,
+                                 false, {}, a, warn, err)) << err.toStdString();
+    ASSERT_TRUE(computeDcorCurve(&bit_file, {}, 0, 600, rangeOf(0, Fixture::kNS), GroupBy(0, 0x04), 0,
+                                 Fixture::kNS, false, {}, b, warn, err)) << err.toStdString();
+    EXPECT_EQ(a.n0, b.n0);
+    EXPECT_EQ(a.n1, b.n1);
+    EXPECT_EQ(a.z, b.z);
+}

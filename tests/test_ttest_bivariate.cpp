@@ -289,3 +289,22 @@ TEST(TTestBivariate, LagExtensionFollowsTheResampling) {
     EXPECT_EQ(lagExtendedRawLength(pl, 400, 10, 420), 420);   // trace ends
     EXPECT_EQ(lagExtendedRawLength({}, 400, 0, 100000), 400);
 }
+
+TEST(TTestBivariate, SplitsOnOneBitLikeOnAFlag) {
+    // The same traces with the class in bit 5 of a byte that is never 0.
+    Shares flag(600);
+    std::vector<uint8_t> in_bit(flag.data.size());
+    for (size_t t = 0; t < flag.data.size(); t++)
+        in_bit[t] = static_cast<uint8_t>(0x03 | (flag.data[t] << 5));
+    TrsFile bit_file;
+    bit_file.openFromArray(flag.samples.data(), 600, kNS, "bit", in_bit.data(), 1);
+
+    BivariateResult a, b;
+    ASSERT_TRUE(run(flag.file, 600, whole("A"), whole("A"), a));
+    QString warn, err;
+    ASSERT_TRUE(computeBivariateTTest(&bit_file, {}, 0, 600, GroupBy(0, 0x20), whole("A"), whole("A"),
+                                      0, kNS, false, false, {}, b, warn, err)) << err.toStdString();
+    EXPECT_EQ(a.n0, b.n0);
+    EXPECT_EQ(a.n1, b.n1);
+    EXPECT_EQ(a.t, b.t);
+}

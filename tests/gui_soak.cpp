@@ -21,6 +21,7 @@
 #include "job_manager.h"
 #include "leakage_model.h"
 #include "crash_handler.h"
+#include "npz.h"
 
 #include <csignal>
 
@@ -227,12 +228,93 @@ bool selectItem(QWidget* d, const QString& item) {
 
 }  // namespace
 
+// A capture the way a scope script leaves it: int16 traces.npy with labels.npz
+// next to it. Bit 1 of byte 3 of "lam" leaks at kLabelLeakAt; the top bit of its
+// last byte never changes.
+constexpr int kLabelLeakAt = 700;
+
+std::vector<uint8_t> npyBytes(const std::string& descr, const std::string& shape, const void* data, size_t bytes) {
+    std::string dict = "{'descr': '" + descr + "', 'fortran_order': False, 'shape': " + shape + ", }";
+    dict.resize(((dict.size() + 11 + 63) / 64) * 64 - 11, ' ');
+    dict += '\n';
+    std::vector<uint8_t> out = {0x93, 'N', 'U', 'M', 'P', 'Y', 1, 0,
+                                static_cast<uint8_t>(dict.size()), static_cast<uint8_t>(dict.size() >> 8)};
+    out.insert(out.end(), dict.begin(), dict.end());
+    const auto* d = static_cast<const uint8_t*>(data);
+    out.insert(out.end(), d, d + bytes);
+    return out;
+}
+
+void writeNpyFile(const QString& path, const std::vector<uint8_t>& bytes) {
+    QFile f(path);
+    if (!f.open(QIODevice::WriteOnly)) { std::fprintf(stderr, "cannot write %s\n", qPrintable(path)); std::exit(2); }
+    f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<qint64>(bytes.size()));
+}
+
+void writeNpyCapture(const QString& dir, int n, int ns, uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<float> noise(0.0f, 100.0f);
+    std::vector<uint8_t> lam(static_cast<size_t>(n) * 32), x0(static_cast<size_t>(n) * 32), ok(static_cast<size_t>(n), 1);
+    std::vector<int32_t> retval(static_cast<size_t>(n), 0);
+    std::vector<double>  t_unix(static_cast<size_t>(n));
+    std::vector<float>   capture_ms(static_cast<size_t>(n));
+    std::vector<int16_t> traces(static_cast<size_t>(n) * static_cast<size_t>(ns));
+    for (int t = 0; t < n; t++) {
+        uint8_t* row = lam.data() + static_cast<size_t>(t) * 32;
+        for (int b = 0; b < 32; b++) {
+            row[b] = static_cast<uint8_t>(rng());
+            x0[static_cast<size_t>(t) * 32 + static_cast<size_t>(b)] = static_cast<uint8_t>(rng());
+        }
+        row[31] &= 0x7F;
+        t_unix[static_cast<size_t>(t)] = 1.8e9 + t;
+        capture_ms[static_cast<size_t>(t)] = 700.0f + static_cast<float>(t % 10);
+        const bool leak = (row[3] >> 1) & 1;
+        for (int s = 0; s < ns; s++) {
+            const float v = noise(rng) + (leak && s == kLabelLeakAt ? 300.0f : 0.0f);
+            traces[static_cast<size_t>(t) * static_cast<size_t>(ns) + static_cast<size_t>(s)] = static_cast<int16_t>(v);
+        }
+    }
+    const std::string rows = std::to_string(n);
+    writeNpyFile(dir + "/traces.npy", npyBytes("<i2", "(" + rows + ", " + std::to_string(ns) + ")",
+                                               traces.data(), traces.size() * sizeof(int16_t)));
+    QString err;
+    if (!saveNpz(dir + "/labels.npz", {
+            {"lam.npy",        npyBytes("|u1", "(" + rows + ", 32)", lam.data(), lam.size())},
+            {"x0.npy",         npyBytes("|u1", "(" + rows + ", 32)", x0.data(), x0.size())},
+            {"ok.npy",         npyBytes("|u1", "(" + rows + ",)", ok.data(), ok.size())},
+            {"retval.npy",     npyBytes("<i4", "(" + rows + ",)", retval.data(), retval.size() * 4)},
+            {"t_unix.npy",     npyBytes("<f8", "(" + rows + ",)", t_unix.data(), t_unix.size() * 8)},
+            {"capture_ms.npy", npyBytes("<f4", "(" + rows + ",)", capture_ms.data(), capture_ms.size() * 4)},
+        }, err)) {
+        std::fprintf(stderr, "%s\n", qPrintable(err));
+        std::exit(2);
+    }
+}
+
+// Picks a label, byte and bit in an analysis dialog's GroupPicker.
+bool pickGroup(QDialog* d, const QString& field, int byte, const QString& bit) {
+    auto* f = d->findChild<QComboBox*>("group_field");
+    auto* b = d->findChild<QSpinBox*>("group_byte");
+    auto* m = d->findChild<QComboBox*>("group_bit");
+    if (!f || !b) return false;
+    const int i = f->findText(field, Qt::MatchStartsWith);
+    if (i < 0) return false;
+    f->setCurrentIndex(i);
+    b->setValue(byte);
+    if (m && !bit.isEmpty()) {
+        const int j = m->findText(bit, Qt::MatchStartsWith);
+        if (j < 0) return false;
+        m->setCurrentIndex(j);
+    }
+    return true;
+}
+
 // ---- scenarios -------------------------------------------------------------
 
 struct GuiTestAccess {
     MainWindow& w;
     Driver&     drv;
-    QString     file, list, long_file;
+    QString     file, list, long_file, capture_dir;
 
     bool jobsIdle() const { return w.jobs_->activeCount() == 0; }
     int  tabs() const { return static_cast<int>(w.datasets_.size()); }
@@ -427,6 +509,216 @@ struct GuiTestAccess {
         drv.step([]() { QApplication::processEvents(); return true; });
     }
 
+    // The active result tab's curve and where its largest magnitude is.
+    int peakOfActiveCurve(float* magnitude = nullptr) {
+        PlotWidget* pw = w.plotWidget();
+        if (pw->traces_.empty() || !pw->traces_[0].mem_data || pw->traces_[0].mem_data->empty()) return -1;
+        const std::vector<float>& c = *pw->traces_[0].mem_data;
+        size_t peak = 0;
+        for (size_t i = 0; i < c.size(); i++)
+            if (std::fabs(c[i]) > std::fabs(c[peak])) peak = i;
+        if (magnitude) *magnitude = std::fabs(c[peak]);
+        return static_cast<int>(peak);
+    }
+    void useCaptureTab() {
+        drv.then([this]() {
+            for (int i = 0; i < tabs(); i++)
+                if (w.datasets_[static_cast<size_t>(i)].display_name == "traces.npy") {
+                    w.tab_bar_->setCurrentIndex(i);
+                    return;
+                }
+            drv.fail("the capture's tab is gone");
+        });
+    }
+
+    // traces.npy with labels.npz next to it: the labels arrive as per-trace
+    // data, and every analysis can split on or read them.
+    void scenarioNpyLabels() {
+        const QString npy = capture_dir + "/traces.npy";
+        drv.then([this, npy]() {
+            w.openAnyFile(npy);
+            const TrsFile& f = *w.activeDs().file;
+            const TrsHeader& h = f.header();
+            if (h.num_traces != 400 || h.num_samples != 2000 || h.sample_type != SampleType::INT16)
+                return drv.fail("the matrix did not open as it is on disk");
+            for (const char* name : {"lam", "x0", "ok", "retval", "t_unix", "capture_ms"})
+                if (!h.param_map.count(name)) return drv.fail(QString("no label %1").arg(name));
+            if (h.data_length != 32 + 32 + 1 + 4 + 8 + 4) return drv.fail(QString("%1 data bytes").arg(h.data_length));
+            if (f.openNotes().find("labels.npz") == std::string::npos) return drv.fail("no note about the labels");
+            if (!w.statusBar()->currentMessage().contains("lam")) return drv.fail("the status bar doesn't say");
+            w.updateTraceDataDisplay();
+            if (!w.lbl_trace_data_->text().contains("lam")) return drv.fail("the trace data panel doesn't show lam");
+        });
+
+        // t-test on the bit that leaks
+        drv.onDialog("Welch t-test", [this](QDialog* d) {
+            if (!pickGroup(d, "lam", 3, "bit 1")) return false;
+            if (auto* c = d->findChild<QLabel*>("group_counts"); !c || c->text().contains("empty"))
+                drv.fail("the group sizes aren't shown properly");
+            selectItem(d, "1st order");
+            return clickOk(d);
+        });
+        drv.then([this]() { w.showTTestDialog(nullptr); });
+        waitJobs();
+        drv.then([this]() {
+            if (!w.activeDs().display_name.contains("lam[3] bit 1"))
+                return drv.fail("tab title: " + w.activeDs().display_name);
+            float t = 0;
+            const int at = peakOfActiveCurve(&t);
+            std::fprintf(stderr, "  t-test lam[3] bit 1: max |t| %.1f at %d\n", t, at);
+            if (at != kLabelLeakAt || t < 10.0f) drv.fail(QString("max |t| %1 at %2").arg(t).arg(at));
+        });
+
+        // a bit that doesn't: nothing stands out
+        useCaptureTab();
+        drv.onDialog("Welch t-test", [](QDialog* d) { return pickGroup(d, "lam", 3, "bit 2") && clickOk(d); });
+        drv.then([this]() { w.showTTestDialog(nullptr); });
+        waitJobs();
+        drv.then([this]() {
+            float t = 0;
+            peakOfActiveCurve(&t);
+            if (t > 6.0f) drv.fail(QString("lam[3] bit 2 shows |t| %1").arg(t));
+        });
+
+        // a bit that never changes: the dialog says so, and the run doesn't crash
+        useCaptureTab();
+        drv.onDialog("Welch t-test", [this](QDialog* d) {
+            if (!pickGroup(d, "lam", 31, "bit 7")) return false;
+            auto* c = d->findChild<QLabel*>("group_counts");
+            if (!c || !c->text().contains("empty")) drv.fail("no word about the empty group");
+            return clickOk(d);
+        });
+        drv.onDialog("T-test", [](QDialog* d) { return clickOk(d); });
+        drv.then([this]() { w.showTTestDialog(nullptr); });
+        waitJobs();
+        drv.step([this]() { return drv.dialogsAnswered(); });
+
+        // Average per group
+        useCaptureTab();
+        drv.onDialog("Average Trace", [](QDialog* d) {
+            selectItem(d, "Each t-test group separately");
+            return pickGroup(d, "lam", 3, "bit 1") && clickOk(d);
+        });
+        drv.then([this]() { w.onRunAverage(); });
+        waitJobs();
+        drv.then([this]() {
+            if (!w.activeDs().display_name.startsWith("Difference of means"))
+                return drv.fail("no difference of means, but: " + w.activeDs().display_name);
+            const int at = peakOfActiveCurve();
+            if (at != kLabelLeakAt) drv.fail(QString("the difference peaks at %1").arg(at));
+        });
+
+        // SNR over a label's byte
+        useCaptureTab();
+        drv.onDialog("SNR — configuration", [](QDialog* d) {
+            selectItem(d, "Hamming weight");
+            return pickGroup(d, "lam", 3, {}) && clickOk(d);
+        });
+        drv.then([this]() { w.onRunSNR(); });
+        waitJobs();
+        drv.then([this]() { if (peakOfActiveCurve() < 0) drv.fail("no SNR curve"); });
+
+        // CPA: the model finds the label through the offsets the editor lists
+        useCaptureTab();
+        drv.onDialog("CPA — Configuration", [](QDialog* d) {
+            for (auto* sp : d->findChildren<QSpinBox*>())
+                if (sp->maximum() == 65536) sp->setValue(8);   // M: one per bit of the byte
+            return clickOk(d);
+        });
+        drv.onDialog("CPA — Leakage Model Editor", [this](QDialog* d) {
+            const int off = w.activeDs().file->header().param_map.at("lam").offset;
+            bool listed = false;
+            for (auto* l : d->findChildren<QLabel*>())
+                listed = listed || l->text().contains(QString("lam = plaintexts[:, %1:%2]").arg(off).arg(off + 32));
+            if (!listed) drv.fail("the model editor doesn't say where lam is");
+            auto* ed = d->findChild<QPlainTextEdit*>();
+            if (!ed) return false;
+            ed->setPlainText(QString("import numpy as np\n"
+                                     "def get_leakages(plaintexts, ciphertexts, key_guess):\n"
+                                     "    return ((plaintexts[:, %1] >> key_guess) & 1).astype(np.float32)\n").arg(off + 3));
+            return clickButton(d, "Run  Test Model");
+        });
+        drv.onDialog("CPA — Leakage Model Editor", [](QDialog* d) {
+            QAbstractButton* run = button(d, "Run CPA");
+            if (!run || !run->isEnabled()) return false;   // test still running
+            clickLater(run);
+            return true;
+        });
+        drv.onDialog("CPA  n=", [this](QDialog* d) {
+            if (!d->windowTitle().contains("best=h1"))
+                drv.fail("CPA picked the wrong bit: " + d->windowTitle());
+            QMetaObject::invokeMethod(d, "close", Qt::QueuedConnection);
+            return true;
+        });
+        drv.then([this]() { w.onRunCpa(); });
+        drv.step([this]() {
+            if (!drv.dialogsAnswered()) return false;
+            for (QWidget* t : QApplication::topLevelWidgets())
+                if (t->isVisible() && t->windowTitle().startsWith("CPA")) return false;
+            return true;
+        });
+
+        // Export TRS keeps the labels and their names
+        const QString out = capture_dir + "/exported.trs";
+        useCaptureTab();
+        drv.then([out]() { QFile::remove(out); });
+        drv.onDialog("Export TRS — select range", [](QDialog* d) { return clickOk(d); });
+        drv.onDialog("Export processed TRS", [out](QDialog* d) {
+            auto* fd = qobject_cast<QFileDialog*>(d);
+            if (!fd) return false;
+            if (auto* name = fd->findChild<QLineEdit*>("fileNameEdit")) name->setText(out);
+            QMetaObject::invokeMethod(fd, "accept", Qt::QueuedConnection);
+            return true;
+        });
+        drv.onDialog("Export complete", [](QDialog* d) { return clickOk(d); });
+        drv.then([this]() { w.onExportTrs(); });
+        drv.step([this]() { return drv.dialogsAnswered(); });
+        drv.then([this, out]() {
+            auto src = w.activeDs().file;
+            w.openFile(out);
+            auto copy = w.activeDs().file;
+            if (copy == src) return drv.fail("the exported TRS did not open");
+            if (!(copy->header().param_map == src->header().param_map)) return drv.fail("the labels' names were lost");
+            if (copy->readData(5) != src->readData(5)) return drv.fail("the labels changed in the export");
+            if (copy->readSample(5, kLabelLeakAt) != src->readSample(5, kLabelLeakAt))
+                return drv.fail("the samples changed in the export");
+            w.closeDatasetAt(w.active_idx_);
+        });
+        drv.step([]() { QApplication::processEvents(); return true; });
+
+        // A .npy without labels still opens, and the t-test says what to do
+        const QString bare = capture_dir + "/bare/traces.npy";
+        drv.onDialog("T-test", [this](QDialog* d) {
+            auto* m = qobject_cast<QMessageBox*>(d);
+            if (!m || !m->text().contains("labels.npz")) drv.fail("no hint about labels.npz");
+            return clickOk(d);
+        });
+        drv.then([this, bare]() {
+            w.openAnyFile(bare);
+            if (w.activeDs().file->header().data_length != 0) return drv.fail("labels out of nowhere");
+            w.showTTestDialog(nullptr);
+        });
+        drv.step([this]() { return drv.dialogsAnswered(); });
+        drv.then([this]() { w.closeDatasetAt(w.active_idx_); });
+
+        // Labels of another length are not used, and that is said
+        const QString other = capture_dir + "/other/traces.npy";
+        drv.onDialog("Labels not loaded", [](QDialog* d) { return clickOk(d); });
+        drv.then([this, other]() {
+            w.openAnyFile(other);
+            if (w.activeDs().file->header().data_length != 0) drv.fail("labels of the wrong length were used");
+            w.closeDatasetAt(w.active_idx_);
+        });
+        drv.step([this]() { return drv.dialogsAnswered(); });
+
+        closeResultTabs();
+        drv.then([this]() {
+            for (int i = tabs() - 1; i >= 0; --i)
+                if (w.datasets_[static_cast<size_t>(i)].display_name == "traces.npy") w.closeDatasetAt(i);
+        });
+        drv.step([]() { QApplication::processEvents(); return true; });
+    }
+
     // Export as NPZ through the dialogs, then open the archive as traces.
     void scenarioExportNpz() {
         const QString out = QFileInfo(file).dir().filePath("export.npz");
@@ -596,6 +888,10 @@ int main(int argc, char** argv) {
         dir.setAutoRemove(false);
         std::fprintf(stderr, "test files kept in %s\n", qPrintable(dir.path()));
     }
+    // Not the user's settings: dialogs remember what they were last set to,
+    // and every file opened here would land in their recent files.
+    QSettings::setPath(QSettings::NativeFormat, QSettings::UserScope, dir.path());
+    QSettings::setPath(QSettings::IniFormat, QSettings::UserScope, dir.path());
     const QString file = dir.filePath("soak.trs");
     writeTrs(file, 400, 4000, 1);
     writeTrs(dir.filePath("soak_part000.trs"), 100, 4000, 2);
@@ -617,7 +913,19 @@ int main(int argc, char** argv) {
             long_file = dir.filePath("long.trs");
             writeTrs(long_file, 2, 10'000'000, 4);
         }
-        GuiTestAccess t{win, drv, file, list, long_file};
+        QString capture_dir;
+        if (scenario == "npy_labels") {
+            capture_dir = dir.filePath("capture");
+            for (const char* sub : {"", "/bare", "/other"}) QDir().mkpath(capture_dir + sub);
+            writeNpyCapture(capture_dir, 400, 2000, 5);
+            // The same matrix alone, and with labels that don't match it.
+            QFile::copy(capture_dir + "/traces.npy", capture_dir + "/bare/traces.npy");
+            QFile::copy(capture_dir + "/traces.npy", capture_dir + "/other/traces.npy");
+            const uint8_t three[3] = {1, 2, 3};
+            QString err;
+            saveNpz(capture_dir + "/other/labels.npz", {{"lam.npy", npyBytes("|u1", "(3,)", three, 3)}}, err);
+        }
+        GuiTestAccess t{win, drv, file, list, long_file, capture_dir};
         double rss_first = 0, rss_last = 0;
 
         t.openTestFile();
@@ -629,6 +937,7 @@ int main(int argc, char** argv) {
             else if (scenario == "cpa_top_curves") t.scenarioCpaTopCurves();
             else if (scenario == "plot_whole_trace") t.scenarioPlotWholeTrace();
             else if (scenario == "export_npz")   t.scenarioExportNpz();
+            else if (scenario == "npy_labels")   t.scenarioNpyLabels();
             else if (scenario == "snapshots")    t.scenarioSnapshots();
             else if (scenario == "combined")     t.scenarioCombined();
             else if (scenario == "quit_dialogs") { t.scenarioQuitDialogs(); loops = 1; break; }

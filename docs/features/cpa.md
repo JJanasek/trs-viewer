@@ -34,31 +34,30 @@ indices of the pipeline's output from *First sample* on.
 
 Model function signature:
 ```python
-def get_leakages(data: np.ndarray, hypothesis: int) -> np.ndarray:
+def get_leakages(plaintexts, ciphertexts, key_guess):
     """
-    data       — uint8 array, shape (n_traces, data_length)
-    hypothesis — current key hypothesis (0 .. M-1)
-    returns    — float32 array, shape (n_traces,)
+    plaintexts  — uint8 array, shape (n_traces, data_length): all the trace's data bytes
+    ciphertexts — uint8 array, shape (n_traces, 0): unused
+    key_guess   — current hypothesis (0 .. M-1)
+    returns     — float32 array, shape (n_traces,)
     """
 ```
 
-For direct data correlation (no key model), set M to the data field length and use `hypothesis` as a byte index:
+For direct data correlation (no key model), set M to the data field length and use `key_guess` as a byte index:
 ```python
-def get_leakages(data, hypothesis):
-    return data[:, hypothesis].astype(np.float32)
+def get_leakages(plaintexts, ciphertexts, key_guess):
+    return plaintexts[:, key_guess].astype(np.float32)
 ```
 
-For LEGACY_DATA files (PT+CT in 32 bytes), correlate against plaintext byte `b` by setting M = 16 and indexing into the first half:
+For LEGACY_DATA files (PT+CT in 32 bytes), correlate against plaintext byte `b` by setting M = 16 and indexing into the first half; for the ciphertext, add 16 to the index.
+
+If the file has named labels ([a `.npy` with `labels.npz`](npy-npz.md), TRS v2 parameters), the editor lists where each one is, e.g. `lam = plaintexts[:, 8:40]`. To scan every bit of a 32-byte label in one run, set M = 256:
 ```python
-def get_leakages(data, hypothesis):
-    # hypothesis = byte index 0..15 into plaintext
-    return data[:, hypothesis].astype(np.float32)
+def get_leakages(plaintexts, ciphertexts, key_guess):
+    byte, bit = key_guess // 8, key_guess % 8
+    return ((plaintexts[:, 8 + byte] >> bit) & 1).astype(np.float32)
 ```
-Or against ciphertext (offset 16):
-```python
-def get_leakages(data, hypothesis):
-    return data[:, 16 + hypothesis].astype(np.float32)
-```
+Each row of the result is then one bit (row = 8 × byte + bit), and the table ranks the bits by how strongly they leak.
 
 **Result window:**
 - Heatmap of the M × N_samples correlation matrix, when every guess's curve
