@@ -103,6 +103,8 @@ set(SOURCES
     src/trs_file.cpp
     src/npz.cpp
     inc/npz.h
+    src/bit_scan.cpp
+    inc/bit_scan.h
     src/processing.cpp
     src/plot_widget.cpp
     src/theme.cpp

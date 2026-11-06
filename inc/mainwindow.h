@@ -162,6 +162,7 @@ bool runTiledAlignment(
     AlignResult& out, AlignProgress progress, std::string& error);
 
 struct CpaResult;
+struct BitScanResult;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -311,6 +312,9 @@ private:
         int32_t outside_alignment = 0;     // traces left out: not covered by the alignment
     };
     void runCpa(const CpaRun& run);
+    // The t-test on every bit of a label: heatmap, table, saving.
+    void showBitScanResult(std::shared_ptr<BitScanResult> result, const QString& label,
+                           int64_t col0, const QString& fname);
     void showCpaResult(std::shared_ptr<CpaResult> result, int64_t col0);
     // Shows an opened trace file in a new tab; recent_path (if not empty)
     // goes to Recent files.

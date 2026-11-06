@@ -27,7 +27,8 @@ and only the labels are held in memory, so the matrix can be larger than RAM.
 Then every analysis that reads per-trace data works on them:
 
 - **t-test, Average per group, Leakage vs Frequency:** *Group by* picks the
-  label, the byte and the bit (see [the t-test](ttest.md)).
+  label, the byte and the bit. The t-test can also run on
+  [every bit of a label](ttest.md#every-bit-of-a-label) and save all results.
 - **SNR:** picks the label and byte the classes come from.
 - **CPA:** the model gets all labels in `plaintexts`; the editor lists where
   each one is ([details](cpa.md)).

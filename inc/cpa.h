@@ -37,6 +37,15 @@ using LeakageFn = std::function<bool(
 // Working memory of one block in correlateCpa().
 constexpr int64_t kCpaBlockBytes = int64_t(512) << 20;
 
+// Every trace's processed samples [p0, p0 + len) into rows of out (N × len);
+// L is the pipeline's output length for raw_ns raw samples. progress(traces
+// done) → false to cancel.
+bool loadSampleBlock(TrsFile* file, const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                     int32_t first_trace, const std::vector<int32_t>& traces,
+                     const std::vector<int32_t>& shifts, int64_t first_sample, int64_t raw_ns,
+                     int64_t L, int64_t p0, int64_t len, float* out,
+                     const std::function<bool(int64_t)>& progress);
+
 // The traces of [0, n_traces) to use: all but those whose shift is
 // kAlignDiscardShift (e.g. below the alignment's correlation threshold).
 std::vector<int32_t> cpaTraces(int32_t n_traces, const std::vector<int32_t>& shifts);

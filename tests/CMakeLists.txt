@@ -39,6 +39,7 @@ add_library(trs-core-test OBJECT
     ${CMAKE_SOURCE_DIR}/src/ttest_dcor.cpp
     ${CMAKE_SOURCE_DIR}/src/pattern_align.cpp
     ${CMAKE_SOURCE_DIR}/src/cpa.cpp
+    ${CMAKE_SOURCE_DIR}/src/bit_scan.cpp
     ${CMAKE_SOURCE_DIR}/src/xcorr.cpp
     ${CMAKE_SOURCE_DIR}/src/align.cpp
     ${CMAKE_SOURCE_DIR}/src/spectral.cpp
@@ -85,6 +86,7 @@ add_trs_test(test_pattern_align)
 add_trs_test(test_trs_file)
 add_trs_test(test_npz)
 add_trs_test(test_cpa)
+add_trs_test(test_bit_scan)
 add_trs_test(test_align)
 add_trs_test(test_xcorr)
 add_trs_test(test_spectral)

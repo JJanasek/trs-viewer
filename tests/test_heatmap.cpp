@@ -467,6 +467,37 @@ TEST(HeatmapExport, SingleCellPeakIsVisibleInALargeExport) {
     EXPECT_GT(hotFraction(img, QRect(3, 3, img.width() - 6, img.height() - 6)), 0.0);
 }
 
+// Few rows and many columns: pooling the columns must leave the rows apart.
+TEST(HeatmapExport, ManyColumnsDontMergeTheRows) {
+    QTemporaryDir dir;
+    ASSERT_TRUE(dir.isValid());
+    constexpr int kRows = 16, kCols = 32000;
+    HeatmapWidget hm;
+    hm.resize(760, 700);
+    std::vector<float> m(static_cast<size_t>(kRows) * kCols, 0.0f);
+    m[2u * kCols + 4000] = 1.0f;
+    m[13u * kCols + 28000] = 1.0f;
+    hm.setMatrix(m, kRows, kCols);
+    hm.setColorRange(-1.0f, 1.0f);
+    hm.setContrast(6.0f);
+    hm.setBrightness(-2.0f);
+    hm.setDownsample(HeatmapWidget::Downsample::Peak);
+
+    const QString path = dir.filePath("rows.png");
+    ASSERT_TRUE(hm.exportPng(path, 1600));
+    QImage img;
+    ASSERT_TRUE(img.load(path));
+    const int W = img.width(), H = img.height();
+    auto cell = [&](int row, int col) {   // a box around a cell's place in the picture
+        const int x = W * col / kCols, y0 = H * row / kRows, y1 = H * (row + 1) / kRows;
+        return QRect(x - 8, y0 + 2, 16, y1 - y0 - 4);
+    };
+    EXPECT_GT(hotFraction(img, cell(2, 4000)), 0.0);
+    EXPECT_GT(hotFraction(img, cell(13, 28000)), 0.0);
+    EXPECT_EQ(hotFraction(img, cell(13, 4000)), 0.0);
+    EXPECT_EQ(hotFraction(img, cell(2, 28000)), 0.0);
+}
+
 // Aspect must follow the plot rectangle, since that is what the view is
 // stretched to fill on screen — not the view's own data proportions.
 TEST(HeatmapExport, AspectFollowsThePlotRectNotTheData) {

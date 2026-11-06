@@ -230,9 +230,9 @@ private:
     // demand (ensurePooled) and dropped whenever display_matrix_ changes.
     // mutable: it is a render cache, filled from the const render path.
     mutable std::vector<float> pooled_;
-    mutable int pool_factor_ = 0, pooled_rows_ = 0, pooled_cols_ = 0;
-    void ensurePooled(int factor) const;
-    void invalidatePooled() { pool_factor_ = 0; pooled_.clear(); }
+    mutable int pool_rows_ = 0, pool_cols_ = 0, pooled_rows_ = 0, pooled_cols_ = 0;
+    void ensurePooled(int row_factor, int col_factor) const;
+    void invalidatePooled() { pool_rows_ = pool_cols_ = 0; pooled_.clear(); }
     float  region_boost_    = 1.0f;
     float  sel_percentile_  = 0.98f;
     float  sel_lo_ = 0.0f, sel_hi_ = 1.0f;   // the region's own clip range

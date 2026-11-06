@@ -13,6 +13,22 @@ When the data is in memory (a `.npy` with [labels](npy-npz.md), an `.npz`), the 
 
 **First sample** and **Sample count** pick the part of the traces to test. Press **Draw on plot →** and drag across the region on the main plot to set both. While you drag, the dialog stays open but no longer blocks the main window; pressing the button again cancels, and **Run t-test** runs straight away with the drawn range. With an alignment applied, the plot shows aligned traces and the drawn range is in the same samples the test uses.
 
+### Every bit of a label
+
+Under **Group by**, choose **every bit (one test each)**: a 1st-order t-test on each bit of the label (or of the chosen byte, if the file has no named labels), over the sample range, with the alignment if ticked. The traces are read once, not once per bit: 256 bits over 1000 × 62500 samples takes under a second. The other test options don't apply and are greyed out, and the next dialog starts on a single test again.
+
+One window holds all the results:
+
+- **Heatmap:** |t| per bit (rows, row = 8 × byte + bit) and sample (columns). Code that handles a value bit by bit shows as a staircase.
+- **Table:** every bit with its largest |t|, where it is, how many samples exceed 4.5, and the group sizes. Click a header to sort. A bit that never changes has an empty group and t = 0.
+- **Show curve**, or double-click a row: that bit's t-curve in a result tab.
+- **Save all (.npz):** `t` (bits × samples, float32), and per bit `byte`, `bit`, `peak_t`, `peak_sample` (raw position when the pipeline keeps sample positions), `n_over` (samples with |t| > 4.5), `n0`, `n1`; also `first_sample`. Column `c` of `t` is sample `first_sample + c`. Limit 4 GB.
+- **Save table (.csv):** the table.
+
+If all the curves wouldn't fit in memory (at 256 bits, a 62.5M-sample range would need about 190 GB with the display copies), only the table is computed; the status bar and the window say so, and you can run the t-test on one bit for its curve.
+
+Every bit and sample is a separate test: over 62500 samples a bit crosses 4.5 about 0.4 times by chance, so a single sample over the line doesn't mean much. Look for strong peaks, or several samples together.
+
 ## Order, jitter window and sanity check
 
 The **Test** group in the dialog:

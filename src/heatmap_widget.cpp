@@ -158,13 +158,18 @@ QImage HeatmapWidget::renderRegion(int W, int H,
     // writing, or the export re-pools the data and stops matching the screen.
     const double ref_w = (pool_ref_w > 0) ? static_cast<double>(pool_ref_w) : W;
     const double ref_h = (pool_ref_h > 0) ? static_cast<double>(pool_ref_h) : H;
-    const double cpp = std::max((x1 - x0) / ref_w, (y1 - y0) / ref_h);
-    int f = 1;
-    if (downsample_ != Downsample::Nearest && cpp > 1.0)
-        while (f < cpp) f *= 2;
-    if (f > 1) ensurePooled(f);
-    const float* dm     = (f > 1) ? pooled_.data() : display_matrix_.data();
-    const int    stride = (f > 1) ? pooled_cols_    : Nc;
+    // Per axis: a matrix of 256 rows × 62500 columns must not lose its rows
+    // because its columns need pooling.
+    int fr = 1, fc = 1;
+    if (downsample_ != Downsample::Nearest) {
+        const double rows_pp = (y1 - y0) / ref_h, cols_pp = (x1 - x0) / ref_w;
+        while (fr < rows_pp) fr *= 2;
+        while (fc < cols_pp) fc *= 2;
+    }
+    const bool pooled = fr > 1 || fc > 1;
+    if (pooled) ensurePooled(fr, fc);
+    const float* dm     = pooled ? pooled_.data() : display_matrix_.data();
+    const int    stride = pooled ? pooled_cols_   : Nc;
 
     // Inside a selected region, each cell's normalised value is blended from
     // the global scale toward the region's own scale by region_boost_ — the
@@ -182,13 +187,13 @@ QImage HeatmapWidget::renderRegion(int W, int H,
 #pragma omp parallel for schedule(static)
     for (int row = 0; row < H; row++) {
         const int data_row = std::clamp(static_cast<int>(y0 + (row + 0.5) * dy), 0, Nr - 1);
-        const float* src   = dm + static_cast<size_t>(data_row / f) * stride;
+        const float* src   = dm + static_cast<size_t>(data_row / fr) * stride;
         QRgb*        line  = bits + row * bpl;
         const bool row_in  = sel_valid_ && data_row >= sel_r0_ && data_row <= sel_r1_;
         for (int col = 0; col < W; col++) {
             const int   data_col = std::clamp(static_cast<int>(x0 + (col + 0.5) * dx), 0, Nc - 1);
             const bool  inside   = row_in && data_col >= sel_c0_ && data_col <= sel_c1_;
-            const float v        = src[data_col / f];
+            const float v        = src[data_col / fc];
             QRgb c;
             if (inside && boost) {
                 const float tg = (g_rng != 0.0f) ? (v - vmin_)  / g_rng : 0.5f;
@@ -270,21 +275,20 @@ void HeatmapWidget::setColorRange(float vmin, float vmax) {
     update();
 }
 
-void HeatmapWidget::ensurePooled(int f) const {
-    if (f <= 1) return;
-    if (pool_factor_ == f && !pooled_.empty()) return;
-    pooled_rows_ = (rows_ + f - 1) / f;
-    pooled_cols_ = (cols_ + f - 1) / f;
+void HeatmapWidget::ensurePooled(int fr, int fc) const {
+    if (pool_rows_ == fr && pool_cols_ == fc && !pooled_.empty()) return;
+    pooled_rows_ = (rows_ + fr - 1) / fr;
+    pooled_cols_ = (cols_ + fc - 1) / fc;
     pooled_.assign(static_cast<size_t>(pooled_rows_) * pooled_cols_, 0.0f);
     const float* dm = display_matrix_.data();
     const bool peak = (downsample_ == Downsample::Peak);
 
 #pragma omp parallel for schedule(static)
     for (int pr = 0; pr < pooled_rows_; pr++) {
-        const int r0 = pr * f, r1 = std::min(rows_, r0 + f);
+        const int r0 = pr * fr, r1 = std::min(rows_, r0 + fr);
         float* out = pooled_.data() + static_cast<size_t>(pr) * pooled_cols_;
         for (int pc = 0; pc < pooled_cols_; pc++) {
-            const int c0 = pc * f, c1 = std::min(cols_, c0 + f);
+            const int c0 = pc * fc, c1 = std::min(cols_, c0 + fc);
             if (peak) {
                 float best = 0.0f, best_abs = -1.0f;
                 for (int r = r0; r < r1; r++) {
@@ -305,7 +309,8 @@ void HeatmapWidget::ensurePooled(int f) const {
             }
         }
     }
-    pool_factor_ = f;
+    pool_rows_ = fr;
+    pool_cols_ = fc;
 }
 
 void HeatmapWidget::setDownsample(Downsample d) {

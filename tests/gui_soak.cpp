@@ -593,6 +593,59 @@ struct GuiTestAccess {
         waitJobs();
         drv.step([this]() { return drv.dialogsAnswered(); });
 
+        // Every bit of the label: one window with all of them, saved to a file
+        const QString scan_out = capture_dir + "/scan.npz", scan_csv = capture_dir + "/scan.csv";
+        auto acceptFile = [](QDialog* d, const QString& path) {
+            auto* fd = qobject_cast<QFileDialog*>(d);
+            if (!fd) return false;
+            if (auto* name = fd->findChild<QLineEdit*>("fileNameEdit")) name->setText(path);
+            QMetaObject::invokeMethod(fd, "accept", Qt::QueuedConnection);
+            return true;
+        };
+        useCaptureTab();
+        drv.then([scan_out, scan_csv]() { QFile::remove(scan_out); QFile::remove(scan_csv); });
+        drv.onDialog("Welch t-test", [](QDialog* d) { return pickGroup(d, "lam", 0, "every bit") && clickOk(d); });
+        drv.onDialog("T-test on every bit", [this](QDialog* d) {
+            if (!d->windowTitle().contains("lam[3] bit 1")) drv.fail("wrong strongest bit: " + d->windowTitle());
+            auto* tbl = d->findChild<QTableWidget*>("bit_scan_table");
+            if (!tbl || tbl->rowCount() != 256) { drv.fail("the table doesn't have 256 bits"); return false; }
+            return clickButton(d, "Save all");
+        });
+        drv.onDialog("Save the t-test on every bit", [=](QDialog* d) { return acceptFile(d, scan_out); });
+        drv.then([this]() { w.showTTestDialog(nullptr); });
+        waitJobs();
+        drv.step([this, scan_out]() { return drv.dialogsAnswered() && QFile::exists(scan_out); });
+        drv.then([this, scan_out]() {
+            std::map<std::string, std::vector<uint8_t>> e;
+            QString err;
+            NpyArray t, peak;
+            if (!loadNpz(scan_out, e, err) || !parseNpyArray(e["t.npy"], t, err) || !parseNpyArray(e["peak_t.npy"], peak, err))
+                return drv.fail("the saved results don't read back: " + err);
+            if (t.shape != std::vector<int64_t>{256, 2000}) return drv.fail("saved t has the wrong shape");
+            float at_leak;
+            std::memcpy(&at_leak, t.payload.data() + (8u * 3u + 1u) * 2000u * 4u + kLabelLeakAt * 4u, 4);
+            if (std::fabs(at_leak) < 10.0f) drv.fail(QString("saved t at the leak: %1").arg(at_leak));
+        });
+        drv.onDialog("T-test on every bit", [](QDialog* d) { return clickButton(d, "Save table"); });
+        drv.onDialog("Save the table", [=](QDialog* d) { return acceptFile(d, scan_csv); });
+        drv.step([this, scan_csv]() { return drv.dialogsAnswered() && QFile::exists(scan_csv); });
+        drv.then([this, scan_csv]() {
+            QFile f(scan_csv);
+            if (!f.open(QIODevice::ReadOnly) || f.readAll().count('\n') != 257) drv.fail("the table has the wrong number of lines");
+        });
+        drv.onDialog("T-test on every bit", [](QDialog* d) { return clickButton(d, "Show curve"); });
+        drv.step([this]() {
+            if (!drv.dialogsAnswered()) return false;
+            // The strongest row is selected: its curve becomes the active tab.
+            if (!w.activeDs().display_name.contains("lam[3] bit 1")) return false;
+            const int at = peakOfActiveCurve();
+            if (at != kLabelLeakAt) drv.fail(QString("the bit's curve peaks at %1").arg(at));
+            for (QWidget* t : QApplication::topLevelWidgets())
+                if (t->windowTitle().startsWith("T-test on every bit")) t->close();
+            return true;
+        });
+        drv.step([]() { QApplication::processEvents(); return true; });
+
         // Average per group
         useCaptureTab();
         drv.onDialog("Average Trace", [](QDialog* d) {

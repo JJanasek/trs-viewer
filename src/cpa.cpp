@@ -45,12 +45,34 @@ int loadThreads() {
 // filters settle before the block's own samples (as the dcor test does).
 constexpr int64_t kMargin = 4096;
 
-// Every trace's processed samples [p0, p0 + len) into rows of out (N × len).
-bool loadBlock(TrsFile* file, const std::vector<std::shared_ptr<ITransform>>& pipeline,
-               int32_t first_trace, const std::vector<int32_t>& traces,
-               const std::vector<int32_t>& shifts, int64_t first_sample, int64_t raw_ns,
-               int64_t L, int64_t p0, int64_t len, float* out,
-               const std::function<bool(int64_t)>& progress)
+// Centres each column of t (N × len) in place; its norm into norm_t.
+void centreColumns(float* t, int64_t n, int64_t len, std::vector<double>& norm_t) {
+    std::vector<double> mean(static_cast<size_t>(len), 0.0), sq(static_cast<size_t>(len), 0.0);
+    for (int64_t i = 0; i < n; i++) {
+        const float* r = t + i * len;
+        for (int64_t s = 0; s < len; s++) mean[static_cast<size_t>(s)] += r[s];
+    }
+    for (double& v : mean) v /= static_cast<double>(n);
+    #pragma omp parallel for schedule(static)
+    for (int64_t i = 0; i < n; i++) {
+        float* r = t + i * len;
+        for (int64_t s = 0; s < len; s++) r[s] = static_cast<float>(r[s] - mean[static_cast<size_t>(s)]);
+    }
+    for (int64_t i = 0; i < n; i++) {
+        const float* r = t + i * len;
+        for (int64_t s = 0; s < len; s++) sq[static_cast<size_t>(s)] += static_cast<double>(r[s]) * r[s];
+    }
+    norm_t.resize(static_cast<size_t>(len));
+    for (int64_t s = 0; s < len; s++) norm_t[static_cast<size_t>(s)] = std::sqrt(sq[static_cast<size_t>(s)]);
+}
+
+}  // namespace
+
+bool loadSampleBlock(TrsFile* file, const std::vector<std::shared_ptr<ITransform>>& pipeline,
+                     int32_t first_trace, const std::vector<int32_t>& traces,
+                     const std::vector<int32_t>& shifts, int64_t first_sample, int64_t raw_ns,
+                     int64_t L, int64_t p0, int64_t len, float* out,
+                     const std::function<bool(int64_t)>& progress)
 {
     const int64_t m  = pipeline.empty() ? 0 : std::min(p0, kMargin);
     const int64_t rs = rawStartForProcessedIndex(pipeline, p0 - m, raw_ns);
@@ -87,29 +109,6 @@ bool loadBlock(TrsFile* file, const std::vector<std::shared_ptr<ITransform>>& pi
     }
     return true;
 }
-
-// Centres each column of t (N × len) in place; its norm into norm_t.
-void centreColumns(float* t, int64_t n, int64_t len, std::vector<double>& norm_t) {
-    std::vector<double> mean(static_cast<size_t>(len), 0.0), sq(static_cast<size_t>(len), 0.0);
-    for (int64_t i = 0; i < n; i++) {
-        const float* r = t + i * len;
-        for (int64_t s = 0; s < len; s++) mean[static_cast<size_t>(s)] += r[s];
-    }
-    for (double& v : mean) v /= static_cast<double>(n);
-    #pragma omp parallel for schedule(static)
-    for (int64_t i = 0; i < n; i++) {
-        float* r = t + i * len;
-        for (int64_t s = 0; s < len; s++) r[s] = static_cast<float>(r[s] - mean[static_cast<size_t>(s)]);
-    }
-    for (int64_t i = 0; i < n; i++) {
-        const float* r = t + i * len;
-        for (int64_t s = 0; s < len; s++) sq[static_cast<size_t>(s)] += static_cast<double>(r[s]) * r[s];
-    }
-    norm_t.resize(static_cast<size_t>(len));
-    for (int64_t s = 0; s < len; s++) norm_t[static_cast<size_t>(s)] = std::sqrt(sq[static_cast<size_t>(s)]);
-}
-
-}  // namespace
 
 std::vector<int32_t> cpaTraces(int32_t n_traces, const std::vector<int32_t>& shifts) {
     std::vector<int32_t> kept;
@@ -254,7 +253,7 @@ bool correlateCpa(TrsFile* file, int32_t first_trace, const std::vector<int32_t>
             const int64_t p0 = bi * block, len = std::min(block, L - p0);
             t.assign(static_cast<size_t>(N * len), 0.0f);
             const int64_t base = (static_cast<int64_t>(pass_idx) * n_blocks + bi) * N;
-            if (!loadBlock(file, pipeline, first_trace, traces, shifts, first_sample, raw_ns, L, p0, len,
+            if (!loadSampleBlock(file, pipeline, first_trace, traces, shifts, first_sample, raw_ns, L, p0, len,
                            t.data(), [&](int64_t done) { return !progress || progress(base + done, total); }))
                 return false;
             centreColumns(t.data(), N, len, norm_t);

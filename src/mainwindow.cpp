@@ -21,6 +21,7 @@
 #include "flow_layout.h"
 #include "job_manager.h"
 #include "npz.h"
+#include "bit_scan.h"
 #include <QDockWidget>
 #include <QProgressBar>
 #include <set>
@@ -326,7 +327,7 @@ private:
 // the data is in memory it also says how many traces each group would get.
 class GroupPicker : public QWidget {
 public:
-    explicit GroupPicker(const std::shared_ptr<TrsFile>& file, bool with_bit = true)
+    explicit GroupPicker(const std::shared_ptr<TrsFile>& file, bool with_bit = true, bool with_scan = false)
         : file_(file), with_bit_(with_bit) {
         const TrsHeader& h = file->header();
         for (const auto& kv : h.param_map) {
@@ -362,9 +363,12 @@ public:
             cmb_bit_->addItem("any bit (byte ≠ 0)");
             for (int b = 0; b < 8; b++)
                 cmb_bit_->addItem(QString("bit %1%2").arg(b).arg(b == 0 ? " (LSB)" : b == 7 ? " (MSB)" : ""));
+            if (with_scan) cmb_bit_->addItem("every bit (one test each)");
             cmb_bit_->setToolTip("Group 1: the traces where this bit of the byte is set, group 0: the "
                                  "others.\n\"any bit\" (zero or not) is for a byte that flags fixed vs "
-                                 "random. For a random value such as a key, split on one bit.");
+                                 "random. For a random value such as a key, split on one bit.\n"
+                                 "\"every bit\": a 1st-order t-test on each bit of the label (or of this "
+                                 "byte, if the file has no named labels), with all results in one window.");
             row->addWidget(new QLabel("bit"));
             row->addWidget(cmb_bit_);
         }
@@ -395,7 +399,28 @@ public:
     }
     GroupBy groupBy() const {
         const int bit = cmb_bit_ ? cmb_bit_->currentIndex() - 1 : -1;
-        return GroupBy(byteIndex(), bit < 0 ? uint8_t(0xFF) : static_cast<uint8_t>(1u << bit));
+        return GroupBy(byteIndex(), bit < 0 || bit > 7 ? uint8_t(0xFF) : static_cast<uint8_t>(1u << bit));
+    }
+    QComboBox* bitCombo() const { return cmb_bit_; }
+    // Back to a single test: "every bit" isn't what a next run should start from.
+    void clearScan() {
+        if (!scanAll()) return;
+        cmb_bit_->setCurrentIndex(0);
+        syncField();
+    }
+    // "every bit" chosen: the bytes it covers, and the label's name if it has one.
+    bool scanAll() const { return cmb_bit_ && cmb_bit_->currentIndex() == 9; }
+    int32_t scanFirstByte() const {
+        const int i = cmb_field_->currentIndex();
+        return i >= 0 ? fields_[static_cast<size_t>(i)].second.offset : sp_byte_->value();
+    }
+    int32_t scanBytes() const {
+        const int i = cmb_field_->currentIndex();
+        return i >= 0 ? fields_[static_cast<size_t>(i)].second.length : 1;
+    }
+    QString scanLabel() const {
+        const int i = cmb_field_->currentIndex();
+        return i >= 0 ? QString::fromStdString(fields_[static_cast<size_t>(i)].first) : QString();
     }
     // In this order, so the restored byte fits the restored label's range.
     void remember(DialogMemory& mem, const QString& byte_key = "group_byte") {
@@ -433,7 +458,13 @@ private:
         updateCounts();
     }
     void updateCounts() {
+        sp_byte_->setEnabled(!scanAll() || fields_.empty());
         if (!lbl_counts_) return;
+        if (scanAll()) {
+            lbl_counts_->setText(QString("A 1st-order t-test on each of the %1 bits, all in one window.")
+                                     .arg(scanBytes() * 8));
+            return;
+        }
         int64_t n0, n1;
         countGroups(groupBy(), n0, n1);
         lbl_counts_->setText(QString("Of all traces: group 0 has %1, group 1 has %2.%3").arg(n0).arg(n1)
@@ -6312,7 +6343,7 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         lbl->setTextFormat(Qt::RichText);
         fl->addRow(lbl);
     } else {
-        picker = new GroupPicker(run_file);
+        picker = new GroupPicker(run_file, true, /*with_scan=*/true);
         fl->addRow("Group by:", picker);
     }
 
@@ -6668,6 +6699,30 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
     connect(cfg_bb, &QDialogButtonBox::rejected, &cfg, &QDialog::reject);
     mem.restore();
     syncBivariate(cmb_order->currentIndex());
+    // Every bit: 1st order on the sample range, none of the other options.
+    if (picker) {
+        picker->clearScan();
+        auto syncScan = [=]() {
+            const bool scan = picker->scanAll();
+            if (scan) {
+                cmb_order->setCurrentIndex(0);
+                chk_sanity->setChecked(false);
+                if (grp_pat) grp_pat->setChecked(false);
+            }
+            syncBivariate(cmb_order->currentIndex());
+            cmb_order->setEnabled(!scan);
+            chk_sanity->setEnabled(!scan);
+            chk_abs->setEnabled(!scan);
+            if (grp_pat && scan) grp_pat->setEnabled(false);
+            if (scan) grp_live->setEnabled(false);
+            if (chk_add_chain && scan) {
+                chk_add_chain->setChecked(false);
+                chk_add_chain->setEnabled(false);
+            }
+        };
+        connect(picker->bitCombo(), QOverload<int>::of(&QComboBox::currentIndexChanged), &cfg, syncScan);
+        syncScan();
+    }
     for (;;) {
         const int res = cfg.exec();
         if (res == QDialog::Accepted) break;
@@ -6736,6 +6791,65 @@ void MainWindow::showTTestDialog(std::function<void(const ChainStep&)> onAddToCh
         c.setAlpha(150);
         plotWidget()->addTrace(std::make_shared<std::vector<float>>(t1), c, "1st order");
     };
+
+    // ---- Every bit of a label: one pass over the traces, one window of results ----
+    if (picker && picker->scanAll()) {
+        const int32_t tile_idx = sp_tile ? sp_tile->value() : 0;
+        const std::vector<int32_t> all_shifts = chk_shifts->isChecked()
+            ? resolveAlignmentTile(activeDs(), tile_idx).shifts : std::vector<int32_t>{};
+        // Per trace of the run; traces the alignment doesn't cover are left out.
+        std::vector<int32_t> shifts;
+        if (!all_shifts.empty()) {
+            shifts.assign(static_cast<size_t>(count), kAlignDiscardShift);
+            const int64_t base = int64_t(first) - activeDs().align_first_trace;
+            for (int32_t i = 0; i < count; i++)
+                if (base + i >= 0 && base + i < static_cast<int64_t>(all_shifts.size()))
+                    shifts[static_cast<size_t>(i)] = all_shifts[static_cast<size_t>(base + i)];
+        }
+        const std::vector<int32_t> traces = cpaTraces(count, shifts);
+        const int64_t first_sample = sp_s_first->value();
+        const int64_t n_samples = sp_s_count->value();
+        const auto job_pipeline = clonePipeline(activeDs().pipeline);
+        const int64_t raw_ns = n_samples == 0 ? h.num_samples - first_sample
+                                              : std::min<int64_t>(n_samples, h.num_samples - first_sample);
+        const int32_t first_byte = picker->scanFirstByte(), n_bytes = picker->scanBytes();
+        const int64_t n_bits = int64_t(n_bytes) * 8;
+        const int64_t ns_out = processedLength(job_pipeline, raw_ns);
+        const int64_t base_bytes = estimateBitScanBytes(static_cast<int64_t>(traces.size()), n_bits, ns_out);
+        // The curves, the heatmap's copy of them and its display matrix.
+        const int64_t curve_bytes = 3 * n_bits * ns_out * 4;
+        const int64_t avail = memoryAvailableBytes();
+        const bool keep_curves = avail <= 0 || base_bytes + curve_bytes <= avail / 2;
+        if (!confirmMemory(this, base_bytes + (keep_curves ? curve_bytes : 0), "The t-test on every bit"))
+            return;
+        if (!keep_curves)
+            statusBar()->showMessage(QString("Every bit: the %1 curves would need %2, so only the table is kept.")
+                                         .arg(n_bits).arg(gigabytes(curve_bytes)), 15000);
+
+        const QString label = picker->scanLabel();
+        const QString fname = activeDs().display_name;
+        struct ScanOut { std::shared_ptr<BitScanResult> r = std::make_shared<BitScanResult>(); std::string err; };
+        auto out = std::make_shared<ScanOut>();
+        const std::shared_ptr<TrsFile> job_file = run_file;
+        jobs_->submit(QString("T-test on every bit of %1 — %2").arg(label.isEmpty() ? QString("byte %1").arg(first_byte) : label, fname),
+            [=](JobContext& ctx) {
+                return computeBitScan(job_file.get(), first, traces, first_sample, n_samples, shifts, job_pipeline,
+                                      first_byte, n_bytes, keep_curves, *out->r,
+                                      [&ctx](int64_t done, int64_t total) {
+                                          ctx.setProgress(done, total);
+                                          return !ctx.cancelled();
+                                      }, out->err);
+            },
+            [=](bool ok) {
+                if (!ok) {
+                    if (!out->err.empty() && out->err != "Cancelled.")
+                        QMessageBox::critical(this, "T-test failed", QString::fromStdString(out->err));
+                    return;
+                }
+                showBitScanResult(out->r, label, first_sample, fname);
+            });
+        return;
+    }
 
     // ---- Distance correlation: any order, per sample (4) or per window (5) ----
     if (cmb_order->currentIndex() >= 4) {
@@ -13254,6 +13368,189 @@ void MainWindow::runCpa(const CpaRun& run) {
 // The CPA result window: every guess ranked by its peak |r|, and the curves
 // kept — as a guess × sample heatmap when there are all of them, as curves
 // when only the strongest are.
+void MainWindow::showBitScanResult(std::shared_ptr<BitScanResult> r, const QString& label,
+                                   int64_t col0, const QString& fname) {
+    const int32_t M = r->n_bits, NS = r->n_samples;
+    if (M <= 0 || NS <= 0) return;
+    // A row's byte, within the label if it has a name, and bit.
+    const int32_t byte_base = label.isEmpty() ? r->first_byte : 0;
+    const auto rowByte = [byte_base](int32_t row) { return byte_base + row / 8; };
+    const auto rowName = [=](int32_t row) {
+        return (label.isEmpty() ? QString("byte %1").arg(rowByte(row)) : QString("%1[%2]").arg(label).arg(rowByte(row)))
+             + QString(" bit %1").arg(row % 8);
+    };
+    int32_t best = 0;
+    for (int32_t k = 1; k < M; k++)
+        if (std::abs(r->peak_t[static_cast<size_t>(k)]) > std::abs(r->peak_t[static_cast<size_t>(best)])) best = k;
+
+    auto* dlg = new QDialog(this);
+    dlg->setAttribute(Qt::WA_DeleteOnClose);
+    dlg->setWindowTitle(QString("T-test on every bit — %1 — %2 traces, strongest: %3, |t| = %4 at sample %5")
+        .arg(fname).arg(r->n_traces).arg(rowName(best))
+        .arg(std::abs(r->peak_t[static_cast<size_t>(best)]), 0, 'f', 2)
+        .arg(col0 + r->peak_sample[static_cast<size_t>(best)]));
+    dlg->resize(1250, 760);
+
+    auto* lbl_hover = new QLabel;
+    lbl_hover->setWordWrap(true);
+    auto* ctrl = new QHBoxLayout;
+    ctrl->addWidget(lbl_hover, 1);
+    QWidget* view = nullptr;
+    if (r->hasCurves()) {
+        auto* hm = new HeatmapWidget(dlg);
+        hm->setMatrix(r->t, M, NS);
+        hm->setColorScheme(ColorScheme::Viridis);
+        hm->setAbsValue(true);
+        float lim = 0.0f;
+        for (float p : r->peak_t) lim = std::max(lim, std::abs(p));
+        hm->setColorRange(0.0f, std::max(lim, 4.5f));
+        const QString idle = "|t| per bit (rows) and sample (columns). Hover to inspect.";
+        lbl_hover->setText(idle);
+        connect(hm, &HeatmapWidget::hoverInfo, dlg, [lbl_hover, col0, rowName, idle](int row, int col, float val) {
+            lbl_hover->setText(row >= 0 && col >= 0
+                ? QString("%1  sample %2  t = %3").arg(rowName(row)).arg(col0 + col).arg(val, 0, 'f', 2)
+                : idle);
+        });
+        auto* sp_max = new QDoubleSpinBox;
+        sp_max->setRange(0.1, 1e6);
+        sp_max->setDecimals(2);
+        sp_max->setValue(std::max(lim, 4.5f));
+        sp_max->setToolTip("|t| at the top of the colour scale. Lower it to see the weaker bits.");
+        connect(sp_max, QOverload<double>::of(&QDoubleSpinBox::valueChanged), hm,
+                [hm](double v) { hm->setColorRange(0.0f, static_cast<float>(v)); });
+        ctrl->addWidget(new QLabel("Colour max |t|:"));
+        ctrl->addWidget(sp_max);
+        view = hm;
+    } else {
+        lbl_hover->setText(QString("All %1 curves wouldn't fit in memory at %2 samples, so the table is what was "
+                                   "kept. For a curve, run the t-test on that one bit, or narrow the sample range.")
+                               .arg(M).arg(NS));
+    }
+
+    // Every bit, strongest first; click a header to sort by something else.
+    auto* tbl = new QTableWidget(M, 7, dlg);
+    tbl->setObjectName("bit_scan_table");
+    tbl->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    tbl->setSelectionBehavior(QAbstractItemView::SelectRows);
+    tbl->setSelectionMode(QAbstractItemView::SingleSelection);
+    tbl->verticalHeader()->hide();
+    tbl->setHorizontalHeaderLabels({"Byte", "Bit", "Max |t|", "Sample", "> 4.5", "G0", "G1"});
+    auto numberItem = [](const QVariant& v, int32_t row) {
+        auto* it = new QTableWidgetItem;
+        it->setData(Qt::DisplayRole, v);
+        it->setData(Qt::UserRole, row);
+        it->setTextAlignment(Qt::AlignCenter);
+        return it;
+    };
+    for (int32_t k = 0; k < M; k++) {
+        const size_t i = static_cast<size_t>(k);
+        tbl->setItem(k, 0, numberItem(rowByte(k), k));
+        tbl->setItem(k, 1, numberItem(k % 8, k));
+        tbl->setItem(k, 2, numberItem(std::round(std::abs(r->peak_t[i]) * 100.0) / 100.0, k));
+        tbl->setItem(k, 3, numberItem(static_cast<qlonglong>(col0 + r->peak_sample[i]), k));
+        tbl->setItem(k, 4, numberItem(static_cast<qlonglong>(r->n_over[i]), k));
+        tbl->setItem(k, 5, numberItem(static_cast<qlonglong>(r->n0[i]), k));
+        tbl->setItem(k, 6, numberItem(static_cast<qlonglong>(r->n1[i]), k));
+    }
+    tbl->setSortingEnabled(true);
+    tbl->sortByColumn(2, Qt::DescendingOrder);
+    tbl->resizeColumnsToContents();
+    tbl->selectRow(0);
+
+    auto* btn_curve = new QPushButton("Show curve");
+    btn_curve->setEnabled(r->hasCurves());
+    btn_curve->setToolTip(r->hasCurves() ? "The selected bit's t-curve in a result tab (or double-click its row)."
+                                         : "The curves weren't kept.");
+    auto* btn_npz = new QPushButton("Save all (.npz)…");
+    btn_npz->setToolTip(r->hasCurves()
+        ? QString("t (%1 bits × %2 samples, float32), plus byte, bit, peak_t, peak_sample, n_over, n0, n1 per bit "
+                  "and first_sample. Row = 8 × byte + bit.").arg(M).arg(NS)
+        : QString("byte, bit, peak_t, peak_sample, n_over, n0, n1 per bit, and first_sample."));
+    auto* btn_csv = new QPushButton("Save table (.csv)…");
+    auto* btn_close = new QPushButton("Close");
+    connect(btn_close, &QPushButton::clicked, dlg, &QDialog::close);
+
+    auto showCurve = [this, r, tbl, rowName, col0, NS]() {
+        if (!r->hasCurves() || tbl->currentRow() < 0) return;
+        const int32_t k = tbl->item(tbl->currentRow(), 0)->data(Qt::UserRole).toInt();
+        const size_t i = static_cast<size_t>(k);
+        const float* p = r->t.data() + i * static_cast<size_t>(NS);
+        addResultTab(std::vector<float>(p, p + NS),
+                     QString("Welch t-test · %1 — %2 traces (G0:%3  G1:%4)")
+                         .arg(rowName(k)).arg(r->n_traces).arg(r->n0[i]).arg(r->n1[i]),
+                     themeTraceColor(0), "t-value");
+        PlotWidget* pw = plotWidget();
+        pw->setTraceFilled(0, true);
+        pw->setAxisLabels("Sample Index", "t-value");
+        pw->setThresholds(true, 4.5, -4.5);
+        pw->setXScale(1.0, static_cast<double>(col0));
+    };
+    connect(btn_curve, &QPushButton::clicked, dlg, showCurve);
+    connect(tbl, &QTableWidget::cellDoubleClicked, dlg, showCurve);
+
+    connect(btn_npz, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Save the t-test on every bit", recentDir("npy"), "NumPy archive (*.npz)");
+        if (path.isEmpty()) return;
+        if (!path.endsWith(".npz", Qt::CaseInsensitive)) path += ".npz";
+        updateRecentDir("npy", path);
+        std::vector<int32_t> bytes(static_cast<size_t>(M)), bits(static_cast<size_t>(M)), peak_at(static_cast<size_t>(M));
+        for (int32_t k = 0; k < M; k++) {
+            bytes[static_cast<size_t>(k)]   = rowByte(k);
+            bits[static_cast<size_t>(k)]    = k % 8;
+            peak_at[static_cast<size_t>(k)] = static_cast<int32_t>(col0 + r->peak_sample[static_cast<size_t>(k)]);
+        }
+        const int64_t first_sample = col0;
+        std::vector<std::pair<std::string, std::vector<uint8_t>>> entries;
+        if (r->hasCurves())
+            entries.push_back({"t.npy", buildNpyBytes("<f4", M, NS, r->t.data(), r->t.size() * sizeof(float))});
+        entries.push_back({"byte.npy", buildNpy1DBytes("<i4", bytes.data(), M, 4)});
+        entries.push_back({"bit.npy", buildNpy1DBytes("<i4", bits.data(), M, 4)});
+        entries.push_back({"peak_t.npy", buildNpy1DBytes("<f4", r->peak_t.data(), M, 4)});
+        entries.push_back({"peak_sample.npy", buildNpy1DBytes("<i4", peak_at.data(), M, 4)});
+        entries.push_back({"n_over.npy", buildNpy1DBytes("<i8", r->n_over.data(), M, 8)});
+        entries.push_back({"n0.npy", buildNpy1DBytes("<i8", r->n0.data(), M, 8)});
+        entries.push_back({"n1.npy", buildNpy1DBytes("<i8", r->n1.data(), M, 8)});
+        entries.push_back({"first_sample.npy", buildNpy1DBytes("<i8", &first_sample, 1, 8)});
+        QString err;
+        if (!saveNpz(path, entries, err)) QMessageBox::critical(dlg, "Save failed", err);
+        else statusBar()->showMessage("Saved " + path, 8000);
+    });
+    connect(btn_csv, &QPushButton::clicked, dlg, [=]() {
+        QString path = QFileDialog::getSaveFileName(dlg, "Save the table", recentDir("export"), "CSV (*.csv)");
+        if (path.isEmpty()) return;
+        if (!path.endsWith(".csv", Qt::CaseInsensitive)) path += ".csv";
+        updateRecentDir("export", path);
+        QFile f(path);
+        if (!f.open(QIODevice::WriteOnly | QIODevice::Text)) {
+            QMessageBox::critical(dlg, "Save failed", "Cannot write " + path);
+            return;
+        }
+        QTextStream out(&f);
+        out << "label,byte,bit,peak_t,peak_sample,n_over_4.5,n0,n1\n";
+        for (int32_t k = 0; k < M; k++) {
+            const size_t i = static_cast<size_t>(k);
+            out << label << ',' << rowByte(k) << ',' << k % 8 << ',' << r->peak_t[i] << ','
+                << col0 + r->peak_sample[i] << ',' << r->n_over[i] << ',' << r->n0[i] << ',' << r->n1[i] << '\n';
+        }
+        statusBar()->showMessage("Saved " + path, 8000);
+    });
+
+    auto* btns = new QHBoxLayout;
+    btns->addStretch(1);
+    for (QPushButton* b : {btn_curve, btn_npz, btn_csv, btn_close}) btns->addWidget(b);
+    auto* body = new QHBoxLayout;
+    if (view) {
+        body->addWidget(view, 1);
+        tbl->setFixedWidth(430);
+    }
+    body->addWidget(tbl, view ? 0 : 1);
+    auto* vl = new QVBoxLayout(dlg);
+    vl->addLayout(ctrl);
+    vl->addLayout(body, 1);
+    vl->addLayout(btns);
+    dlg->show();
+}
+
 void MainWindow::showCpaResult(std::shared_ptr<CpaResult> result_ptr, int64_t col0) {
     const int32_t NS = result_ptr->n_samples;
     const int32_t n_hypotheses = result_ptr->n_hypotheses;
