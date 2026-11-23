@@ -30,7 +30,8 @@ result — each in its own tab, several files at a time.
 ## Quick start
 
 ```bash
-scripts/install-deps.sh                       # build dependencies for your distro
+git clone <repo-url> && cd trs-viewer
+scripts/install-deps.sh                       # build dependencies for your distro (uses sudo)
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 

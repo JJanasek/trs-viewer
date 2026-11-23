@@ -7871,8 +7871,8 @@ void MainWindow::onRunXCorr() {
     // exec() event loop as soon as it's hidden, which made the old hide()-while-
     // drawing trick close this dialog outright instead of just stepping aside.
     // Non-modal avoids that entirely — the main plot is always interactive.
+    // Deleted by hand, not WA_DeleteOnClose: an accepted run is queued and needs it.
     auto* cfg = new QDialog(this);
-    cfg->setAttribute(Qt::WA_DeleteOnClose);
     cfg->setWindowTitle("Cross-Correlation — configuration");
     auto* vl_cfg = new QVBoxLayout(cfg);
 
@@ -8171,8 +8171,9 @@ void MainWindow::onRunXCorr() {
             plotWidget()->setMode(InteractionMode::Pan);
     });
     // QDialog::accept()/reject() call done(), which hide()s rather than close()s
-    // the dialog — WA_DeleteOnClose alone would never fire, so clean up explicitly.
-    connect(cfg, &QDialog::finished, cfg, &QObject::deleteLater);
+    // the dialog — WA_DeleteOnClose alone would never fire, so clean up
+    // explicitly: here when cancelled, after the run when accepted.
+    connect(cfg, &QDialog::rejected, cfg, &QObject::deleteLater);
 
     // Update output-size / memory estimate labels (accounts for pipeline decimation).
     // Branches on Template Match (n_traces × n_lags) vs. matrix methods (M × M).
@@ -8233,9 +8234,12 @@ void MainWindow::onRunXCorr() {
 
     // Everything below used to run synchronously after `cfg.exec()` returned
     // Accepted. Now that cfg is non-modal, it runs instead when the user clicks
-    // OK, via QDialog::accepted() (emitted from within accept(), so this fires
-    // right after cfg_bb's "accepted" -> cfg->accept() connection above runs).
+    // OK, via QDialog::accepted(), queued: the run (progress loops, result
+    // windows) must not happen inside done(), which still emits finished()
+    // afterwards — on Qt 6.4 building the result window there left finished()
+    // reading freed memory. The dialog goes once the run is over.
     connect(cfg, &QDialog::accepted, cfg, [=]() {
+    struct DeleteAfterRun { QDialog* d; ~DeleteAfterRun() { d->deleteLater(); } } delete_after{cfg};
     if (!returnToFile(dlg_file, cfg)) return;
     mem->save();
     // Copies: the progress loops below run the event loop, where the tab can
@@ -8835,7 +8839,7 @@ void MainWindow::onRunXCorr() {
         }
         showResultWindow(std::move(result), QString());
     }
-    });
+    }, Qt::QueuedConnection);
 
     cfg->show();
 }

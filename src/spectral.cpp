@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 
 // ---------------------------------------------------------------------------
 // runningMedianBaseline
@@ -34,10 +35,10 @@ void runningMedianBaseline(const std::vector<float>& spec, int window,
         const int64_t c  = grid[gi];
         const int64_t lo = std::max<int64_t>(0, c - half);
         const int64_t hi = std::min<int64_t>(n, c + half + 1);
-        scratch.assign(spec.begin() + static_cast<ptrdiff_t>(lo),
-                       spec.begin() + static_cast<ptrdiff_t>(hi));
+        scratch.assign(spec.begin() + static_cast<std::ptrdiff_t>(lo),
+                       spec.begin() + static_cast<std::ptrdiff_t>(hi));
         const size_t mid = scratch.size() / 2;
-        std::nth_element(scratch.begin(), scratch.begin() + static_cast<ptrdiff_t>(mid),
+        std::nth_element(scratch.begin(), scratch.begin() + static_cast<std::ptrdiff_t>(mid),
                          scratch.end());
         medians[gi] = scratch[mid];
     }

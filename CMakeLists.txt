@@ -48,6 +48,18 @@ if(Qt6_FOUND)
     set(QT_LIBS_CORE Qt6::Core)
     message(STATUS "Using Qt6")
 else()
+    # Qt6 is installed but its Gui module didn't load: name why, rather than
+    # falling through to a "no Qt5" error.
+    find_package(Qt6Core QUIET)
+    if(Qt6Core_FOUND)
+        find_package(Qt6Gui QUIET)
+        message(FATAL_ERROR
+            "Qt6 was found, but its Gui or Widgets module could not be loaded.\n"
+            "Usually the OpenGL development headers are missing (Ubuntu 22.04):\n"
+            "  Debian / Ubuntu: sudo apt install libgl-dev\n"
+            "  Fedora / RHEL:   sudo dnf install mesa-libGL-devel\n"
+            "Or run scripts/install-deps.sh. Reconfigure with --log-level=debug for details.")
+    endif()
     find_package(Qt5 QUIET COMPONENTS Core Gui Widgets Svg)
     if(NOT Qt5_FOUND)
         message(FATAL_ERROR
@@ -69,7 +81,12 @@ message(STATUS "OpenMP version: ${OpenMP_CXX_VERSION}")
 # ---------------------------------------------------------------------------
 # Eigen3 — try system package first, then FetchContent
 # ---------------------------------------------------------------------------
-find_package(Eigen3 3.3 QUIET NO_MODULE)
+# Any version from 3.3 on, Eigen 5 too (its package config refuses a "3.3"
+# request because the major version differs).
+find_package(Eigen3 QUIET NO_MODULE)
+if(Eigen3_FOUND AND Eigen3_VERSION VERSION_LESS 3.3)
+    set(Eigen3_FOUND FALSE)
+endif()
 if(Eigen3_FOUND)
     message(STATUS "Using system Eigen3 ${Eigen3_VERSION}")
 else()

@@ -14,7 +14,7 @@ set -euo pipefail
 # fetching it on every fresh configure.
 #
 #   compiler + cmake   build system
-#   qt6 base           Core / Gui / Widgets
+#   qt6 base           Core / Gui / Widgets (and OpenGL headers on Debian/Ubuntu)
 #   qt6 svg            the app icon is an SVG; CMake hard-fails without it
 #   eigen              linear algebra (CPA, FFT)
 #   python3 + numpy    CPA leakage-model evaluation
@@ -29,10 +29,21 @@ detect() {
     fi
 }
 
+# A fresh Debian/Ubuntu has no package lists yet: without them neither the
+# install nor the Svg package-name check below works.
+if [[ "$(detect)" == "apt" && "${1:-}" != "--print" ]]; then
+    sudo apt-get update
+fi
+
 case "$(detect)" in
   dnf)    CMD=(sudo dnf install -y gcc-c++ cmake qt6-qtbase-devel qt6-qtsvg-devel
                 eigen3-devel python3-devel python3-numpy zlib-devel) ;;
-  apt)    CMD=(sudo apt-get install -y build-essential cmake qt6-base-dev qt6-svg-dev
+  apt)    # Ubuntu 22.04 calls the Svg module libqt6svg6-dev; later releases qt6-svg-dev.
+          svg=qt6-svg-dev
+          apt-cache show qt6-svg-dev >/dev/null 2>&1 || svg=libqt6svg6-dev
+          # libgl-dev: Qt6Gui's CMake package needs the OpenGL headers, which
+          # qt6-base-dev doesn't pull in on Ubuntu 22.04.
+          CMD=(sudo apt-get install -y build-essential cmake qt6-base-dev "$svg" libgl-dev
                 libeigen3-dev python3-dev python3-numpy zlib1g-dev) ;;
   pacman) CMD=(sudo pacman -S --needed base-devel cmake qt6-base qt6-svg
                 eigen python python-numpy zlib) ;;

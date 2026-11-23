@@ -112,9 +112,13 @@ public:
         QObject::connect(&tick, &QTimer::timeout, [this]() { pump(); });
         tick.start(20);
         QTimer::singleShot(timeout_ms, [this]() {
-            fail(QString("timed out in step %1 (%2 handlers still waiting%3)")
+            QStringList open;
+            for (QWidget* t : QApplication::topLevelWidgets())
+                if (t->isVisible()) open << "'" + t->windowTitle() + "'";
+            fail(QString("timed out in step %1 (%2 handlers still waiting%3; windows open: %4)")
                      .arg(done_steps_).arg(handlers_.size())
-                     .arg(handlers_.empty() ? QString() : ", next: " + handlers_.front().title));
+                     .arg(handlers_.empty() ? QString() : ", next: " + handlers_.front().title)
+                     .arg(open.join(", ")));
             QApplication::exit(2);
         });
         return QApplication::exec();
@@ -509,6 +513,18 @@ struct GuiTestAccess {
         drv.step([]() { QApplication::processEvents(); return true; });
     }
 
+    // Waits for a window whose title starts with `prefix` to be shown, then
+    // closes it: result windows open some time after their job or dialog ends.
+    void closeWindows(const QString& prefix) {
+        drv.step([prefix]() {
+            bool found = false;
+            for (QWidget* t : QApplication::topLevelWidgets())
+                if (t->isVisible() && t->windowTitle().startsWith(prefix)) { t->close(); found = true; }
+            return found;
+        });
+        drv.step([]() { QApplication::processEvents(); return true; });
+    }
+
     // The active result tab's curve and where its largest magnitude is.
     int peakOfActiveCurve(float* magnitude = nullptr) {
         PlotWidget* pw = w.plotWidget();
@@ -840,12 +856,12 @@ struct GuiTestAccess {
         drv.onDialog("T-test on every bit", [this](QDialog* d) {
             if (!d->windowTitle().contains("800 traces") || !d->windowTitle().contains("lam[3] bit 1"))
                 drv.fail("every bit: " + d->windowTitle());
-            QMetaObject::invokeMethod(d, "close", Qt::QueuedConnection);
             return true;
         });
         drv.then([this]() { w.showTTestDialog(nullptr); });
         waitJobs();
         drv.step([this]() { return drv.dialogsAnswered(); });
+        closeWindows("T-test on every bit");
         // Leakage vs Frequency
         useSetTab();
         drv.onDialog("Leakage vs Frequency", [](QDialog* d) { return pickGroup(d, "lam", 3, "bit 1") && clickOk(d); });
@@ -913,11 +929,7 @@ struct GuiTestAccess {
         drv.onDialog("Cross-Correlation — configuration", [](QDialog* d) { return clickOk(d); });
         drv.then([this]() { w.onRunXCorr(); });
         drv.step([this]() { return drv.dialogsAnswered() && jobsIdle(); });
-        drv.then([]() {
-            for (QWidget* t : QApplication::topLevelWidgets())
-                if (t->isVisible() && (t->windowTitle().startsWith("Cross") || t->windowTitle().startsWith("Template")))
-                    t->close();
-        });
+        closeWindows("Cross-Correlation [");   // the result, once the run (queued after OK) has shown it
         // FFT
         useSetTab();
         drv.onDialog("FFT Spectrum — configuration", [](QDialog* d) { return clickOk(d); });
